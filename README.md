@@ -3,10 +3,10 @@
 # Clawsome
 A lean python harness for running persistent AI agents.
 
-## Names
+> Clawsome is under early, active development. Expect rough edges, breaking changes, and missing features. Feedback and contributions are welcome.
 
-- Repo: `clawsome`
-- Python module / `import`: `claw`
+<br clear="left">
+
 
 ## Quick start
 
@@ -23,12 +23,12 @@ claw --config claw.yaml
 
 ## Architecture
 
-A clawsome process manages **N agents**, each with a **workspace** (state on
+A single clawsome process manages **multiple agents**, each with a **workspace** (state on
 disk) and **one or more channels** (inbound surfaces — Matrix is the shipped
 one). Per-turn, the agent loads its transcript, assembles a system prompt
 from injected identity files + retrieved memory, runs an Ollama tool loop,
 and replies. Background tasks (compaction, memory_flush, reindex, cron,
-session rotate) run off the user-reply path.
+session rotate) run **off** the user-reply path.
 
 → See [`docs/architecture.md`](docs/architecture.md) for the full mental
 model, request lifecycle, and workspace file contract.
@@ -37,8 +37,6 @@ model, request lifecycle, and workspace file contract.
 
 `claw.yaml` is parsed once at startup; editing requires a restart. The
 shipped `claw.example.yaml` is a runnable template with inline comments.
-Tokens and passwords live in separate `*_file:` paths (mode 0600) so the
-yaml itself is safe to share as a config example.
 
 → See [`docs/configuration.md`](docs/configuration.md) for the full key-by-key
 reference.
@@ -67,3 +65,9 @@ launchd / systemd / your process manager of choice as a long-lived service
 running under a dedicated user. This repo intentionally does not ship
 example service files — paths, log destinations, and label/unit names all
 depend on the host layout.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome on [GitHub](https://github.com/jefffroman/clawsome).
