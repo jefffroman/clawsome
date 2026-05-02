@@ -1,0 +1,124 @@
+# claw — example config
+#
+# Copy this file outside the repo (somewhere private to the host that runs
+# claw) and fill in real values. Access tokens and bot passwords are NEVER
+# inlined here — they live in separate one-line files referenced by
+# *_file: paths, mode 0600.
+
+verbose: false
+
+ollama:
+  base_url: http://127.0.0.1:11434
+  default_compaction_model: qwen3.6:35b-a3b
+  # Cap on tool round-trips per inbound message before claw forces a stub
+  # final reply. Cron-driven research tasks can legitimately need 15-25.
+  max_tool_turns: 30
+
+memory_retrieval:
+  top_n: 5         # max chunks injected into the per-turn prompt
+  compact: true    # collapse retrieval block to a single header + bullets
+
+searxng:
+  base_url: http://127.0.0.1:8080
+
+cron:
+  enabled: true
+  jobs_file: /path/to/cron/jobs.json
+  max_instances_per_job: 1
+  # Agent ids that get cron_add / cron_list / cron_remove. Empty disables
+  # agent-driven scheduling entirely (jobs in jobs.json still fire).
+  exposed_to: []
+  # Fallback delivery target when cron_add is called without an explicit
+  # deliver_to. Omit (or null) to require deliver_to per call.
+  # default_deliver_to: "@phone-user:example.com"
+
+subagents:
+  max_concurrent: 8
+  max_children_per_agent: 5
+  default_model: qwen3.6:35b-a3b
+  # Each persona declares its own max_spawn_depth (default 0 = leaf) and an
+  # optional can_spawn allowlist (default None = no restriction beyond
+  # max_spawn_depth). When a parent forks a persona, the child's effective
+  # budget is min(parent_remaining - 1, persona.max_spawn_depth) AND the
+  # spawn must be in the parent's can_spawn list (if any). Top-level
+  # agents set their own ceiling + allowlist under `agents:` below.
+  personas:                              # case-insensitive lookup
+    thesa:     { model: qwen3.5:122b,        role: researcher,  max_spawn_depth: 1, can_spawn: [chop-chop] }
+    cristal:   { model: qwen3-coder-next,    role: coder,       max_spawn_depth: 1, can_spawn: [chop-chop] }
+    chop-chop: { model: qwen3.6:35b-a3b,     role: grunt }       # default max_spawn_depth=0, leaf
+
+compaction:
+  idle_recap_seconds: 3600
+  # Tuned for a 192K Ollama context. mid_session_token_threshold fires
+  # compaction at ~50% of context; reserve_tokens is the newest-tokens
+  # budget preserved verbatim (older portion summarized to one recap row).
+  # Scale these together to your context window: trigger ≈ 2× reserve.
+  mid_session_token_threshold: 96000
+  reserve_tokens: 48000
+
+memory_flush:
+  enabled: true
+  soft_threshold_tokens: 12000          # pre-compaction trigger; fires
+                                        # when transcript is within this
+                                        # many tokens of compaction line
+  force_flush_transcript_bytes: 2097152 # 2 MB hard fallback
+  periodic_growth_threshold: 4000       # periodic flush via maintenance loop
+                                        # (paired with reindex). Fires when a
+                                        # session has grown by this many tokens
+                                        # since its last flush.
+  turn_timeout_s: 300.0                 # per-flush deadline. On timeout the
+                                        # flush is dropped and compaction
+                                        # proceeds anyway.
+  # IANA timezone name used to roll the daily-note filename
+  # `memory/YYYY-MM-DD.md`. Omit (or null) for UTC. Set to your local TZ
+  # if cron / calendar / log timing is local — UTC and local can otherwise
+  # drift the day boundary by hours.
+  # daily_note_tz: America/New_York
+
+lifecycle:
+  # Hour (0-23, system local time) at which to rotate every agent's active
+  # sessions: run one final memory_flush per session, archive the JSONL with
+  # a `.reset-<ts>` suffix, and clear per-session in-memory caches. The next
+  # inbound message starts a fresh session with no prior turns. Memory files
+  # under <workspace>/memory/ are NOT touched, so durable knowledge persists
+  # across the rotate. Comment out (or leave unset) to disable.
+  # daily_session_rotate_hour: 4
+
+agents:
+  - id: example
+    workspace: /path/to/workspace
+    primary_model: qwen3.6:27b
+    compaction_model: qwen3.6:35b-a3b
+    # How deep a chain rooted at me can extend. 0 = no spawning. Default 1.
+    # Child fork's effective budget is min(this - 1, persona.max_spawn_depth).
+    max_spawn_depth: 1
+    # Optional persona allowlist. Omit (or null) to allow any persona.
+    # Example: can_spawn: [thesa, cristal, chop-chop]
+    # Files injected verbatim into the system prompt every turn. Keep this
+    # list to small, stable identity/role/operating-instructions content.
+    # Anything large or growing belongs in indexed retrieval (MEMORY.md +
+    # memory/YYYY-MM-DD.md) — keep the two lists disjoint so retrieval slots
+    # aren't wasted on content the model already sees verbatim.
+    extra_paths:
+      - IDENTITY.md
+      - USER.md
+      - SOUL.md
+      - AGENTS.md
+      - TOOLS.md
+    matrix:
+      user_id: "@example:matrix.example.com"
+      homeserver: http://127.0.0.1:6167
+      access_token_file: /path/to/credentials/example.matrix.token
+      # Bot account login password — needed only for the one-time cross-signing
+      # bootstrap (UIA challenge on /keys/device_signing/upload). If omitted,
+      # the bot still works but shows as "user verification unavailable" in
+      # Element. Mode 0600.
+      password_file: /path/to/credentials/example.matrix.password
+      device_id: CLAW_EXAMPLE
+      device_name: Claw Example
+      store_path: /path/to/workspace/.matrix-store
+      encryption: true
+      auto_join: always
+      allow_bots: mentions
+      allow_from:
+        - "@operator:matrix.example.com"
