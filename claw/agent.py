@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timezone
 
 from claw.channel.base import Channel, InboundMessage
+from claw.channel.envelope import format_inbound_envelope
 from claw.compaction import (
     maybe_idle_recap,
     run_mid_session_compact_async,
@@ -128,6 +129,10 @@ class Agent:
         self._bg_compaction: dict[str, asyncio.Task] = {}
         # Token count at last periodic flush per session, for delta-trigger.
         self._last_periodic_flush_tokens: dict[str, int] = {}
+        # Per-session timestamp of the previous _process_batch invocation.
+        # Powers the envelope's elapsed-time delta. Cleared across restarts —
+        # the first inbound after a restart simply has no `+elapsed` suffix.
+        self._last_inbound_at: dict[str, datetime] = {}
 
         self._workspace_block: str | None = None
         # Boot-time recap state, keyed by session id.
@@ -164,6 +169,15 @@ class Agent:
     @property
     def compaction_model(self) -> str:
         return self.agent_cfg.compaction_model or self.cfg.ollama.default_compaction_model
+
+    @property
+    def num_predict(self) -> int | None:
+        """Effective per-call generation cap. Per-agent (or persona) override
+        wins; otherwise global OllamaConfig.num_predict applies. None / -1
+        disables the cap."""
+        if self.agent_cfg.num_predict is not None:
+            return self.agent_cfg.num_predict
+        return self.cfg.ollama.num_predict
 
     def _session_lock(self, sid: str) -> asyncio.Lock:
         return self._session_locks.setdefault(sid, asyncio.Lock())
@@ -207,6 +221,10 @@ class Agent:
             matrix=self.agent_cfg.matrix,
             compaction_model=self.agent_cfg.compaction_model,
             extra_paths=self.agent_cfg.extra_paths,
+            # Persona-level num_predict flows through the same per-agent
+            # resolution path as a top-level agent's override; None falls
+            # back to the global OllamaConfig.num_predict.
+            num_predict=persona_cfg.num_predict,
         )
         base_tools = {
             k: v for k, v in self.tools.items()
@@ -258,6 +276,7 @@ class Agent:
                 # effect is bounded (one shot, <max_tool_turns calls).
                 sid=f"subagent-{self.id}",
                 workspace_dir=self.agent_cfg.workspace,
+                num_predict=self.num_predict,
             )
         except Exception:
             log.exception("[%s] subagent run_turn failed", self.id)
@@ -371,8 +390,26 @@ class Agent:
                 parts.append(f"{m.sender_name}: {m.text}")
             else:
                 parts.append(m.text)
-        user_text = "\n\n".join(parts)
+        body = "\n\n".join(parts)
         peer_id = msgs[0].peer_id  # all batched msgs share peer_id by sid keying
+
+        # Envelope wrap: gives the model a per-turn anchor for current date,
+        # day-of-week, and elapsed time since the prior turn. Without this,
+        # qwen3.6:27b hallucinates dates because it has no other ground-truth
+        # source for "today." Cron and initial-prompt inbounds flow through
+        # this same path, so they're stamped too.
+        now = datetime.now(timezone.utc)
+        prev = self._last_inbound_at.get(sid)
+        envelope_sender = msgs[0].sender_name if msgs[0].sender_name else None
+        user_text = format_inbound_envelope(
+            channel=msgs[0].channel,
+            sender=envelope_sender,
+            body=body,
+            ts=now,
+            prev_ts=prev,
+            tz_name=self.cfg.tz,
+        )
+        self._last_inbound_at[sid] = now
 
         # Memory retrieval — query against the combined text.
         try:
@@ -406,6 +443,7 @@ class Agent:
                 tools=self.tools,
                 sid=sid,
                 workspace_dir=self.agent_cfg.workspace,
+                num_predict=self.num_predict,
             )
         except Exception:
             log.exception("[%s] ollama.run_turn failed", self.id)
@@ -491,7 +529,7 @@ class Agent:
                             tools=self.tools,
                             workspace_system_block=self._workspace_system_block(),
                             reason="pre-compact",
-                            daily_note_tz=self.cfg.memory_flush.daily_note_tz,
+                            tz_name=self.cfg.tz,
                         ),
                         timeout=self.cfg.memory_flush.turn_timeout_s,
                     )
@@ -583,7 +621,7 @@ class Agent:
                     tools=self.tools,
                     workspace_system_block=self._workspace_system_block(),
                     reason="periodic-growth",
-                    daily_note_tz=self.cfg.memory_flush.daily_note_tz,
+                    tz_name=self.cfg.tz,
                 ),
                 timeout=self.cfg.memory_flush.turn_timeout_s,
             )
@@ -638,7 +676,7 @@ class Agent:
                             tools=self.tools,
                             workspace_system_block=self._workspace_system_block(),
                             reason="pre-rotate",
-                            daily_note_tz=self.cfg.memory_flush.daily_note_tz,
+                            tz_name=self.cfg.tz,
                         ),
                         timeout=self.cfg.memory_flush.turn_timeout_s,
                     )

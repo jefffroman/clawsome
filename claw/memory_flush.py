@@ -105,7 +105,7 @@ async def run_memory_flush(
     tools: dict[str, Tool],
     workspace_system_block: str,
     reason: str,
-    daily_note_tz: str | None = None,
+    tz_name: str | None = None,
 ) -> bool:
     """Run one flush turn against ``rows`` (typically a snapshot). The agent
     appends durable memory via ``append_file``. Flush turn output is
@@ -113,13 +113,14 @@ async def run_memory_flush(
 
     ``reason`` is a short label ("pre-compact" / "periodic-growth") logged
     when the flush starts. ``sid`` and ``workspace_dir`` are forwarded to
-    ``ollama.run_turn`` for tool-result spooling. ``daily_note_tz`` (IANA
-    zone name) controls which day's `memory/YYYY-MM-DD.md` file the agent
-    is asked to append to; ``None`` falls back to UTC.
+    ``ollama.run_turn`` for tool-result spooling. ``tz_name`` (IANA zone)
+    controls which day's `memory/YYYY-MM-DD.md` file the agent is asked to
+    append to; ``None`` falls back to UTC. Caller typically passes
+    ``cfg.tz``.
     """
     log.info("[%s] memory flush starting (reason=%s, %d rows)", sid, reason, len(rows))
     history = [as_message(r) for r in rows]
-    history.append({"role": "user", "content": _flush_prompt(today_iso_date(daily_note_tz))})
+    history.append({"role": "user", "content": _flush_prompt(today_iso_date(tz_name))})
     try:
         await ollama.run_turn(
             model=primary_model,

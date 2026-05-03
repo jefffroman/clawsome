@@ -17,6 +17,21 @@ class OllamaConfig:
     # tasks (web_search × N + reads + write_file + summarize); raise per
     # deployment if needed.
     max_tool_turns: int = 30
+    # Per-/api/chat-call generation cap (Ollama options.num_predict). When
+    # the model hits this, claw inspects the partial: dangerous truncation
+    # (unclosed code fence) → discard partial + return structured error;
+    # otherwise → re-feed partial + recovery system note and call once
+    # more so the model can wrap up, restart tighter, or bail. None or -1
+    # disables (unbounded — original behavior, not recommended; runaway
+    # reasoning traces can hang the call until request_timeout_s fires).
+    num_predict: int | None = 8192
+    # httpx read timeout per /api/chat call. Should comfortably exceed the
+    # worst-case wall time for one num_predict-bounded generation on the
+    # slowest agent's model. Bumped 2026-05-03 from 900 to 1800 to give
+    # 16K-cap turns on qwen3.5:122b (Thesa) headroom; recovery branch
+    # double-budgets a length-truncated turn (initial + recovery), each
+    # call independently bounded by this timeout.
+    request_timeout_s: float = 1800.0
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,8 @@ class PersonaConfig:
     # subject to max_spawn_depth). Validated at config load against the
     # persona registry.
     can_spawn: tuple[str, ...] | None = None
+    # Per-persona override of OllamaConfig.num_predict. None inherits global.
+    num_predict: int | None = None
 
 
 @dataclass(frozen=True)
@@ -106,11 +123,6 @@ class MemoryFlushConfig:
     # and let compaction proceed anyway — losing one flush is cheaper than
     # delaying compaction.
     turn_timeout_s: float = 300.0
-    # IANA timezone name (e.g. "America/New_York", "Europe/Berlin") used to
-    # roll the daily-note filename `memory/YYYY-MM-DD.md`. None = UTC. Set
-    # this to the operator's local TZ if cron / calendar / log timing is also
-    # local — UTC and local can otherwise drift the day boundary by hours.
-    daily_note_tz: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +179,8 @@ class AgentConfig:
     # Persona allowlist. None = any persona (the default for top-level agents).
     # Tuple = restricted set. Same semantics as PersonaConfig.can_spawn.
     can_spawn: tuple[str, ...] | None = None
+    # Per-agent override of OllamaConfig.num_predict. None inherits global.
+    num_predict: int | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +195,13 @@ class Config:
     memory_flush: MemoryFlushConfig
     lifecycle: LifecycleConfig
     agents: tuple[AgentConfig, ...]
+    # IANA timezone name (e.g. "America/New_York", "Europe/Berlin") used for
+    # every operator-facing timestamp claw renders: inbound-message envelope,
+    # daily-note filename `memory/YYYY-MM-DD.md`, daily-session-rotate hour.
+    # ``None`` falls back to UTC. Internal/persisted timestamps (transcripts,
+    # memory sync state, compaction bookkeeping) stay in UTC regardless —
+    # this knob only affects what humans (and the model) see.
+    tz: str | None = None
 
 
 def load(path: Path | str) -> Config:
@@ -203,6 +224,7 @@ def _parse_persona(spec: dict[str, Any]) -> "PersonaConfig":
         role=spec["role"],
         max_spawn_depth=spec.get("max_spawn_depth", 0),
         can_spawn=_parse_can_spawn(spec.get("can_spawn")),
+        num_predict=spec.get("num_predict"),
     )
 
 
@@ -253,6 +275,7 @@ def _parse(d: dict[str, Any]) -> Config:
         memory_flush=MemoryFlushConfig(**d.get("memory_flush", {})),
         lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
         agents=tuple(_parse_agent(a) for a in d["agents"]),
+        tz=d.get("tz"),
     )
 
 
@@ -266,6 +289,7 @@ def _parse_agent(d: dict[str, Any]) -> AgentConfig:
         extra_paths=tuple(d.get("extra_paths", [])),
         max_spawn_depth=d.get("max_spawn_depth", 1),
         can_spawn=_parse_can_spawn(d.get("can_spawn")),
+        num_predict=d.get("num_predict"),
         matrix=MatrixAccountConfig(
             user_id=m["user_id"],
             homeserver=m["homeserver"],

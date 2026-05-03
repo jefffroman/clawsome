@@ -25,7 +25,8 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from claw import __version__
@@ -134,7 +135,9 @@ async def _serve(cfg: Config) -> int:
     rotate_task: asyncio.Task | None = None
     if cfg.lifecycle.daily_session_rotate_hour is not None:
         rotate_task = asyncio.create_task(
-            _daily_session_rotate_loop(agents, cfg.lifecycle.daily_session_rotate_hour),
+            _daily_session_rotate_loop(
+                agents, cfg.lifecycle.daily_session_rotate_hour, cfg.tz,
+            ),
             name="daily-session-rotate",
         )
 
@@ -221,27 +224,34 @@ async def _maintenance_loop(
             log.exception("maintenance loop iteration raised; continuing")
 
 
-def _seconds_until_next(hour: int) -> float:
-    """Seconds from now (local time) until the next ``hour:00:00``. Always
-    > 0 — if we're already past today's hour:00, returns time-to-tomorrow's.
+def _seconds_until_next(hour: int, tz_name: str | None) -> float:
+    """Seconds from now until the next ``hour:00:00`` in the given IANA TZ.
+    Always > 0 — if we're already past today's hour:00, returns
+    time-to-tomorrow's. ``tz_name=None`` falls back to UTC.
     """
-    now = datetime.now()
+    tz = ZoneInfo(tz_name) if tz_name else timezone.utc
+    now = datetime.now(tz)
     target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()
 
 
-async def _daily_session_rotate_loop(agents: list[Agent], hour: int) -> None:
-    """Sleep until the configured local-time hour, rotate every agent's
-    sessions (memory_flush + transcript archive + cache wipe), repeat.
+async def _daily_session_rotate_loop(
+    agents: list[Agent], hour: int, tz_name: str | None,
+) -> None:
+    """Sleep until the configured ``hour`` in ``tz_name``, rotate every
+    agent's sessions (memory_flush + transcript archive + cache wipe), repeat.
 
     Runs forever until cancelled.
     """
     while True:
         try:
-            sleep_s = _seconds_until_next(hour)
-            log.info("daily rotate: next run in %.0f s (hour=%02d:00 local)", sleep_s, hour)
+            sleep_s = _seconds_until_next(hour, tz_name)
+            log.info(
+                "daily rotate: next run in %.0f s (hour=%02d:00 %s)",
+                sleep_s, hour, tz_name or "UTC",
+            )
             await asyncio.sleep(sleep_s)
             for agent in agents:
                 try:

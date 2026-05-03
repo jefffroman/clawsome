@@ -28,8 +28,10 @@ from claw.tools.base import Tool, ollama_tool_spec
 log = logging.getLogger("claw.ollama")
 
 # Big models with no streaming can be slow on cold cache; allow generous
-# wall time per request.
-DEFAULT_TIMEOUT_S = 900.0
+# wall time per request. Now configurable via OllamaConfig.request_timeout_s
+# (default 1800s); this constant is the fallback when no cfg is provided
+# (tests, ad-hoc usage).
+DEFAULT_TIMEOUT_S = 1800.0
 
 # When a single tool result exceeds this many chars, we keep the model's
 # in-loop view intact (it sees the full result on the next chat_once in this
@@ -98,12 +100,41 @@ _PARSE_RECOVERY_NOTE = (
     "plain text if no tool is needed."
 )
 
+# One-shot system note injected when Ollama returns done_reason="length"
+# with safe (non-code) partial content. The partial gets re-fed as an
+# assistant turn so the model sees its own truncated output, and this note
+# tells it to choose a recovery strategy. The model's response to this
+# note IS its decision — there's no separate "decision" mechanism.
+_LENGTH_RECOVERY_NOTE = (
+    "Your previous reply was cut off — you reached the output token cap. "
+    "The partial above is everything you generated so far. Now choose: "
+    "(1) if the partial already conveys a complete usable answer, finish "
+    "it cleanly in a few sentences; (2) if you were mid-thinking and the "
+    "answer would be too long, restart with a tighter scope or shorter "
+    "format; (3) if the question is genuinely too big, reply briefly "
+    "explaining that and ask the user to narrow it down."
+)
+
+
+def _has_unclosed_code_fence(text: str) -> bool:
+    """Conservative truncation detector. Counts non-overlapping ``` markers
+    and flags if odd. Errs toward false positives (over-flagging): false
+    positives produce a structured error to the caller (safe), while false
+    negatives would let truncated code through (dangerous). Tested against
+    open/closed 3- and 4-backtick fences, mid-content truncation, and
+    inline backticks; the only false-positive cases are 4+4 fences with
+    a literal ``` inside, and unbalanced 5+ backtick blobs — both very
+    rare in real LLM output and both fail-safe."""
+    return text.count("```") % 2 == 1
+
 
 class OllamaClient:
-    def __init__(self, cfg: OllamaConfig, timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
+    def __init__(self, cfg: OllamaConfig, timeout_s: float | None = None) -> None:
         self.cfg = cfg
         self.max_tool_turns = cfg.max_tool_turns
-        self._client = httpx.AsyncClient(base_url=cfg.base_url, timeout=timeout_s)
+        # Caller can pin an explicit timeout (tests); otherwise honor cfg.
+        effective_timeout = timeout_s if timeout_s is not None else cfg.request_timeout_s
+        self._client = httpx.AsyncClient(base_url=cfg.base_url, timeout=effective_timeout)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -154,6 +185,7 @@ class OllamaClient:
         tools: dict[str, Tool],
         sid: str,
         workspace_dir: Path,
+        num_predict: int | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """Drive ``/api/chat`` until the model stops requesting tools.
 
@@ -169,6 +201,15 @@ class OllamaClient:
         reason on it across this run_turn invocation, but ``new_messages``
         gets the truncated preview so subsequent inbounds don't re-pay for
         the full content. See ``_spool_and_truncate``.
+
+        ``num_predict`` caps each /api/chat call's generated tokens. When a
+        call hits the cap (``done_reason == "length"``) the partial is
+        inspected: an unclosed code fence triggers an immediate fail-loud
+        return; otherwise claw injects the partial back as an assistant
+        turn plus a recovery system note and re-calls /api/chat once so
+        the model can wrap up, restart tighter, or bail. The truncated
+        partial only ever lives in the in-loop ``messages``, never in
+        ``new_messages`` (transcript).
         """
         messages: list[dict[str, Any]] = []
         if system:
@@ -177,11 +218,17 @@ class OllamaClient:
         new_messages: list[dict[str, Any]] = []
 
         tool_specs = ollama_tool_spec(tools) if tools else None
+        options: dict[str, Any] | None = None
+        if num_predict is not None and num_predict != -1:
+            options = {"num_predict": num_predict}
         parse_retry_used = False
+        length_recovery_used = False
 
         for turn_idx in range(self.max_tool_turns):
             try:
-                response = await self.chat_once(model=model, messages=messages, tools=tool_specs)
+                response = await self.chat_once(
+                    model=model, messages=messages, tools=tool_specs, options=options,
+                )
             except httpx.HTTPStatusError as e:
                 if 500 <= e.response.status_code < 600 and not parse_retry_used:
                     parse_retry_used = True
@@ -190,12 +237,49 @@ class OllamaClient:
                         turn_idx,
                     )
                     messages.append({"role": "system", "content": _PARSE_RECOVERY_NOTE})
-                    response = await self.chat_once(model=model, messages=messages, tools=tool_specs)
+                    response = await self.chat_once(
+                        model=model, messages=messages, tools=tool_specs, options=options,
+                    )
                 else:
                     raise
             assistant_msg = response.get("message", {}) or {}
             content = assistant_msg.get("content", "") or ""
             tool_calls = assistant_msg.get("tool_calls") or []
+            done_reason = response.get("done_reason")
+
+            # Length-recovery branch: only fires for the "model was producing
+            # final-answer prose and got cut off" case (no tool_calls). When
+            # tool_calls are present, the model is mid-work — let the tool
+            # loop proceed normally; the partial content is just narration
+            # leading up to the call. The flag bounds recovery to once per
+            # run_turn so a still-truncated retry doesn't loop.
+            if done_reason == "length" and not tool_calls and not length_recovery_used:
+                if _has_unclosed_code_fence(content):
+                    log.warning(
+                        "turn %d: done_reason=length with unclosed code fence "
+                        "(content=%d chars); discarding partial",
+                        turn_idx, len(content),
+                    )
+                    return new_messages, (
+                        "[claw: output truncated mid-code-fence; partial discarded; "
+                        "retry with smaller scope]"
+                    )
+                length_recovery_used = True
+                log.info(
+                    "turn %d: done_reason=length (content=%d chars, no tool_calls); "
+                    "injecting continuation note and retrying once",
+                    turn_idx, len(content),
+                )
+                # Re-feed partial as assistant + recovery note as system.
+                # This second call IS the agent's decision mechanism.
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "system", "content": _LENGTH_RECOVERY_NOTE})
+                response = await self.chat_once(
+                    model=model, messages=messages, tools=tool_specs, options=options,
+                )
+                assistant_msg = response.get("message", {}) or {}
+                content = assistant_msg.get("content", "") or ""
+                tool_calls = assistant_msg.get("tool_calls") or []
 
             assistant_record: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:

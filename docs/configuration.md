@@ -22,6 +22,8 @@ The `/api/chat` client used for inference and compaction.
 | `base_url` | str | required | Base URL of the Ollama HTTP server, e.g. `http://127.0.0.1:11434`. |
 | `default_compaction_model` | str | required | Fallback model used for background compaction and memory_flush turns when an agent doesn't override. Pick a fast non-reasoning model — these turns aren't user-visible and shouldn't compete with primary inference for slots. |
 | `max_tool_turns` | int | `30` | Cap on tool round-trips per inbound message before the loop forces a stub final reply. Cron-driven research tasks can need 15–25; raise per deployment. |
+| `num_predict` | int \| null | `8192` | Per-call generation cap (Ollama `options.num_predict`). When the model hits this, claw inspects the partial: if the content has an unclosed Markdown code fence (odd count of ` ``` ` markers), the partial is discarded and `[claw: output truncated mid-code-fence; partial discarded; retry with smaller scope]` is returned to the caller; otherwise claw injects the partial back as an assistant turn plus a recovery system note and re-calls `/api/chat` once so the model can wrap up, restart with tighter scope, or bail. `null` or `-1` disables (unbounded — original behavior; runaway reasoning traces can hang the call until `request_timeout_s` fires). Override per agent / per persona below. |
+| `request_timeout_s` | float | `1800.0` | Per-call httpx read timeout for `/api/chat`. Should comfortably exceed the worst-case wall time for one `num_predict`-bounded generation on the slowest agent's model. |
 
 ## `memory_retrieval:`
 
@@ -111,6 +113,7 @@ Persona-based child agents spawned via the `spawn_subagent` tool.
 | `role` | str | required | One-word role label injected into the persona's system prompt context. |
 | `max_spawn_depth` | int | `0` | Deepest chain this persona will root. `0` = leaf (cannot spawn). |
 | `can_spawn` | list[str] \| null | `null` | Persona allowlist. `null` = any persona; `[]` = explicitly nothing; otherwise restricted set. Validated at config load against the persona registry. |
+| `num_predict` | int \| null | `null` | Per-persona override of `ollama.num_predict`. `null` inherits the global. Tune by role: researchers benefit from headroom for deep reasoning (e.g. `16384`); grunts should stay tight (e.g. `4096`). |
 
 The effective spawn budget when persona X is forked under parent Y is
 `min(parent_remaining - 1, X.max_spawn_depth)`, AND the spawn must be in
@@ -142,7 +145,10 @@ Flush turns that ask the agent to capture durable knowledge into
 | `force_flush_transcript_bytes` | int | `2_097_152` | Hard fallback. If the on-disk transcript JSONL crosses this size, flush fires regardless of token estimate. Catches pathological transcripts where token estimate underreports (e.g. lots of base64 in tool results). |
 | `periodic_growth_threshold` | int | `4000` | Periodic flush triggers when a session's transcript has grown by this many tokens since its last flush. With a 96K compaction trigger, 4K growth ≈ 4% — comfortable cadence. |
 | `turn_timeout_s` | float | `300.0` | Per-flush deadline. On timeout the flush is dropped and compaction proceeds anyway. |
-| `daily_note_tz` | str \| null | `null` | IANA zone (e.g. `America/New_York`) used to roll the daily-note filename. `null` = UTC. Set to operator's local TZ if cron / calendar / log timing is local. |
+
+## `tz:` (top-level)
+
+Optional, top-level (not nested). IANA zone name used for every operator-facing timestamp claw renders: the inbound-message envelope (so the model sees today's date + day-of-week on every turn), the `memory/YYYY-MM-DD.md` daily-note filename, and the `lifecycle.daily_session_rotate_hour`. Internal/persisted timestamps (transcripts, memory sync state, compaction bookkeeping) stay UTC regardless. Omit (or `null`) for UTC.
 
 ## `lifecycle:`
 
@@ -150,7 +156,7 @@ Whole block optional.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `daily_session_rotate_hour` | int \| null | `null` | Hour (0–23, system local time) at which every active session gets a final memory_flush + the JSONL is archived with a `.reset-<ts>` suffix + per-session caches clear. `null` disables. Memory files under `<workspace>/memory/` are NOT touched, so durable knowledge persists across rotate. |
+| `daily_session_rotate_hour` | int \| null | `null` | Hour (0–23, in `tz`) at which every active session gets a final memory_flush + the JSONL is archived with a `.reset-<ts>` suffix + per-session caches clear. `null` disables. Memory files under `<workspace>/memory/` are NOT touched, so durable knowledge persists across rotate. |
 
 ## `agents:`
 
@@ -164,6 +170,7 @@ List of agent blocks. At least one required. Each block:
 | `compaction_model` | str \| null | `null` | Model for background compaction + memory_flush. `null` falls back to `ollama.default_compaction_model`. |
 | `max_spawn_depth` | int | `1` | Deepest subagent chain this top-level agent can root. `0` = no spawning. |
 | `can_spawn` | list[str] \| null | `null` | Persona allowlist. Same semantics as persona-level `can_spawn`. |
+| `num_predict` | int \| null | `null` | Per-agent override of `ollama.num_predict`. `null` inherits the global. |
 | `extra_paths` | list[str] | `[]` | Workspace-relative paths injected into the system prompt every turn. Conventionally `IDENTITY.md`, `USER.md`, `SOUL.md`, `AGENTS.md`, `TOOLS.md`. Missing files silently skipped. Keep this list disjoint from indexed memory sources. |
 | `matrix` | block | required | Per-agent Matrix account. See below. |
 
