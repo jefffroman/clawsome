@@ -12,7 +12,7 @@ to specific keys point at `docs/configuration.md`.
 | Pre-compaction memory_flush | Request path, when transcript within `memory_flush.soft_threshold_tokens` of compaction trigger | Background asyncio task (off the user-reply critical path) | Same as above |
 | Pre-rotate memory_flush | At `lifecycle.daily_session_rotate_hour`, once per active session before wipe | Synchronous under per-session lock | Same as above |
 | Mid-session compaction | Request path, when estimated transcript tokens > `compaction.mid_session_token_threshold` | Background asyncio task | Older portion of transcript collapsed to a `## Pre-compaction Recap` row |
-| Idle recap | Agent boot, if prior session's last turn older than `compaction.idle_recap_seconds` | Synchronous, pre-live | `## Last Session Recap` row prepended on next prompt |
+| Idle recap | Agent boot. Older than `compaction.idle_recap_seconds` → archive + recap; younger → transcript resumes intact, no recap | Synchronous, pre-live | `## Last Session Recap` row prepended on the fresh session; prior JSONL archived `.recap-<ts>` |
 | Periodic reindex | Maintenance loop, every 5 min, if memory source files' hash changed | Background asyncio task | Refreshed ChromaDB + BM25 + graph |
 | Daily session rotate | At `lifecycle.daily_session_rotate_hour` | Synchronous per session | Final memory_flush, JSONL archived `.reset-<ts>`, caches cleared |
 
@@ -92,8 +92,14 @@ The next inbound message starts a fresh session. Memory files under
 `<workspace>/memory/` are never touched, so durable knowledge persists.
 
 Useful as a daily reset to keep transcripts from growing indefinitely.
-With `idle_recap_seconds` set to ~1h, the next session also gets a "Last
-Session Recap" row prepended automatically.
+Continuity across the wipe comes from the pre-rotate `memory_flush`,
+not from idle recap: the flush appends durable knowledge to
+`memory/YYYY-MM-DD.md`, which surfaces via retrieval on the next turn.
+Idle recap does *not* fire after a rotate — the JSONL is already
+archived, so `maybe_idle_recap` finds no `last_ts` and bails. If you
+want a recap on resume rather than a hard reset, leave
+`daily_session_rotate_hour` unset and let `idle_recap_seconds` cover
+the conversational gap instead.
 
 ## Memory retrieval
 

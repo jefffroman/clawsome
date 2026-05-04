@@ -8,18 +8,14 @@ A lean python harness for running persistent AI agents.
 <br clear="left">
 
 
-## Quick start
+## Setup
 
-`matrix-nio[e2e]` requires libolm. On macOS, `python-olm` builds from source
-(no PyPI wheels) and the bundled libolm needs two patches against modern
-cmake + Apple Clang — see the matrix-nio / python-olm install notes.
+Clawsome talks to a few external services (Ollama, SearXNG, a Matrix
+homeserver) — get those running first, then `pip install -e .` and
+point claw at a populated `claw.yaml`.
 
-```
-brew install libolm
-pip install -e .
-cp claw.example.yaml claw.yaml      # edit, then:
-claw --config claw.yaml
-```
+→ See [`docs/setup.md`](docs/setup.md) for prerequisites, install notes
+(including the macOS libolm wrinkle), and a first-boot checklist.
 
 ## Architecture
 

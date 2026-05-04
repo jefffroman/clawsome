@@ -19,7 +19,7 @@ The `/api/chat` client used for inference and compaction.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `base_url` | str | required | Base URL of the Ollama HTTP server, e.g. `http://127.0.0.1:11434`. |
+| `base_url` | str | required | Base URL of the Ollama HTTP server, e.g. `http://127.0.0.1:11434`. **Must match the daemon's actual bind URL** (`OLLAMA_HOST`). Every model tag referenced elsewhere in this config (`agents[*].primary_model`, `agents[*].compaction_model`, `default_compaction_model`, `subagents.personas[*].model`, `subagents.default_model`) must already be pulled on this server (`ollama pull <tag>`). |
 | `default_compaction_model` | str | required | Fallback model used for background compaction and memory_flush turns when an agent doesn't override. Pick a fast non-reasoning model — these turns aren't user-visible and shouldn't compete with primary inference for slots. |
 | `max_tool_turns` | int | `30` | Cap on tool round-trips per inbound message before the loop forces a stub final reply. Cron-driven research tasks can need 15–25; raise per deployment. |
 | `num_predict` | int \| null | `8192` | Per-call generation cap (Ollama `options.num_predict`). When the model hits this, claw inspects the partial: if the content has an unclosed Markdown code fence (odd count of ` ``` ` markers), the partial is discarded and `[claw: output truncated mid-code-fence; partial discarded; retry with smaller scope]` is returned to the caller; otherwise claw injects the partial back as an assistant turn plus a recovery system note and re-calls `/api/chat` once so the model can wrap up, restart with tighter scope, or bail. `null` or `-1` disables (unbounded — original behavior; runaway reasoning traces can hang the call until `request_timeout_s` fires). Override per agent / per persona below. |
@@ -40,7 +40,7 @@ Backend for the `web_search` built-in tool.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `base_url` | str | required | URL of a SearXNG instance. The `web_search` tool calls `<base_url>/search?q=...&format=json`. |
+| `base_url` | str | required | URL of a SearXNG instance. The `web_search` tool calls `<base_url>/search?q=...&format=json` — **the SearXNG instance must have JSON output enabled** (`search.formats:` in `settings.yml` must include `json`; upstream defaults ship HTML-only). |
 
 ## `cron:`
 
@@ -49,7 +49,7 @@ In-process APScheduler that fires `InboundMessage(channel="cron", ...)` on sched
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | required | Master switch. `false` skips the scheduler entirely. |
-| `jobs_file` | path | required | Path to the JSON file holding job definitions. See "jobs.json schema" below. |
+| `jobs_file` | path | required | Path to the JSON file holding job definitions. **Must be writable by the claw user if `exposed_to` is non-empty** — agents rewrite the file via `cron_add` / `cron_remove`. See "jobs.json schema" below. |
 | `max_instances_per_job` | int | `1` | Per-job concurrency cap. With `1`, a still-running job blocks its own next firing. |
 | `exposed_to` | list[str] | `[]` | Agent ids granted the `cron_add` / `cron_list` / `cron_remove` tools. Empty disables agent-driven scheduling (jobs in `jobs_file` still fire). |
 | `default_deliver_to` | str \| null | `null` | Fallback delivery target (e.g. an MXID) when `cron_add` is called without an explicit `deliver_to`. `null` requires the agent to specify per call. |
@@ -126,7 +126,7 @@ target a 192K Ollama context.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `idle_recap_seconds` | int | `3600` | If the prior session's last turn is older than this on agent boot, prepend a `## Last Session Recap` row. |
+| `idle_recap_seconds` | int | `3600` | Boundary between resume and recap on agent boot. Younger: the existing transcript stays loaded and the agent resumes mid-conversation. Older: the JSONL is archived (`.recap-<ts>`) and a fresh session opens with a `## Last Session Recap` system block. |
 | `mid_session_token_threshold` | int | `96000` | Estimated transcript tokens past which mid-session compaction fires. Default fires at ~50% of a 192K context. |
 | `reserve_tokens` | int | `48000` | Newest-tokens budget preserved verbatim when compaction fires; older portion is summarized. Walk advances to the next `user`-role boundary so it doesn't slice mid-tool-call sequence. Default = 1/4 of 192K. |
 
@@ -148,7 +148,7 @@ Flush turns that ask the agent to capture durable knowledge into
 
 ## `tz:` (top-level)
 
-Optional, top-level (not nested). IANA zone name used for every operator-facing timestamp claw renders: the inbound-message envelope (so the model sees today's date + day-of-week on every turn), the `memory/YYYY-MM-DD.md` daily-note filename, and the `lifecycle.daily_session_rotate_hour`. Internal/persisted timestamps (transcripts, memory sync state, compaction bookkeeping) stay UTC regardless. Omit (or `null`) for UTC.
+Optional, top-level (not nested). IANA zone name used for every operator-facing timestamp claw renders: the inbound-message envelope (so the model sees today's date + day-of-week on every turn), the `memory/YYYY-MM-DD.md` daily-note filename, and the `lifecycle.daily_session_rotate_hour`. Internal/persisted timestamps (transcripts, memory sync state, compaction bookkeeping) stay UTC regardless. Omit (or `null`) for UTC. **Must be a valid IANA zone name installed in the host's tzdata** (e.g., `America/New_York`, `Europe/Berlin`).
 
 ## `lifecycle:`
 
@@ -165,7 +165,7 @@ List of agent blocks. At least one required. Each block:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `id` | str | required | Agent identifier. Used in logs, transcript naming, `cron.exposed_to`, etc. Must be unique across the deployment. |
-| `workspace` | path | required | Workspace directory. Must exist and be writable by the user running claw. |
+| `workspace` | path | required | Workspace directory. **Must exist and be writable by the user running claw before first boot.** Subdirs (`memory/`, `transcripts/`, `.memory/`, `.matrix-store/`, `.tool-results/`) are created on demand. |
 | `primary_model` | str | required | Default Ollama model for user-reply turns. |
 | `compaction_model` | str \| null | `null` | Model for background compaction + memory_flush. `null` falls back to `ollama.default_compaction_model`. |
 | `max_spawn_depth` | int | `1` | Deepest subagent chain this top-level agent can root. `0` = no spawning. |
@@ -178,16 +178,16 @@ List of agent blocks. At least one required. Each block:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `user_id` | str (MXID) | required | Bot's full Matrix ID, e.g. `@bot:matrix.example.com`. |
-| `homeserver` | URL | required | Homeserver base URL. |
-| `access_token_file` | path | required | One-line file with the bot's access token. Mode 0600. Mint via `POST /_matrix/client/r0/login`. |
-| `device_id` | str | required | Stable device id for this bot. Conventionally uppercase. |
+| `user_id` | str (MXID) | required | Bot's full Matrix ID, e.g. `@bot:matrix.example.com`. The localpart must be a registered user on the homeserver. **The server-name portion (after `:`) must match the homeserver's `server_name`** (Synapse: `server_name:` in `homeserver.yaml`) — *not* the URL host of `homeserver` below. The two are independent values. |
+| `homeserver` | URL | required | Homeserver base URL — *where to reach* the server, e.g. `http://127.0.0.1:6167` for a same-host Synapse. **Must match the homeserver's actual bind URL.** Independent from the server-name in `user_id`. |
+| `access_token_file` | path | required | One-line file with the bot's access token. Mode 0600. Token must be valid for `user_id` on `homeserver`. Mint via `POST /_matrix/client/r0/login` — see `docs/operations.md` *Matrix bot first-deploy*. |
+| `device_id` | str | required | Stable device id for this bot. Conventionally uppercase. **Must be unique per `user_id` for fresh crypto state** — reusing an existing device id binds to that device's existing Olm sessions on the homeserver. |
 | `device_name` | str | required | Human-facing device label visible in Element's device list. |
-| `store_path` | path | required | matrix-nio crypto store directory. Holds Olm sessions, group sessions. Conventionally `<workspace>/.matrix-store`. |
+| `store_path` | path | required | matrix-nio crypto store directory. Holds Olm sessions, group sessions. Conventionally `<workspace>/.matrix-store`. **Must persist across restarts** — losing it forces a fresh crypto handshake and invalidates ongoing E2E sessions. |
 | `encryption` | bool | `true` | Enable E2E encryption. Disable only if testing against a non-encrypted room. |
 | `auto_join` | `"always"` \| `"never"` | `"always"` | Whether to auto-join rooms the bot is invited to. |
 | `allow_bots` | `"mentions"` \| `"all"` \| `"none"` | `"mentions"` | Filter for group-room messages. `"mentions"` = reply only when explicitly `@`-mentioned. |
-| `allow_from` | list[str] (MXIDs) | `[]` | DM allowlist. The bot accepts DMs only from these MXIDs. Group rooms ignore this list. |
+| `allow_from` | list[str] (MXIDs) | `[]` | DM allowlist. The bot accepts DMs only from these MXIDs (e.g. `@alice:localhost.localnet`). Group rooms ignore this list. **Each entry must be a real account on the homeserver** — clawsome ships no signup flow, so register human users out-of-band (Synapse: `register_new_matrix_user`) before listing them here. |
 | `password_file` | path \| null | `null` | One-line file with the bot account login password. Needed only for the one-time cross-signing UIA challenge on `/keys/device_signing/upload`. If unset, cross-signing is skipped — the bot still works but appears as "user verification unavailable" in Element. Mode 0600. |
 | `force_cross_signing_replace` | bool | `false` | One-shot operator escape hatch: replace any existing cross-signing keys on the homeserver with freshly-generated ones. Use when migrating an account previously bootstrapped by another client. **Destructive** — invalidates prior device signatures and forces every other user to re-verify this account. Set `true` for one boot, then revert. |
 

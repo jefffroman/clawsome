@@ -3,10 +3,11 @@
 Mental model and request lifecycle. Read this first — the other docs use the
 vocabulary it sets.
 
-## The three abstractions
+## The four abstractions
 
 A clawsome deployment runs **one process** managing **N agents**, each with
-**one or more inbound channels**.
+**one or more inbound channels**. Agents may transiently fork into
+**subagents** drawn from a shared registry of **personas**.
 
 **Agent.** A persistent identity. Owns: a workspace directory, a primary
 inference model, a tool registry, a memory index, a transcript per session,
@@ -24,6 +25,23 @@ account per agent). The `Channel` protocol lives in
 `claw/channel/base.py` — `start`, `send`, `shutdown`, `typing`. New
 surfaces (Slack, IRC, HTTP webhook, CLI) implement that protocol and
 register on the agent.
+
+**Subagent (persona).** A *persona* is a named subagent template — model,
+role label, spawn budget, optional `can_spawn` allowlist — declared once
+under `subagents.personas:` in `claw.yaml` and shared across every agent
+in the deployment. A *subagent* is a transient `Agent` fork instantiated
+from a persona by the `spawn_subagent` tool: one-shot, no transcript
+persistence, no compaction, sharing the parent's workspace, memory
+index, and tool registry (minus `spawn_subagent` and `cron_*`). The fork
+runs `run_one_shot(prompt)` and its final reply substitutes for the
+tool result in the parent's tool loop. Spawn budgets shrink strictly
+down each chain (`min(parent_remaining - 1,
+persona.max_spawn_depth)`); global `max_concurrent` and per-parent
+`max_children_per_agent` cap live fan-out; `ABSOLUTE_MAX_CHAIN_DEPTH=5`
+is the runtime safety net. The shape — a pool of named (model, role)
+pairs any agent can delegate into and discard — is content-neutral; the
+example `researcher / coder / grunt` triple is one defaulting, not a
+fixed taxonomy.
 
 ## Request lifecycle
 
@@ -97,9 +115,13 @@ Run off the user-reply critical path so latency stays bounded.
   `compaction.mid_session_token_threshold`, the older portion is
   summarized into a single `## Pre-compaction Recap` row and atomically
   swapped in under the per-session lock.
-- **Idle recap.** On agent boot, if the prior session's last turn is older
-  than `compaction.idle_recap_seconds`, a `## Last Session Recap` row is
-  prepended.
+- **Idle recap.** On agent boot, the prior session's last-turn age
+  decides resume vs. recap. *Younger* than
+  `compaction.idle_recap_seconds` → the existing transcript stays loaded
+  and the agent picks up mid-conversation (no recap, no archive).
+  *Older* → the JSONL is archived (`.recap-<ts>`) and a fresh session
+  opens prefixed with a `## Last Session Recap` system block summarizing
+  the prior turns.
 - **Periodic reindex.** Maintenance loop reindexes each agent's memory
   source files if their hash changed since last reindex.
 - **Daily session rotate.** At `lifecycle.daily_session_rotate_hour`
@@ -124,6 +146,8 @@ outside what `claw.yaml` declares.
 
 ## Further reading
 
+- `docs/setup.md` — prerequisites (Ollama, SearXNG, Matrix homeserver),
+  Python install, first-boot checklist.
 - `docs/configuration.md` — full key-by-key `claw.yaml` reference.
 - `docs/operations.md` — runbook (compaction tuning, matrix bot setup,
   troubleshooting).
