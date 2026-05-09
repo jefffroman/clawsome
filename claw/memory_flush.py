@@ -97,6 +97,8 @@ def will_pre_compact_flush(
 
 async def run_memory_flush(
     *,
+    agent_id: str,
+    peer_label: str,
     ollama: OllamaClient,
     sid: str,
     workspace_dir: Path,
@@ -112,11 +114,14 @@ async def run_memory_flush(
     discarded — the side effect on disk is what we want.
 
     ``reason`` is a short label ("pre-compact" / "periodic-growth") logged
-    when the flush starts. ``sid`` and ``workspace_dir`` are forwarded to
-    ``ollama.run_turn`` for tool-result spooling. ``tz_name`` (IANA zone)
-    controls which day's `memory/YYYY-MM-DD.md` file the agent is asked to
-    append to; ``None`` falls back to UTC. Caller typically passes
-    ``cfg.tz``.
+    when the flush starts. ``agent_id`` and ``peer_label`` shape the
+    run_turn label as ``<agent_id>:flush:<reason>:<peer_label>`` so log
+    lines self-identify whose conversation is being flushed. ``sid`` is
+    forwarded to ``ollama.run_turn`` for tool-result spooling and as the
+    verbose-only correlation handle in the log prefix. ``tz_name`` (IANA
+    zone) controls which day's `memory/YYYY-MM-DD.md` file the agent is
+    asked to append to; ``None`` falls back to UTC. Caller typically
+    passes ``cfg.tz``.
     """
     log.info("[%s] memory flush starting (reason=%s, %d rows)", sid, reason, len(rows))
     history = [as_message(r) for r in rows]
@@ -129,6 +134,8 @@ async def run_memory_flush(
             tools=tools,
             sid=sid,
             workspace_dir=workspace_dir,
+            label=f"{agent_id}:flush:{reason}:{peer_label}",
+            verbose_suffix=sid,
         )
     except Exception:
         log.exception("[%s] memory flush turn failed (reason=%s)", sid, reason)

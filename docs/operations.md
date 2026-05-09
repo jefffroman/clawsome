@@ -191,7 +191,7 @@ loggers to DEBUG. Verbose; flip back off when done investigating.
 | `claw.memory_flush INFO [<sid>] memory flush starting (reason=<r>, N rows)` | Flush turn beginning. |
 | `claw.memory_flush INFO [<sid>] memory flush done (reason=<r>)` | Flush turn complete; durable bullets written. |
 | `claw.memory_flush ERROR [<sid>] memory flush turn failed (reason=<r>)` | Flush threw an exception (Traceback follows). Compaction will proceed regardless. |
-| `claw.ollama INFO turn N: K tool_call(s) requested` | Tool round-trip. If you see N approaching `max_tool_turns`, the model is in a tool loop. |
+| `claw.ollama INFO [<label>] turn N: K tool_call(s) requested` | Tool round-trip. `<label>` shape: `<agent_id>:<kind>[:<peer_or_task>]` — e.g. `quint:main:alice` (user-facing turn from `@alice:example.org`), `quint:flush:periodic-growth:alice` (background memory flush of that user's session), `quint:subagent:chop-chop-a1b2c3d4` (subagent one-shot, parent's id + kind + the spawned task_id). At DEBUG verbosity an additional `:<sid>` correlation handle is appended for the matrix call sites (subagent labels stay as-is — the task_id is already a stable correlation handle). If N approaches `max_tool_turns`, the model is in a tool loop. |
 | `WARNING [<agent>] background flush timed out after Xs` | Flush exceeded `turn_timeout_s`. |
 | `claw.main INFO firing job <name>` | Cron-driven inbound being dispatched. |
 

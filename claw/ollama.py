@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,11 @@ from claw.config import OllamaConfig
 from claw.tools.base import Tool, ollama_tool_spec
 
 log = logging.getLogger("claw.ollama")
+
+# Truncate per-call args in verbose tool-call logs. Long enough to identify
+# which write/bash/etc. is which from the leading characters; short enough
+# to keep an ``append_file`` with a multi-KB body from blowing up the log.
+_VERBOSE_ARG_PREVIEW_CHARS = 300
 
 # Big models with no streaming can be slow on cold cache; allow generous
 # wall time per request. Now configurable via OllamaConfig.request_timeout_s
@@ -105,7 +111,7 @@ _PARSE_RECOVERY_NOTE = (
 # assistant turn so the model sees its own truncated output, and this note
 # tells it to choose a recovery strategy. The model's response to this
 # note IS its decision — there's no separate "decision" mechanism.
-_LENGTH_RECOVERY_NOTE = (
+_LENGTH_RECOVERY_NOTE_WITH_PARTIAL = (
     "Your previous reply was cut off — you reached the output token cap. "
     "The partial above is everything you generated so far. Now choose: "
     "(1) if the partial already conveys a complete usable answer, finish "
@@ -114,6 +120,51 @@ _LENGTH_RECOVERY_NOTE = (
     "format; (3) if the question is genuinely too big, reply briefly "
     "explaining that and ask the user to narrow it down."
 )
+
+# Variant for the thinking-budget-exhaustion case: done_reason="length"
+# with content="" — the model spent the entire generation budget inside
+# its <think> trace and emitted no post-think prose. There's nothing to
+# wrap up, so we drop the "finish the partial" option and the empty
+# assistant turn isn't injected (some /api/chat parsers misbehave on
+# empty assistant content, and there's no information in it anyway).
+_LENGTH_RECOVERY_NOTE_EMPTY = (
+    "Your previous reply produced no output before hitting the output "
+    "token cap — your reasoning consumed the entire generation budget "
+    "without producing a final answer. Now choose: (1) restart with a "
+    "tighter scope or shorter format that fits within the budget, or "
+    "(2) reply briefly explaining that the question is too big to "
+    "answer at this depth and ask the user to narrow it down."
+)
+
+# One-shot system note for the "model finished naturally with empty
+# content + no tool_calls" case (typically done_reason="stop"). The
+# user only sees text replies, not tool calls or thinking traces, so
+# an empty turn is invisible to them — they can't tell whether the
+# work happened, failed, or is still in progress. Re-prompt for a
+# brief summary or direct answer.
+_EMPTY_REPLY_RECOVERY_NOTE = (
+    "Your previous reply was empty — you finished the turn without "
+    "sending any text to the user. The user can only see your text "
+    "replies, not your tool calls or thinking. Reply now with a brief "
+    "summary of what you did or the answer to their question."
+)
+
+
+def _label_prefix(label: str, verbose_suffix: str = "") -> str:
+    """Format the caller-supplied label as a log prefix. Empty string when
+    no label is provided.
+
+    ``label`` is shown in every mode. ``verbose_suffix`` is appended
+    (joined with ``:``) only when the ``claw.ollama`` logger is at DEBUG.
+    Callers should put the always-useful information in ``label`` (agent
+    id, kind, peer name, task id) and any verbose-only correlation
+    handle (session id, internal sid) in ``verbose_suffix``.
+    """
+    if not label:
+        return ""
+    if verbose_suffix and log.isEnabledFor(logging.DEBUG):
+        return f"[{label}:{verbose_suffix}] "
+    return f"[{label}] "
 
 
 def _has_unclosed_code_fence(text: str) -> bool:
@@ -146,6 +197,7 @@ class OllamaClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
+        label: str = "",
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
@@ -170,8 +222,8 @@ class OllamaClient:
             if last_assistant is not None:
                 preview = (last_assistant.get("content") or "")[:500]
             log.warning(
-                "ollama 5xx model=%s status=%d body=%r last_assistant_content_preview=%r",
-                model, resp.status_code, resp.text[:500], preview,
+                "%sollama 5xx model=%s status=%d body=%r last_assistant_content_preview=%r",
+                _label_prefix(label), model, resp.status_code, resp.text[:500], preview,
             )
         resp.raise_for_status()
         return resp.json()
@@ -185,6 +237,8 @@ class OllamaClient:
         tools: dict[str, Tool],
         sid: str,
         workspace_dir: Path,
+        label: str,
+        verbose_suffix: str = "",
         num_predict: int | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """Drive ``/api/chat`` until the model stops requesting tools.
@@ -202,14 +256,29 @@ class OllamaClient:
         gets the truncated preview so subsequent inbounds don't re-pay for
         the full content. See ``_spool_and_truncate``.
 
-        ``num_predict`` caps each /api/chat call's generated tokens. When a
-        call hits the cap (``done_reason == "length"``) the partial is
-        inspected: an unclosed code fence triggers an immediate fail-loud
-        return; otherwise claw injects the partial back as an assistant
-        turn plus a recovery system note and re-calls /api/chat once so
-        the model can wrap up, restart tighter, or bail. The truncated
-        partial only ever lives in the in-loop ``messages``, never in
-        ``new_messages`` (transcript).
+        ``num_predict`` caps each /api/chat call's generated tokens. The
+        recovery branch fires once per ``run_turn`` when the model emits
+        no tool_calls AND either (a) hits the cap (``done_reason ==
+        "length"``) — claw inspects the partial, fails loud on an unclosed
+        code fence, otherwise re-feeds the partial + a length-recovery
+        note so the model can wrap up, restart tighter, or bail; or (b)
+        finishes with empty content under any other ``done_reason``
+        (typically ``"stop"``) — claw re-prompts with
+        ``_EMPTY_REPLY_RECOVERY_NOTE`` so the model produces something
+        the user can actually see. The truncated partial only ever lives
+        in the in-loop ``messages``, never in ``new_messages`` (transcript).
+
+        ``label`` is a caller-supplied prefix prepended to every
+        ``claw.ollama`` log line emitted from this call. Always shown.
+        Format convention: ``<agent_id>:<kind>[:<peer_or_task>]`` —
+        e.g. ``"quint:main:alice"``, ``"quint:flush:periodic-growth:alice"``,
+        ``"quint:subagent:chop-chop-a1b2c3d4"``.
+
+        ``verbose_suffix`` is an optional addendum (joined with ``:``)
+        appended only when ``claw.ollama`` is at DEBUG. Use it for
+        correlation handles that are noisy in normal operator scans —
+        typically the matrix-room sid for the main / flush call sites,
+        empty for subagents (their task_id is already in ``label``).
         """
         messages: list[dict[str, Any]] = []
         if system:
@@ -222,23 +291,27 @@ class OllamaClient:
         if num_predict is not None and num_predict != -1:
             options = {"num_predict": num_predict}
         parse_retry_used = False
-        length_recovery_used = False
+        recovery_used = False
+
+        prefix = _label_prefix(label, verbose_suffix)
 
         for turn_idx in range(self.max_tool_turns):
             try:
                 response = await self.chat_once(
                     model=model, messages=messages, tools=tool_specs, options=options,
+                    label=label,
                 )
             except httpx.HTTPStatusError as e:
                 if 500 <= e.response.status_code < 600 and not parse_retry_used:
                     parse_retry_used = True
                     log.info(
-                        "turn %d: ollama 5xx; injecting recovery note and retrying once",
-                        turn_idx,
+                        "%sturn %d: ollama 5xx; injecting recovery note and retrying once",
+                        prefix, turn_idx,
                     )
                     messages.append({"role": "system", "content": _PARSE_RECOVERY_NOTE})
                     response = await self.chat_once(
                         model=model, messages=messages, tools=tool_specs, options=options,
+                        label=label,
                     )
                 else:
                     raise
@@ -247,35 +320,72 @@ class OllamaClient:
             tool_calls = assistant_msg.get("tool_calls") or []
             done_reason = response.get("done_reason")
 
-            # Length-recovery branch: only fires for the "model was producing
-            # final-answer prose and got cut off" case (no tool_calls). When
-            # tool_calls are present, the model is mid-work — let the tool
-            # loop proceed normally; the partial content is just narration
-            # leading up to the call. The flag bounds recovery to once per
-            # run_turn so a still-truncated retry doesn't loop.
-            if done_reason == "length" and not tool_calls and not length_recovery_used:
-                if _has_unclosed_code_fence(content):
+            # Recovery branch: model returned no tool_calls and no
+            # actionable output. Two trigger cases:
+            #   (a) done_reason="length": model hit the output token cap.
+            #       Re-feed the partial (or just a note, if empty) so the
+            #       model can wrap up, restart tighter, or bail.
+            #   (b) empty content with any other done_reason (typically
+            #       "stop"): model finished without sending text. The user
+            #       sees nothing — re-prompt for a final reply.
+            # When tool_calls are present, the model is mid-work; let the
+            # loop proceed normally even if content is empty (the partial
+            # content is just pre-tool-call narration). The flag bounds
+            # recovery to once per run_turn so a still-degenerate retry
+            # doesn't loop.
+            empty_reply = not content.strip()
+            if (
+                not tool_calls
+                and not recovery_used
+                and (done_reason == "length" or empty_reply)
+            ):
+                if done_reason == "length" and _has_unclosed_code_fence(content):
                     log.warning(
-                        "turn %d: done_reason=length with unclosed code fence "
+                        "%sturn %d: done_reason=length with unclosed code fence "
                         "(content=%d chars); discarding partial",
-                        turn_idx, len(content),
+                        prefix, turn_idx, len(content),
                     )
                     return new_messages, (
                         "[claw: output truncated mid-code-fence; partial discarded; "
                         "retry with smaller scope]"
                     )
-                length_recovery_used = True
-                log.info(
-                    "turn %d: done_reason=length (content=%d chars, no tool_calls); "
-                    "injecting continuation note and retrying once",
-                    turn_idx, len(content),
-                )
-                # Re-feed partial as assistant + recovery note as system.
-                # This second call IS the agent's decision mechanism.
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "system", "content": _LENGTH_RECOVERY_NOTE})
+                recovery_used = True
+                if done_reason == "length":
+                    log.info(
+                        "%sturn %d: done_reason=length (content=%d chars, no tool_calls); "
+                        "injecting continuation note and retrying once",
+                        prefix, turn_idx, len(content),
+                    )
+                    # Re-feed partial as assistant + recovery note as
+                    # system. Empty-partial case (thinking-budget
+                    # exhaustion) skips the empty assistant turn and uses
+                    # the EMPTY-variant note — drops the nonsensical
+                    # "finish the partial" option.
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "system",
+                            "content": _LENGTH_RECOVERY_NOTE_WITH_PARTIAL,
+                        })
+                    else:
+                        messages.append({
+                            "role": "system",
+                            "content": _LENGTH_RECOVERY_NOTE_EMPTY,
+                        })
+                else:
+                    log.info(
+                        "%sturn %d: done_reason=%s with empty content and no "
+                        "tool_calls; injecting empty-reply recovery note "
+                        "and retrying once",
+                        prefix, turn_idx, done_reason,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": _EMPTY_REPLY_RECOVERY_NOTE,
+                    })
                 response = await self.chat_once(
                     model=model, messages=messages, tools=tool_specs, options=options,
+                    label=label,
                 )
                 assistant_msg = response.get("message", {}) or {}
                 content = assistant_msg.get("content", "") or ""
@@ -292,7 +402,30 @@ class OllamaClient:
             if not tool_calls:
                 return new_messages, content
 
-            log.info("turn %d: %d tool_call(s) requested", turn_idx, len(tool_calls))
+            tc_counts = Counter(
+                ((tc.get("function") or {}).get("name") or "?")
+                for tc in assistant_record["tool_calls"]
+            )
+            tc_summary = ", ".join(
+                f"{name}({n})" for name, n in tc_counts.most_common()
+            )
+            log.info(
+                "%sturn %d: %d tool_call(s) requested: %s",
+                prefix, turn_idx, len(tool_calls), tc_summary,
+            )
+            if log.isEnabledFor(logging.DEBUG):
+                for tc in assistant_record["tool_calls"]:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or "?"
+                    args_str = json.dumps(
+                        fn.get("arguments") or {},
+                        default=str, ensure_ascii=False,
+                    )
+                    if len(args_str) > _VERBOSE_ARG_PREVIEW_CHARS:
+                        args_str = (
+                            args_str[: _VERBOSE_ARG_PREVIEW_CHARS - 3] + "..."
+                        )
+                    log.debug("%s  %s(%s)", prefix, name, args_str)
             for tc in assistant_record["tool_calls"]:
                 result_text = await _run_one_tool(tc, tools)
                 fn = tc.get("function", {}) or {}
@@ -317,7 +450,10 @@ class OllamaClient:
                     ),
                 })
 
-        log.warning("hit max_tool_turns=%d without final assistant text", self.max_tool_turns)
+        log.warning(
+            "%shit max_tool_turns=%d without final assistant text",
+            prefix, self.max_tool_turns,
+        )
         return new_messages, "[hit tool-use limit; please try again]"
 
     async def summarize(

@@ -38,7 +38,7 @@ async def _run_bash(workspace_dir: Path, args: dict[str, Any]) -> str:
     cmd = (args.get("command") or "").strip()
     if not cmd:
         return "error: command is required"
-    timeout = max(1, min(int(args.get("timeout_s", 60)), 300))
+    timeout = max(1, min(int(args.get("timeout_s", 60)), 3600))
 
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -152,13 +152,16 @@ def build_builtin_tools(workspace_dir: Path) -> dict[str, Tool]:
             name="bash",
             description=(
                 "Run a shell command inside the agent's workspace. "
-                "stdout, stderr, and exit code are returned."
+                "stdout, stderr, and exit code are returned. "
+                "Default timeout is 60s; pass timeout_s explicitly for longer commands (max 3600s). "
+                "For long-running work (builds, large clones, long test runs), prefer delegating "
+                "to a subagent via spawn_subagent rather than blocking your own turn."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run."},
-                    "timeout_s": {"type": "integer", "description": "Timeout in seconds (1-300; default 60)."},
+                    "timeout_s": {"type": "integer", "description": "Timeout in seconds (1-3600; default 60)."},
                 },
                 "required": ["command"],
             },

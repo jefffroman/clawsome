@@ -209,6 +209,7 @@ class MatrixChannel:
                 sender_name=sender_name,
                 text=event.body,
                 channel=self.name,
+                sender_id=event.sender,
             ))
         except Exception:
             log.exception("[%s] inbound handler raised", self.user_id)

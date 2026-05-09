@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -58,6 +59,11 @@ from claw.config import Config
 from claw.tools.base import Tool
 
 log = logging.getLogger("claw.triggers.scheduler")
+
+# Naive ISO 8601: YYYY-MM-DDTHH:MM[:SS] with no offset and no trailing Z.
+# kind=at job times are interpreted in tz (per-job or gateway default), so the
+# string must not embed its own zone — that's the whole point of the contract.
+_NAIVE_ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?")
 
 
 # APScheduler 3.x's ``CronTrigger.from_crontab`` passes the day-of-week
@@ -170,7 +176,11 @@ class JobRunner:
                 job_id)
             return
         kind = job.get("kind", "cron")
-        tz = job.get("tz")
+        tz = job.get("tz") or self.cfg.tz
+        if not tz:
+            raise ValueError(
+                f"job {job_id}: 'tz' is required (no per-job tz and no default in claw.yaml)"
+            )
         if kind == "cron":
             expr = job.get("cron")
             if not expr:
@@ -292,24 +302,32 @@ class JobRunner:
 # --- agent tools -----------------------------------------------------
 
 
-def build_cron_add_tool(agent_id: str, runner: JobRunner, default_deliver_to: str | None) -> Tool:
+def build_cron_add_tool(
+    agent_id: str,
+    runner: JobRunner,
+    default_deliver_to: str | None,
+    default_tz: str | None,
+) -> Tool:
     """Tool an agent can call to schedule its own future turn.
 
     Forces the ``agent`` field to the calling agent's id so persona
     promotion isn't possible via this surface. Each call creates a new
     job with a fresh uuid — there's no name/key collision concept.
-    ``default_deliver_to`` (from config) fills in when the caller omits
-    it; if neither is set, the call is rejected.
+    ``default_deliver_to`` and ``default_tz`` (from config) fill in when
+    the caller omits them; if no fallback is available, the call is
+    rejected.
     """
     async def _run(args: dict[str, Any]) -> str:
         kind = (args.get("kind") or "at").lower()
         message = args.get("message") or ""
-        tz = args.get("tz")
+        tz = args.get("tz") or default_tz
         deliver_to = (args.get("deliver_to") or default_deliver_to or "").strip()
         if not message:
             return "error: message is required"
         if not deliver_to:
             return "error: deliver_to is required (no default configured)"
+        if not tz:
+            return "error: tz is required — no per-call value and no gateway default configured"
         job: dict[str, Any] = {
             "agent": agent_id,
             "kind": kind,
@@ -327,6 +345,11 @@ def build_cron_add_tool(agent_id: str, runner: JobRunner, default_deliver_to: st
             run_date = args.get("run_date")
             if not run_date:
                 return "error: 'run_date' is required when kind='at'"
+            if not _NAIVE_ISO_RE.fullmatch(run_date):
+                return (
+                    "error: run_date must be naive ISO 8601 (no offset, no Z), "
+                    "e.g. '2026-05-15T14:30:00'; pass the zone in tz"
+                )
             job["run_date"] = run_date
             job["deleteAfterRun"] = bool(args.get("deleteAfterRun", True))
         else:
@@ -344,24 +367,28 @@ def build_cron_add_tool(agent_id: str, runner: JobRunner, default_deliver_to: st
         f"Defaults to {default_deliver_to}." if default_deliver_to
         else "Matrix MXID or room id to send your reply to. Required (no default configured)."
     )
+    tz_doc = (
+        f"IANA timezone. Defaults to {default_tz!r} (the gateway's configured "
+        f"tz) — override per call to schedule in a different zone." if default_tz
+        else "IANA timezone, e.g. 'America/New_York'. Required (no gateway default configured)."
+    )
     return Tool(
         name="cron_add",
         description=(
-            "Schedule a future turn for yourself. kind='at' fires once at "
-            "run_date (ISO 8601 with tz, e.g. '2026-05-15T14:30:00-07:00') "
-            "and auto-deletes. kind='cron' fires repeatedly on a crontab "
-            "expression (e.g. '0 8 * * *' or '*/15 * * * *'). The job's "
-            "`message` becomes a synthetic user turn for you, and your reply "
-            "is sent to `deliver_to` — write the message as a self-contained "
-            "instruction. Returns a short id; use it with cron_remove."
+            "Schedule a future turn for yourself. kind='at' fires once and "
+            "auto-deletes. kind='cron' fires repeatedly on a crontab "
+            "expression. The job's `message` becomes a synthetic user turn "
+            "for you, and your reply is sent to `deliver_to` — write the "
+            "message as a self-contained instruction. Returns a short id "
+            "for the job."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "kind": {"type": "string", "enum": ["at", "cron"], "description": "One-shot or recurring."},
-                "run_date": {"type": "string", "description": "ISO 8601 datetime with tz (kind=at only)."},
-                "cron": {"type": "string", "description": "Any crontab expression APScheduler accepts: '0 8 * * *', '*/15 * * * *', '0 9 * * 1-5' (kind=cron only)."},
-                "tz": {"type": "string", "description": "IANA timezone for the schedule, e.g. 'America/New_York'. Defaults to UTC if omitted."},
+                "run_date": {"type": "string", "description": "Naive ISO 8601 datetime, e.g. '2026-05-15T14:30:00'. Only for kind='at'."},
+                "cron": {"type": "string", "description": "Crontab expression, e.g. '0 8 * * *' or '*/15 * * * *'. Only for kind='cron'."},
+                "tz": {"type": "string", "description": tz_doc},
                 "message": {"type": "string", "description": "Synthetic user turn delivered to you when the job fires. Self-contained — no other context."},
                 "deliver_to": {"type": "string", "description": deliver_to_doc},
                 "deleteAfterRun": {"type": "boolean", "description": "Default true for kind=at, ignored for kind=cron."},

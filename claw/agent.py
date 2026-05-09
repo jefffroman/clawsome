@@ -45,7 +45,13 @@ from claw.memory import MemoryIndex
 from claw.memory_flush import run_memory_flush, will_pre_compact_flush
 from claw.ollama import OllamaClient
 from claw.tools.base import Tool
-from claw.tools.subagent import SubagentSpawner, build_subagent_tool
+from claw.tools.subagent import (
+    SubagentSpawner,
+    build_subagent_list_tool,
+    build_subagent_status_tool,
+    build_subagent_stop_tool,
+    build_subagent_spawn_tool,
+)
 from claw.transcript import (
     TranscriptStore,
     as_message,
@@ -66,6 +72,22 @@ from claw.workspace_inject import render_extra_paths
 log = logging.getLogger("claw.agent")
 
 
+def _derive_peer_label(msg: InboundMessage) -> str:
+    """Short human-meaningful identifier for ``msg``'s sender, used in
+    run_turn labels. MXID localpart for matrix (``@alice:example.org`` ->
+    ``alice``), sender_name for synthetic channels (cron / initial_prompt
+    / subagent_completion), channel name as last resort.
+    """
+    sid = msg.sender_id
+    if sid.startswith("@") and ":" in sid:
+        return sid[1:].split(":", 1)[0]
+    if sid:
+        return sid
+    if msg.sender_name:
+        return msg.sender_name
+    return msg.channel or "?"
+
+
 class Agent:
     def __init__(
         self,
@@ -82,6 +104,8 @@ class Agent:
         job_runner: JobRunner | None = None,
         remaining_spawn_budget: int | None = None,
         allowed_spawn_personas: tuple[str, ...] | None = None,
+        parent_id: str | None = None,
+        spawn_task_id: str | None = None,
     ) -> None:
         self.cfg = cfg
         self.agent_cfg = agent_cfg
@@ -111,6 +135,12 @@ class Agent:
             if allowed_spawn_personas is not None
             else agent_cfg.can_spawn
         )
+        # Set on subagent forks — used to label run_turn invocations as
+        # ``<parent_id>:subagent:<spawn_task_id>`` so the log stream
+        # self-identifies whose child this is and which spawn produced it.
+        # None for top-level agents.
+        self.parent_id = parent_id
+        self.spawn_task_id = spawn_task_id
 
         # Per-session state.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -133,6 +163,15 @@ class Agent:
         # Powers the envelope's elapsed-time delta. Cleared across restarts —
         # the first inbound after a restart simply has no `+elapsed` suffix.
         self._last_inbound_at: dict[str, datetime] = {}
+        # (channel, peer_id) of the inbound currently being processed —
+        # set at the top of _process_batch, read by subagent_spawn so the
+        # eventual completion message can be delivered to the same
+        # session. None outside an active turn.
+        self._active_inbound: tuple[str, str] | None = None
+        # Per-session cache of the last-seen peer_label, populated in
+        # _process_batch. Background flush sites (periodic, pre-rotate)
+        # read this so their log labels match the conversation's peer.
+        self._peer_label_by_sid: dict[str, str] = {}
 
         self._workspace_block: str | None = None
         # Boot-time recap state, keyed by session id.
@@ -143,10 +182,16 @@ class Agent:
         # MemoryIndex. Subagents inherit it via their parent's tool registry.
         self.tools["memory_search"] = build_memory_search_tool(memory)
 
-        # Expose spawn_subagent only if I have remaining budget. Per-agent
+        # Expose subagent_spawn only if I have remaining budget. Per-agent
         # gate; the global cfg.subagents has no max_spawn_depth field.
+        # The subagent_{status,list,stop} family pairs with subagent_spawn —
+        # the parent always wants to inspect/cancel the task_ids it was
+        # just handed.
         if spawner is not None and self.remaining_spawn_budget > 0:
-            self.tools["spawn_subagent"] = build_subagent_tool(self, spawner, depth)
+            self.tools["subagent_spawn"] = build_subagent_spawn_tool(self, spawner, depth)
+            self.tools["subagent_status"] = build_subagent_status_tool(self, spawner)
+            self.tools["subagent_list"] = build_subagent_list_tool(self, spawner)
+            self.tools["subagent_stop"] = build_subagent_stop_tool(self, spawner)
         # cron_* exposure is gated by config (cron.exposed_to). Single
         # responsibility per deployment — typically one agent owns
         # scheduling — so we don't hardcode names. Subagents inherit
@@ -158,7 +203,7 @@ class Agent:
             and cfg.cron.enabled
             and self.id in cfg.cron.exposed_to
         ):
-            self.tools["cron_add"] = build_cron_add_tool(self.id, job_runner, cfg.cron.default_deliver_to)
+            self.tools["cron_add"] = build_cron_add_tool(self.id, job_runner, cfg.cron.default_deliver_to, cfg.tz)
             self.tools["cron_list"] = build_cron_list_tool(job_runner)
             self.tools["cron_remove"] = build_cron_remove_tool(job_runner)
 
@@ -208,8 +253,13 @@ class Agent:
 
     # --- subagent fork --------------------------------------------------
 
-    def fork(self, persona: str) -> "Agent":
-        """Return a transient child agent for one-shot subagent execution."""
+    def fork(self, persona: str, task_id: str | None = None) -> "Agent":
+        """Return a transient child agent for one-shot subagent execution.
+
+        ``task_id`` is the spawner-assigned id for this specific spawn; the
+        child stores it for use in run_turn labels so logs self-identify
+        as ``<parent_id>:subagent:<task_id>``.
+        """
         persona_cfg = self.cfg.subagents.personas[persona.lower()]
         child_id = f"{self.id}.{persona.lower()}"
         if self.depth > 0:
@@ -228,7 +278,7 @@ class Agent:
         )
         base_tools = {
             k: v for k, v in self.tools.items()
-            if k != "spawn_subagent" and not k.startswith("cron_")
+            if k != "subagent_spawn" and not k.startswith("cron_")
         }
         # Child's spawn budget = min(parent_remaining - 1, persona's own ceiling).
         # Both constraints must hold; whichever is tighter wins. Floored at 0.
@@ -249,6 +299,8 @@ class Agent:
             depth=self.depth + 1,
             remaining_spawn_budget=child_budget,
             allowed_spawn_personas=persona_cfg.can_spawn,
+            parent_id=self.id,
+            spawn_task_id=task_id,
         )
 
     async def run_one_shot(self, prompt: str) -> str:
@@ -266,6 +318,15 @@ class Agent:
         history = [{"role": "user", "content": prompt}]
         system = self._build_system_prompt(retrieval_block)
         try:
+            sid = f"subagent-{self.id}"
+            # Label as <parent_id>:subagent:<task_id> when both are known
+            # (i.e. when this Agent was created via fork from a spawner);
+            # falls back to bare ``subagent:<sid>`` for any direct
+            # run_one_shot caller that bypassed fork.
+            if self.parent_id and self.spawn_task_id:
+                label = f"{self.parent_id}:subagent:{self.spawn_task_id}"
+            else:
+                label = f"subagent:{sid}"
             _new_messages, final_text = await self.ollama.run_turn(
                 model=self.agent_cfg.primary_model,
                 history=history,
@@ -274,8 +335,9 @@ class Agent:
                 # Subagent one-shots discard new_messages, but the model
                 # still sees full tool results in-loop and the spool side
                 # effect is bounded (one shot, <max_tool_turns calls).
-                sid=f"subagent-{self.id}",
+                sid=sid,
                 workspace_dir=self.agent_cfg.workspace,
+                label=label,
                 num_predict=self.num_predict,
             )
         except Exception:
@@ -392,6 +454,27 @@ class Agent:
                 parts.append(m.text)
         body = "\n\n".join(parts)
         peer_id = msgs[0].peer_id  # all batched msgs share peer_id by sid keying
+        # Make (channel, peer_id) visible to tools that fire later
+        # (notably subagent_spawn, which needs to know where to deliver
+        # the synthetic completion message).
+        self._active_inbound = (msgs[0].channel, peer_id)
+
+        # peer_label: short human-meaningful identifier for the conversation
+        # partner who triggered this turn — used in the run_turn label so
+        # log lines self-identify (``[quint:main:alice]``). Prefer the MXID
+        # localpart when sender_id is a Matrix MXID; fall back to
+        # sender_name (synthetic channels like cron/initial_prompt set
+        # sender_name to a meaningful tag); ultimate fallback is the
+        # channel name so labels never collapse to bare ``[quint:main]``.
+        peer_label = _derive_peer_label(msgs[0])
+        self._peer_label_by_sid[sid] = peer_label
+        # Anchor log line at the top of every turn — closes the visibility
+        # gap for plain-text replies, which otherwise produce no claw.*
+        # output (the ollama tool-turn lines fire only when tool_calls do).
+        log.info(
+            "[%s:main:%s] turn starting (%d inbound)",
+            self.id, peer_label, len(msgs),
+        )
 
         # Envelope wrap: gives the model a per-turn anchor for current date,
         # day-of-week, and elapsed time since the prior turn. Without this,
@@ -443,6 +526,8 @@ class Agent:
                 tools=self.tools,
                 sid=sid,
                 workspace_dir=self.agent_cfg.workspace,
+                label=f"{self.id}:main:{peer_label}",
+                verbose_suffix=sid,
                 num_predict=self.num_predict,
             )
         except Exception:
@@ -521,6 +606,8 @@ class Agent:
                 try:
                     await asyncio.wait_for(
                         run_memory_flush(
+                            agent_id=self.id,
+                            peer_label=self._peer_label_by_sid.get(sid, "?"),
                             ollama=self.ollama,
                             sid=sid,
                             workspace_dir=self.agent_cfg.workspace,
@@ -613,6 +700,8 @@ class Agent:
         try:
             ok = await asyncio.wait_for(
                 run_memory_flush(
+                    agent_id=self.id,
+                    peer_label=self._peer_label_by_sid.get(sid, "?"),
                     ollama=self.ollama,
                     sid=sid,
                     workspace_dir=self.agent_cfg.workspace,
@@ -668,6 +757,8 @@ class Agent:
                 try:
                     await asyncio.wait_for(
                         run_memory_flush(
+                            agent_id=self.id,
+                            peer_label=self._peer_label_by_sid.get(sid, "?"),
                             ollama=self.ollama,
                             sid=sid,
                             workspace_dir=self.agent_cfg.workspace,

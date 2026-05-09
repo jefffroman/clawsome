@@ -13,11 +13,16 @@ class InboundMessage:
 
     For Matrix: ``peer_id`` is the room ID (DMs have one peer; group rooms
     are routed by mention). ``sender_name`` is the human display name.
+    ``sender_id`` is the stable identifier — full MXID for matrix
+    (``@alice:example.org``), task_id for subagent_completion synthetics,
+    empty otherwise (cron / initial_prompt fall back to sender_name for
+    log labelling).
     """
     peer_id: str
     sender_name: str
     text: str
     channel: str
+    sender_id: str = ""
 
 
 InboundHandler = Callable[[InboundMessage], Awaitable[None]]

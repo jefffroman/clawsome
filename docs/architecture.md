@@ -30,18 +30,29 @@ register on the agent.
 role label, spawn budget, optional `can_spawn` allowlist — declared once
 under `subagents.personas:` in `claw.yaml` and shared across every agent
 in the deployment. A *subagent* is a transient `Agent` fork instantiated
-from a persona by the `spawn_subagent` tool: one-shot, no transcript
+from a persona by the `subagent_spawn` tool: one-shot, no transcript
 persistence, no compaction, sharing the parent's workspace, memory
-index, and tool registry (minus `spawn_subagent` and `cron_*`). The fork
-runs `run_one_shot(prompt)` and its final reply substitutes for the
-tool result in the parent's tool loop. Spawn budgets shrink strictly
-down each chain (`min(parent_remaining - 1,
+index, and tool registry (minus the `subagent_*` family and `cron_*`).
+Spawns are **async**: the fork's `run_one_shot(prompt)` runs as a
+detached `asyncio.Task` held by the spawner registry, and the
+`subagent_spawn` tool returns immediately with a `task_id` — freeing
+the parent's drainer to handle other inbound while the child works.
+On completion (success, failure, or cancellation) the spawner fires a
+synthetic `InboundMessage` whose `(channel, peer_id)` match the
+original spawn site, so the result arrives as the parent's next turn
+with the original prompt + result body already in context. The
+companion tools `subagent_status`, `subagent_list`, and `subagent_stop`
+cover polling, roster inspection, and cancellation. Spawn budgets
+shrink strictly down each chain (`min(parent_remaining - 1,
 persona.max_spawn_depth)`); global `max_concurrent` and per-parent
-`max_children_per_agent` cap live fan-out; `ABSOLUTE_MAX_CHAIN_DEPTH=5`
-is the runtime safety net. The shape — a pool of named (model, role)
-pairs any agent can delegate into and discard — is content-neutral; the
-example `researcher / coder / grunt` triple is one defaulting, not a
-fixed taxonomy.
+`max_children_per_agent` cap live fan-out (counts include both pending
+and running children, so concurrent spawns can't race past the cap);
+`ABSOLUTE_MAX_CHAIN_DEPTH=5` is the runtime safety net. The registry
+is in-memory only — gateway restart kills any in-flight subagents and
+forgets completed results. The shape — a pool of named (model, role)
+pairs any agent can delegate into and discard — is content-neutral;
+the example `researcher / coder / grunt` triple is one defaulting,
+not a fixed taxonomy.
 
 ## Request lifecycle
 

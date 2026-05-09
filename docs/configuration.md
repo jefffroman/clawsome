@@ -11,7 +11,7 @@ restart — no live-reload.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `verbose` | bool | `false` | Enables DEBUG-level logging across `claw.*` loggers. Verbose; flip on when investigating. |
+| `verbose` | bool | `false` | Enables DEBUG-level logging across `claw.*` loggers. Also expands the per-turn tool-call log line to include the full `kind:sid` label and adds one DEBUG line per tool call with truncated JSON arguments — so flipping this on will write tool args (Matrix room ids, bash commands, file contents being written, web search queries) to `/var/log/claw.log`. The log file is mode 644 owned by `claw`. Verbose; flip on when investigating. |
 
 ## `ollama:`
 
@@ -96,7 +96,12 @@ Flat list of job entries. Two kinds:
 
 ## `subagents:`
 
-Persona-based child agents spawned via the `spawn_subagent` tool.
+Persona-based child agents spawned via the `subagent_spawn` tool. Spawns
+are async — the call returns a `task_id` immediately and the result is
+delivered later as a synthetic completion message; companion tools
+`subagent_status`, `subagent_list`, and `subagent_stop` cover polling,
+roster inspection, and cancellation. See `docs/architecture.md` for the
+full lifecycle.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

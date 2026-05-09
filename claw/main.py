@@ -50,7 +50,13 @@ def _configure_logging(verbose: bool) -> None:
         level=level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    logging.getLogger("nio").setLevel(logging.INFO)
+    # Third-party library noise. INFO from nio (room state, crypto events,
+    # join callbacks) and apscheduler (per-job add lines) drowns out claw's
+    # own log lines during normal operation. Surface them only at WARNING
+    # in non-verbose mode; let DEBUG/verbose flip the firehose back on.
+    library_level = logging.INFO if verbose else logging.WARNING
+    logging.getLogger("nio").setLevel(library_level)
+    logging.getLogger("apscheduler").setLevel(library_level)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -215,7 +221,14 @@ async def _maintenance_loop(
                 try:
                     result = await index.reindex_if_stale()
                     if result.get("status") == "reindexed":
-                        log.info("[%s] periodic reindex: %s", index.agent_id, result)
+                        log.info(
+                            "[%s] periodic reindex: +%d changed (%s) -%d removed (%s)",
+                            index.agent_id,
+                            len(result.get("changed", [])),
+                            ", ".join(result.get("changed", [])) or "—",
+                            len(result.get("removed", [])),
+                            ", ".join(result.get("removed", [])) or "—",
+                        )
                 except Exception:
                     log.exception("[%s] periodic reindex failed", index.agent_id)
         except asyncio.CancelledError:
