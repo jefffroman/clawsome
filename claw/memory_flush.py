@@ -51,8 +51,10 @@ def today_iso_date(tz_name: str | None = None) -> str:
 def _flush_prompt(today: str) -> str:
     return (
         "Memory flush.\n\n"
-        "Look at the conversation so far and capture any durable knowledge worth "
-        "persisting across sessions. Use the `append_file` tool ONCE with "
+        "The conversation turns above are the slice for this flush — typically "
+        "new turns since your previous memory flush. Earlier turns were already "
+        "considered and don't need re-extracting. Capture any durable knowledge "
+        "from these turns. Use the `append_file` tool ONCE with "
         f"`path=\"memory/{today}.md\"` to add bullet-style notes at the end of "
         "today's memory file. Bundle all your observations into a single "
         "content string in that one tool call.\n\n"

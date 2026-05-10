@@ -32,6 +32,10 @@ def _path(transcripts_dir: Path, sid: str) -> Path:
     return transcripts_dir / f"{sid}.jsonl"
 
 
+def _flush_state_path(transcripts_dir: Path, sid: str) -> Path:
+    return transcripts_dir / f"{sid}.flush.json"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -84,7 +88,47 @@ class TranscriptStore:
             return None
         archived = self.dir / f"{sid}.{suffix}.jsonl"
         os.replace(path, archived)
+        # Drop the flush-state sidecar — a new transcript at this sid starts
+        # at row 0, and the next flush should slice from the start.
+        flush_state = _flush_state_path(self.dir, sid)
+        try:
+            flush_state.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
         return archived
+
+    def read_flush_state(self, sid: str) -> int:
+        """Return the row_count recorded by the previous successful memory
+        flush, or 0 if no sidecar exists / file is unreadable / count is
+        missing. Sidecar lives at ``<sid>.flush.json`` alongside the
+        transcript.
+        """
+        path = _flush_state_path(self.dir, sid)
+        if not path.exists():
+            return 0
+        try:
+            with open(path) as f:
+                obj = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return 0
+        rc = obj.get("row_count")
+        return rc if isinstance(rc, int) and rc >= 0 else 0
+
+    def write_flush_state(self, sid: str, row_count: int) -> None:
+        """Atomically persist the row_count of the most recent successful
+        flush. Atomic rewrite via tmp+rename mirrors ``replace()``.
+        """
+        path = _flush_state_path(self.dir, sid)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "row_count": int(row_count),
+            "last_flushed_at": _now_iso(),
+        }
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
 
     def last_ts(self, sid: str) -> str | None:
         path = _path(self.dir, sid)

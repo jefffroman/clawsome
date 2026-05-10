@@ -159,6 +159,18 @@ class Agent:
         self._bg_compaction: dict[str, asyncio.Task] = {}
         # Token count at last periodic flush per session, for delta-trigger.
         self._last_periodic_flush_tokens: dict[str, int] = {}
+        # Row count at last successful flush per session, for incremental
+        # slicing. Lazy-loaded from the on-disk sidecar so the count survives
+        # claw restarts (otherwise the first periodic tick after restart
+        # would re-flush the entire transcript).
+        self._last_flushed_row_count: dict[str, int] = {}
+        # Sids with a flush turn currently in flight. Bg flushes (pre-compact,
+        # periodic) skip if their sid is present; the synchronous pre-rotate
+        # flush waits on _flush_lock(sid) instead.
+        self._flush_in_flight: set[str] = set()
+        # Per-session lock serializing flush turns. Bg flushes acquire-and-hold
+        # for the duration; pre-rotate awaits to run after any bg flush.
+        self._flush_locks: dict[str, asyncio.Lock] = {}
         # Per-session timestamp of the previous _process_batch invocation.
         # Powers the envelope's elapsed-time delta. Cleared across restarts —
         # the first inbound after a restart simply has no `+elapsed` suffix.
@@ -226,6 +238,106 @@ class Agent:
 
     def _session_lock(self, sid: str) -> asyncio.Lock:
         return self._session_locks.setdefault(sid, asyncio.Lock())
+
+    def _flush_lock(self, sid: str) -> asyncio.Lock:
+        return self._flush_locks.setdefault(sid, asyncio.Lock())
+
+    async def _run_flush_guarded(
+        self,
+        *,
+        sid: str,
+        full_rows: list[dict],
+        reason: str,
+        mode: str,
+    ) -> bool:
+        """Slice ``full_rows`` to just the rows added since the previous
+        successful flush for ``sid``, gate against concurrent flushes, run
+        the flush turn, and persist the new row count on success.
+
+        ``mode="bg"`` (pre-compact, periodic): return immediately if another
+        flush is in flight for this sid (skip-if-busy). ``mode="sync"``
+        (pre-rotate, on session archival): await the per-sid flush lock so
+        we run after any in-flight bg flush completes.
+
+        If ``len(full_rows)`` is below the stored count, the transcript was
+        replaced (mid-session compaction) — reset to 0 and re-flush from the
+        start. If the slice is empty (no new rows), skip.
+
+        Returns True iff a flush turn ran AND the agent's append_file
+        succeeded (``run_memory_flush`` return).
+        """
+        if not self.cfg.memory_flush.enabled:
+            return False
+        if mode not in ("bg", "sync"):
+            raise ValueError(f"unknown flush mode: {mode!r}")
+
+        last_count = self._last_flushed_row_count.get(sid)
+        if last_count is None:
+            last_count = self.transcripts.read_flush_state(sid)
+            self._last_flushed_row_count[sid] = last_count
+        if last_count > len(full_rows):
+            last_count = 0  # transcript shrank (replace()); start over
+
+        new_rows = full_rows[last_count:]
+        if not new_rows:
+            log.debug(
+                "[%s] no new rows since last flush, skipping (reason=%s, sid=%s)",
+                self.id, reason, sid,
+            )
+            return False
+
+        if mode == "bg":
+            if sid in self._flush_in_flight:
+                log.debug(
+                    "[%s] flush already in flight, skipping (reason=%s, sid=%s)",
+                    self.id, reason, sid,
+                )
+                return False
+            self._flush_in_flight.add(sid)
+        try:
+            async with self._flush_lock(sid):
+                try:
+                    ok = await asyncio.wait_for(
+                        run_memory_flush(
+                            agent_id=self.id,
+                            peer_label=self._peer_label_by_sid.get(sid, "?"),
+                            ollama=self.ollama,
+                            sid=sid,
+                            workspace_dir=self.agent_cfg.workspace,
+                            rows=new_rows,
+                            primary_model=self.compaction_model,
+                            tools=self.tools,
+                            workspace_system_block=self._workspace_system_block(),
+                            reason=reason,
+                            tz_name=self.cfg.tz,
+                        ),
+                        timeout=self.cfg.memory_flush.turn_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "[%s] %s flush timed out after %.0fs for %s",
+                        self.id, reason,
+                        self.cfg.memory_flush.turn_timeout_s, sid,
+                    )
+                    return False
+                except Exception:
+                    log.exception("[%s] %s flush raised for %s", self.id, reason, sid)
+                    return False
+                if ok:
+                    new_count = len(full_rows)
+                    self._last_flushed_row_count[sid] = new_count
+                    self._last_periodic_flush_tokens[sid] = estimate_tokens(full_rows)
+                    try:
+                        self.transcripts.write_flush_state(sid, new_count)
+                    except OSError:
+                        log.exception(
+                            "[%s] failed to persist flush state for %s",
+                            self.id, sid,
+                        )
+                return ok
+        finally:
+            if mode == "bg":
+                self._flush_in_flight.discard(sid)
 
     def _workspace_system_block(self) -> str:
         if self._workspace_block is None:
@@ -603,31 +715,12 @@ class Agent:
         """
         try:
             if do_flush:
-                try:
-                    await asyncio.wait_for(
-                        run_memory_flush(
-                            agent_id=self.id,
-                            peer_label=self._peer_label_by_sid.get(sid, "?"),
-                            ollama=self.ollama,
-                            sid=sid,
-                            workspace_dir=self.agent_cfg.workspace,
-                            rows=rows_snapshot,
-                            primary_model=self.compaction_model,
-                            tools=self.tools,
-                            workspace_system_block=self._workspace_system_block(),
-                            reason="pre-compact",
-                            tz_name=self.cfg.tz,
-                        ),
-                        timeout=self.cfg.memory_flush.turn_timeout_s,
-                    )
-                    self._last_periodic_flush_tokens[sid] = estimate_tokens(rows_snapshot)
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "[%s] background flush timed out after %.0fs for %s — proceeding to compaction",
-                        self.id, self.cfg.memory_flush.turn_timeout_s, sid,
-                    )
-                except Exception:
-                    log.exception("[%s] background flush failed for %s", self.id, sid)
+                await self._run_flush_guarded(
+                    sid=sid,
+                    full_rows=rows_snapshot,
+                    reason="pre-compact",
+                    mode="bg",
+                )
 
             if do_compact:
                 try:
@@ -685,44 +778,16 @@ class Agent:
             if current_tokens - last < delta_threshold:
                 continue
             task = asyncio.create_task(
-                self._run_periodic_flush(sid, list(rows), current_tokens),
+                self._run_flush_guarded(
+                    sid=sid,
+                    full_rows=list(rows),
+                    reason="periodic-growth",
+                    mode="bg",
+                ),
                 name=f"periodic-flush-{self.id}-{sid}",
             )
             tasks.append(task)
         return tasks
-
-    async def _run_periodic_flush(
-        self,
-        sid: str,
-        rows_snapshot: list[dict],
-        observed_tokens: int,
-    ) -> None:
-        try:
-            ok = await asyncio.wait_for(
-                run_memory_flush(
-                    agent_id=self.id,
-                    peer_label=self._peer_label_by_sid.get(sid, "?"),
-                    ollama=self.ollama,
-                    sid=sid,
-                    workspace_dir=self.agent_cfg.workspace,
-                    rows=rows_snapshot,
-                    primary_model=self.compaction_model,
-                    tools=self.tools,
-                    workspace_system_block=self._workspace_system_block(),
-                    reason="periodic-growth",
-                    tz_name=self.cfg.tz,
-                ),
-                timeout=self.cfg.memory_flush.turn_timeout_s,
-            )
-            if ok:
-                self._last_periodic_flush_tokens[sid] = observed_tokens
-        except asyncio.TimeoutError:
-            log.warning(
-                "[%s] periodic flush timed out after %.0fs for %s",
-                self.id, self.cfg.memory_flush.turn_timeout_s, sid,
-            )
-        except Exception:
-            log.exception("[%s] periodic flush task raised for %s", self.id, sid)
 
     # --- session rotate (full-context clear) ---------------------------
 
@@ -751,39 +816,25 @@ class Agent:
                 self._idle_recapped.discard(sid)
                 self._idle_recap_blocks.pop(sid, None)
                 self._last_periodic_flush_tokens.pop(sid, None)
+                self._last_flushed_row_count.pop(sid, None)
+                self._flush_locks.pop(sid, None)
                 return False
 
             if run_final_flush and self.cfg.memory_flush.enabled:
-                try:
-                    await asyncio.wait_for(
-                        run_memory_flush(
-                            agent_id=self.id,
-                            peer_label=self._peer_label_by_sid.get(sid, "?"),
-                            ollama=self.ollama,
-                            sid=sid,
-                            workspace_dir=self.agent_cfg.workspace,
-                            rows=rows,
-                            primary_model=self.compaction_model,
-                            tools=self.tools,
-                            workspace_system_block=self._workspace_system_block(),
-                            reason="pre-rotate",
-                            tz_name=self.cfg.tz,
-                        ),
-                        timeout=self.cfg.memory_flush.turn_timeout_s,
-                    )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "[%s] pre-rotate flush timed out after %.0fs for %s — rotating anyway",
-                        self.id, self.cfg.memory_flush.turn_timeout_s, sid,
-                    )
-                except Exception:
-                    log.exception("[%s] pre-rotate flush raised for %s — rotating anyway", self.id, sid)
+                await self._run_flush_guarded(
+                    sid=sid,
+                    full_rows=rows,
+                    reason="pre-rotate",
+                    mode="sync",
+                )
 
             ts = datetime.now(timezone.utc).isoformat().replace(":", "-")
             archived = self.transcripts.archive(sid, f"reset-{ts}")
             self._idle_recapped.discard(sid)
             self._idle_recap_blocks.pop(sid, None)
             self._last_periodic_flush_tokens.pop(sid, None)
+            self._last_flushed_row_count.pop(sid, None)
+            self._flush_locks.pop(sid, None)
             log.info(
                 "[%s] session %s rotated (%d rows -> %s)",
                 self.id, sid, len(rows), archived.name if archived else "no-archive",

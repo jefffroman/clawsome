@@ -18,10 +18,19 @@ to specific keys point at `docs/configuration.md`.
 
 ## Memory_flush in depth
 
-A flush turn loads the full session transcript, prepends a synthetic user
-message asking the agent to summarize durable knowledge into today's
-memory file via the `append_file` tool, and runs the agent's compaction
-model end-to-end.
+A flush turn passes the agent the *slice of rows added since the previous
+successful flush for that session* — not the full transcript — followed
+by a synthetic user message asking the agent to summarize durable
+knowledge into today's memory file via the `append_file` tool. The
+agent's compaction model runs end-to-end.
+
+The "rows since last flush" marker is persisted per-session at
+`<workspace>/transcripts/<sid>.flush.json` so the marker survives claw
+restarts. Mid-session compaction shrinks the transcript via atomic
+replace; the next flush detects the shrink and starts over from row 0.
+At most one flush is in flight per session: background flushes
+(periodic, pre-compact) skip if another is running; the synchronous
+pre-rotate flush waits on the per-session flush lock.
 
 The flush turn is **not persisted to the user-visible transcript** — only
 the side effect (the appended bullets) survives. This means:

@@ -116,12 +116,14 @@ Run off the user-reply critical path so latency stays bounded.
 
 - **Periodic memory_flush.** Maintenance loop fires every 5 min; for each
   active session that has grown by `memory_flush.periodic_growth_threshold`
-  tokens since its last flush, spawn a flush turn that asks the agent to
-  append durable knowledge to today's `memory/YYYY-MM-DD.md`.
-- **Pre-compaction memory_flush.** Same flush, fired from the request path
-  when the transcript is within `memory_flush.soft_threshold_tokens` of
-  the compaction trigger. Captures durable info before older turns get
-  summarized away.
+  tokens since its last flush, spawn a flush turn over *the rows added
+  since that last flush*, asking the agent to append durable knowledge
+  to today's `memory/YYYY-MM-DD.md`. At most one flush is in flight per
+  session; concurrent triggers skip rather than queue.
+- **Pre-compaction memory_flush.** Same flush (incremental, locked the
+  same way), fired from the request path when the transcript is within
+  `memory_flush.soft_threshold_tokens` of the compaction trigger.
+  Captures durable info before older turns get summarized away.
 - **Mid-session compaction.** When a transcript crosses
   `compaction.mid_session_token_threshold`, the older portion is
   summarized into a single `## Pre-compaction Recap` row and atomically
