@@ -40,6 +40,7 @@ from olm import PkSigning
 from nio.crypto import Sas
 from nio.crypto.sas import SasState
 from nio.events.room_events import UnknownEvent
+from markdown_it import MarkdownIt
 
 from claw.channel.base import InboundHandler, InboundMessage
 from claw.config import MatrixAccountConfig
@@ -49,6 +50,19 @@ log = logging.getLogger("claw.channel.matrix")
 # Matrix has no hard message size cap, but very long messages render
 # awkwardly on most clients. Soft-cap with paragraph-boundary chunking.
 MATRIX_CHUNK_MAX = 16000
+
+# CommonMark + tables + strikethrough + linkify. `breaks=True` turns single
+# newlines into <br> so chat-style line-wrapped LLM output renders the way
+# it reads in the source. `html=False` (the default) escapes any literal
+# `<tag>` the model emits instead of executing it.
+_MD = (
+    MarkdownIt("commonmark", {"linkify": True, "breaks": True})
+    .enable(["table", "strikethrough", "linkify"])
+)
+
+
+def _to_html(text: str) -> str:
+    return _MD.render(text)
 
 # Typing indicator must be renewed periodically; 6s leaves headroom inside
 # Matrix's 8s typing timeout.
@@ -676,11 +690,22 @@ class MatrixChannel:
         else:
             room_id = peer_id
         for chunk in _chunk(text):
+            content: dict[str, Any] = {"msgtype": "m.text", "body": chunk}
+            try:
+                html = _to_html(chunk)
+            except Exception:
+                # Never let a render failure drop a message — fall through
+                # to plain-body-only send.
+                log.exception("[%s] markdown render failed; sending plain",
+                              self.user_id)
+            else:
+                content["format"] = "org.matrix.custom.html"
+                content["formatted_body"] = html
             try:
                 await self._client.room_send(
                     room_id=room_id,
                     message_type="m.room.message",
-                    content={"msgtype": "m.text", "body": chunk},
+                    content=content,
                     # TOFU for v0: closed system, two known accounts on a private
                     # homeserver. Without this matrix-nio refuses to encrypt to
                     # any unverified device and raises OlmUnverifiedDeviceError.

@@ -38,6 +38,8 @@ dependencies = [
     "chromadb>=0.5",
     "rank-bm25>=0.2.2",
     "networkx>=3.2",
+    "markdown-it-py>=3",
+    "linkify-it-py>=2",
 ]
 
 [project.optional-dependencies]
