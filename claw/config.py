@@ -77,6 +77,10 @@ class PersonaConfig:
     can_spawn: tuple[str, ...] | None = None
     # Per-persona override of OllamaConfig.num_predict. None inherits global.
     num_predict: int | None = None
+    # Per-persona override of OllamaConfig.max_tool_turns. None inherits global.
+    # Tune by role: researchers (web_search + reads) need headroom; grunts
+    # should stay tight; coders sit in the middle.
+    max_tool_turns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -106,11 +110,6 @@ class CompactionConfig:
 @dataclass(frozen=True)
 class MemoryFlushConfig:
     enabled: bool = True
-    # Pre-compact flush fires when transcript is within this many tokens of
-    # mid_session_token_threshold. Default tracks the 192K context tuning
-    # (was 4000 when the threshold was 24000; scales proportionally).
-    soft_threshold_tokens: int = 12000
-    force_flush_transcript_bytes: int = 2_097_152
     # Periodic flush triggers from the maintenance loop (paired with reindex)
     # whenever a session's transcript has grown by this many tokens since its
     # last periodic flush. Lets long-running sessions capture durable info
@@ -134,6 +133,26 @@ class LifecycleConfig:
     # suffix and the next inbound message starts a clean session. Useful as
     # a daily reset so transcripts don't grow indefinitely.
     daily_session_rotate_hour: int | None = None
+
+
+@dataclass(frozen=True)
+class CommandsConfig:
+    # In-band admin commands parsed out of Matrix message bodies before they
+    # reach the LLM. A message is only treated as a command when enabled, the
+    # channel is matrix, the sender is in `allow`, and the body starts with
+    # `prefix`. Anything else (incl. an unauthorized sender's prefixed text)
+    # flows to the LLM as ordinary text — no command, no reply, no indication.
+    # Defaults true, but `allow` is still fail-closed (empty = nobody), so a
+    # deployment that never sets `allow` has no usable commands regardless.
+    enabled: bool = True
+    # Sigil that prefixes a command word. "%" is safe: Matrix clients don't
+    # intercept it (unlike "/"), it isn't Markdown, and it's improbable as a
+    # natural first character. Configurable per deployment.
+    prefix: str = "%"
+    # MXIDs allowed to run commands. Empty tuple = nobody (fail closed).
+    # Deliberately separate from per-agent matrix.allow_from so a sender who
+    # may DM an agent does not automatically gain control-plane access.
+    allow: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,6 +200,8 @@ class AgentConfig:
     can_spawn: tuple[str, ...] | None = None
     # Per-agent override of OllamaConfig.num_predict. None inherits global.
     num_predict: int | None = None
+    # Per-agent override of OllamaConfig.max_tool_turns. None inherits global.
+    max_tool_turns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +215,7 @@ class Config:
     compaction: CompactionConfig
     memory_flush: MemoryFlushConfig
     lifecycle: LifecycleConfig
+    commands: CommandsConfig
     agents: tuple[AgentConfig, ...]
     # IANA timezone name (e.g. "America/New_York", "Europe/Berlin") used for
     # every operator-facing timestamp claw renders: inbound-message envelope,
@@ -225,6 +247,7 @@ def _parse_persona(spec: dict[str, Any]) -> "PersonaConfig":
         max_spawn_depth=spec.get("max_spawn_depth", 0),
         can_spawn=_parse_can_spawn(spec.get("can_spawn")),
         num_predict=spec.get("num_predict"),
+        max_tool_turns=spec.get("max_tool_turns"),
     )
 
 
@@ -247,6 +270,14 @@ def _validate_can_spawn(cfg: "Config") -> None:
                     f"persona {name!r} can_spawn references unknown persona(s): "
                     f"{sorted(unknown)}; available: {sorted(persona_names)}"
                 )
+
+
+def _parse_commands(d: dict[str, Any]) -> CommandsConfig:
+    return CommandsConfig(
+        enabled=d.get("enabled", True),
+        prefix=d.get("prefix", "%"),
+        allow=tuple(d.get("allow", [])),
+    )
 
 
 def _parse(d: dict[str, Any]) -> Config:
@@ -274,6 +305,7 @@ def _parse(d: dict[str, Any]) -> Config:
         compaction=CompactionConfig(**d.get("compaction", {})),
         memory_flush=MemoryFlushConfig(**d.get("memory_flush", {})),
         lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
+        commands=_parse_commands(d.get("commands", {})),
         agents=tuple(_parse_agent(a) for a in d["agents"]),
         tz=d.get("tz"),
     )
@@ -290,6 +322,7 @@ def _parse_agent(d: dict[str, Any]) -> AgentConfig:
         max_spawn_depth=d.get("max_spawn_depth", 1),
         can_spawn=_parse_can_spawn(d.get("can_spawn")),
         num_predict=d.get("num_predict"),
+        max_tool_turns=d.get("max_tool_turns"),
         matrix=MatrixAccountConfig(
             user_id=m["user_id"],
             homeserver=m["homeserver"],

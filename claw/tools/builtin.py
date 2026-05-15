@@ -9,12 +9,92 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import os
+import signal
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
+from claw.runctx import current_task_id, current_turn_id
 from claw.tools.base import Tool
+
+log = logging.getLogger("claw.tools.bash")
+
+
+# --- bash subprocess registry --------------------------------------------
+# Each bash command runs as its own session leader (start_new_session=True)
+# so a single killpg takes the whole tree (bash + anything it spawned). We
+# track every live process group keyed by pgid, tagged with the (turn_id,
+# task_id) that owned the spawn, so %stop can kill exactly the right scope
+# after cancelling a turn (cancelling the await abandons the executor
+# thread but never the OS processes). There is deliberately NO session
+# scope here — every %stop kill is bounded to a single turn or one
+# subagent subtree within it:
+#   - whole turn   -> kill_turn_bash(turn_id)      (main + the turn's cascade)
+#   - one subagent -> kill_subagent_bash(task_ids) (that subtree only)
+#
+# Mutated from the event loop (registration, before offload) and worker
+# threads (deregistration in the runner's finally) — hence the lock.
+_BashCtx = tuple[str, str]  # (turn_id, task_id)
+_BASH: dict[int, _BashCtx] = {}  # pgid -> ctx
+_BASH_LOCK = threading.Lock()
+
+
+def _bash_register(pgid: int, turn_id: str, task_id: str) -> None:
+    with _BASH_LOCK:
+        _BASH[pgid] = (turn_id, task_id)
+
+
+def _bash_unregister(pgid: int) -> None:
+    with _BASH_LOCK:
+        _BASH.pop(pgid, None)
+
+
+def _killpg_all(pgids: list[int], scope: str) -> int:
+    """SIGKILL each process group; return the count signalled.
+
+    A process exiting and being deregistered are not atomic, so a
+    snapshotted pgid may already be gone. ``ProcessLookupError`` ("no such
+    process", ESRCH) is therefore a *silent success* — the goal is "that
+    tree is not running", and it isn't. Only an unexpected OSError (e.g.
+    EPERM) is worth logging.
+    """
+    killed = 0
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            killed += 1
+        except ProcessLookupError:
+            # Already gone between snapshot and kill — exactly the
+            # end→deregister gap; treat as done, no noise.
+            pass
+        except OSError:
+            log.exception("killpg(%s) failed (%s)", pgid, scope)
+    return killed
+
+
+def kill_turn_bash(turn_id: str) -> int:
+    """SIGKILL every live bash process group whose spawn belonged to
+    ``turn_id`` — the turn's own bash plus its entire subagent cascade
+    (the turn id is inherited transitively into spawned tasks)."""
+    if not turn_id:
+        return 0
+    with _BASH_LOCK:
+        pgids = [p for p, (t, _) in _BASH.items() if t == turn_id]
+    return _killpg_all(pgids, f"turn={turn_id}")
+
+
+def kill_subagent_bash(task_ids: set[str]) -> int:
+    """SIGKILL live bash process groups whose owning subagent is in
+    ``task_ids`` (a targeted subtree). Empty/blank ids never match."""
+    wanted = {t for t in task_ids if t}
+    if not wanted:
+        return 0
+    with _BASH_LOCK:
+        pgids = [p for p, (_, k) in _BASH.items() if k in wanted]
+    return _killpg_all(pgids, f"tasks={sorted(wanted)}")
 
 
 class PathScopeError(ValueError):
@@ -44,17 +124,49 @@ async def _run_bash(workspace_dir: Path, args: dict[str, Any]) -> str:
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "HOME": str(Path.home()),
     }
+    # Captured on the event loop (ContextVars aren't visible from the
+    # worker thread); passed into _runner so the spawn is attributable to
+    # the turn / subagent that owns it for %stop's scoped kill.
+    turn_id = current_turn_id.get()
+    task_id = current_task_id.get()
 
     def _runner() -> tuple[int, str, str]:
-        proc = subprocess.run(
+        # start_new_session=True → child is its own session/process-group
+        # leader, so killpg(pgid) reaps bash AND anything it spawned. Popen
+        # (not subprocess.run) so we can register the pgid *before* waiting.
+        proc = subprocess.Popen(
             ["/bin/bash", "-c", cmd],
             cwd=str(workspace_dir),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            # Exited before we could read its pgid — nothing to track;
+            # fall back to pid-as-pgid (session leader => pgid == pid).
+            pgid = proc.pid
+        _bash_register(pgid, turn_id, task_id)
+        try:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+                return proc.returncode, out, err
+            except subprocess.TimeoutExpired:
+                # Kill the whole tree on timeout (subprocess.run only
+                # killed the immediate child; grandchildren leaked).
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    log.exception("killpg(%s) on timeout failed", pgid)
+                proc.communicate()  # reap
+                raise
+        finally:
+            _bash_unregister(pgid)
 
     loop = asyncio.get_running_loop()
     try:

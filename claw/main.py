@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from typing import Any
 
 from claw import __version__
+from claw import logsetup
 from claw.agent import Agent
 from claw.channel.matrix import MatrixChannel
 from claw.config import Config, load
@@ -45,20 +46,13 @@ log = logging.getLogger("claw.main")
 
 
 def _configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+    # Install handlers/formatter once; level logic + library taming lives in
+    # logsetup so the %verbose command can re-apply it at runtime.
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    # Third-party library noise. INFO from nio (room state, crypto events,
-    # join callbacks) and apscheduler (per-job add lines) drowns out claw's
-    # own log lines during normal operation. Surface them only at WARNING
-    # in non-verbose mode; let DEBUG/verbose flip the firehose back on.
-    library_level = logging.INFO if verbose else logging.WARNING
-    logging.getLogger("nio").setLevel(library_level)
-    logging.getLogger("apscheduler").setLevel(library_level)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logsetup.apply_log_levels(verbose)
 
 
 async def _serve(cfg: Config) -> int:

@@ -145,9 +145,7 @@ Flush turns that ask the agent to capture durable knowledge into
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `true` | Master switch. `false` disables all three trigger paths. |
-| `soft_threshold_tokens` | int | `12000` | Pre-compaction trigger margin. Flush fires when transcript is within this many tokens of `compaction.mid_session_token_threshold`. Tracks the 192K tuning (was 4000 when threshold=24000). |
-| `force_flush_transcript_bytes` | int | `2_097_152` | Hard fallback. If the on-disk transcript JSONL crosses this size, flush fires regardless of token estimate. Catches pathological transcripts where token estimate underreports (e.g. lots of base64 in tool results). |
+| `enabled` | bool | `true` | Master switch. `false` disables both trigger paths (pre-compact bg + periodic). |
 | `periodic_growth_threshold` | int | `4000` | Periodic flush triggers when a session's transcript has grown by this many tokens since its last flush. With a 96K compaction trigger, 4K growth ≈ 4% — comfortable cadence. |
 | `turn_timeout_s` | float | `300.0` | Per-flush deadline. On timeout the flush is dropped and compaction proceeds anyway. |
 
@@ -162,6 +160,31 @@ Whole block optional.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `daily_session_rotate_hour` | int \| null | `null` | Hour (0–23, in `tz`) at which every active session gets a final memory_flush + the JSONL is archived with a `.reset-<ts>` suffix + per-session caches clear. `null` disables. Memory files under `<workspace>/memory/` are NOT touched, so durable knowledge persists across rotate. |
+
+## `commands:`
+
+Whole block optional. In-band operator commands parsed out of Matrix
+message bodies before they reach the model (see Architecture → Control
+plane). Applies process-wide, not per-agent. `enabled` defaults true,
+but `allow` is fail-closed (empty = nobody) — so the feature is
+effectively off until you list operator MXIDs.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | Master switch. When `false`, a prefixed message is always ordinary text. Defaults `true`; `allow` (below) is the real gate. |
+| `prefix` | str | `"%"` | Sigil that marks a command. Pick one Matrix clients don't intercept (`/` is reserved client-side) and that won't collide with the agents' natural prose. |
+| `allow` | list[str] | `[]` | MXIDs permitted to run commands. **Empty = nobody (fail closed).** Deliberately separate from per-agent `matrix.allow_from`: being able to DM an agent does not grant control-plane access. A prefixed message from a non-listed sender is treated as ordinary text — no reply, no hint. |
+
+In a group room with `allow_bots: mentions`, a command must still
+`@`-mention the bot to reach the gateway at all.
+
+```yaml
+commands:
+  enabled: true
+  prefix: "%"
+  allow:
+    - "@operator:example.org"
+```
 
 ## `agents:`
 

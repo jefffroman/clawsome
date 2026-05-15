@@ -48,6 +48,48 @@ DEFAULT_TIMEOUT_S = 1800.0
 # the original path.
 TOOL_RESULT_THRESHOLD_CHARS = 8192
 
+# Same idea on the *tool-call* side: tools like write_file / append_file
+# can carry multi-KB content in their argument JSON. We keep full args in
+# the in-loop ``messages`` list (so the model can chain on its own
+# emissions within the current run_turn) and in DEBUG logs, but stub any
+# string-typed arg value longer than this when persisting to the JSONL
+# transcript. Stopping the bloat from leaking into the next turn's history
+# also keeps later flush slices from re-capturing the same content.
+TOOL_CALL_ARGS_MAX_CHARS = 200
+
+
+def _truncate_persisted_tool_call_args(
+    tc: dict[str, Any], max_chars: int,
+) -> dict[str, Any]:
+    """Return a copy of ``tc`` with any string-typed argument value longer
+    than ``max_chars`` replaced by ``<truncated: N chars>``. Applied only
+    when writing the assistant tool-call row to the persistent transcript;
+    the in-loop ``messages`` list and the DEBUG log keep full args.
+    """
+    fn = tc.get("function") or {}
+    args_str = fn.get("arguments")
+    if not isinstance(args_str, str):
+        return tc
+    try:
+        args = json.loads(args_str)
+    except (json.JSONDecodeError, ValueError):
+        return tc
+    if not isinstance(args, dict):
+        return tc
+    changed = False
+    truncated_args: dict[str, Any] = {}
+    for k, v in args.items():
+        if isinstance(v, str) and len(v) > max_chars:
+            truncated_args[k] = f"<truncated: {len(v)} chars>"
+            changed = True
+        else:
+            truncated_args[k] = v
+    if not changed:
+        return tc
+    new_fn = dict(fn)
+    new_fn["arguments"] = json.dumps(truncated_args, ensure_ascii=False)
+    return {**tc, "function": new_fn}
+
 
 async def _spool_and_truncate(
     result: str,
@@ -240,6 +282,7 @@ class OllamaClient:
         label: str,
         verbose_suffix: str = "",
         num_predict: int | None = None,
+        max_tool_turns: int | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """Drive ``/api/chat`` until the model stops requesting tools.
 
@@ -279,6 +322,11 @@ class OllamaClient:
         correlation handles that are noisy in normal operator scans —
         typically the matrix-room sid for the main / flush call sites,
         empty for subagents (their task_id is already in ``label``).
+
+        ``max_tool_turns`` overrides the client-wide default (set from
+        ``OllamaConfig.max_tool_turns`` at construction) for this call.
+        Callers pass the agent's or persona's resolved value; ``None``
+        falls back to the client-wide default.
         """
         messages: list[dict[str, Any]] = []
         if system:
@@ -292,10 +340,13 @@ class OllamaClient:
             options = {"num_predict": num_predict}
         parse_retry_used = False
         recovery_used = False
+        effective_max_tool_turns = (
+            max_tool_turns if max_tool_turns is not None else self.max_tool_turns
+        )
 
         prefix = _label_prefix(label, verbose_suffix)
 
-        for turn_idx in range(self.max_tool_turns):
+        for turn_idx in range(effective_max_tool_turns):
             try:
                 response = await self.chat_once(
                     model=model, messages=messages, tools=tool_specs, options=options,
@@ -396,8 +447,23 @@ class OllamaClient:
                 assistant_record["tool_calls"] = [
                     _normalize_tool_call(tc, turn_idx, i) for i, tc in enumerate(tool_calls)
                 ]
-            new_messages.append(assistant_record)
             messages.append(assistant_record)
+            # Diverge: persist a copy with long string args stubbed so
+            # subsequent turns (and later flush slices) don't carry the
+            # full tool-call payload. The in-loop ``messages`` above keeps
+            # full args for the model's own chaining within this run_turn.
+            if tool_calls:
+                persisted_record = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        _truncate_persisted_tool_call_args(tc, TOOL_CALL_ARGS_MAX_CHARS)
+                        for tc in assistant_record["tool_calls"]
+                    ],
+                }
+                new_messages.append(persisted_record)
+            else:
+                new_messages.append(assistant_record)
 
             if not tool_calls:
                 return new_messages, content
@@ -452,7 +518,7 @@ class OllamaClient:
 
         log.warning(
             "%shit max_tool_turns=%d without final assistant text",
-            prefix, self.max_tool_turns,
+            prefix, effective_max_tool_turns,
         )
         return new_messages, "[hit tool-use limit; please try again]"
 

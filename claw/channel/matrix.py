@@ -687,8 +687,17 @@ class MatrixChannel:
                     "[%s] no 1:1 room with %s; dropping send. Invite the bot "
                     "to a DM to establish one.", self.user_id, peer_id)
                 return
-        else:
+        elif peer_id.startswith("!"):
             room_id = peer_id
+        else:
+            # Synthetic InboundMessage channels (e.g., the "bootstrap"
+            # sentinel from initial_prompt) have no real Matrix recipient.
+            # The agent's reply has nowhere to go — log and drop.
+            log.warning(
+                "[%s] message sent to non-existent channel %r: %s",
+                self.user_id, peer_id, text,
+            )
+            return
         for chunk in _chunk(text):
             content: dict[str, Any] = {"msgtype": "m.text", "body": chunk}
             try:
@@ -717,12 +726,15 @@ class MatrixChannel:
 
     def typing(self, peer_id: str) -> AsyncContextManager[None]:
         # Same MXID -> room resolution as send(). If no DM room exists yet,
-        # the typing context becomes a no-op (returns a benign room_id of "")
-        # and _TypingContext skips the API call.
+        # or peer_id is a synthetic-channel sentinel (no Matrix room behind
+        # it), the typing context becomes a no-op (returns a benign room_id
+        # of "") and _TypingContext skips the API call.
         if peer_id.startswith("@"):
             room_id = self._resolve_room_for_user(peer_id) or ""
-        else:
+        elif peer_id.startswith("!"):
             room_id = peer_id
+        else:
+            room_id = ""
         return _TypingContext(self._client, room_id)
 
     async def shutdown(self) -> None:

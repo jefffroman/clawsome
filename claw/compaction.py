@@ -211,6 +211,20 @@ def will_mid_session_compact(cfg: Config, rows: list[dict[str, Any]]) -> bool:
     return estimate_tokens(rows) > cfg.compaction.mid_session_token_threshold
 
 
+def will_compact(cfg: Config, rows: list[dict[str, Any]], *, force: bool = False) -> bool:
+    """Predicate-only (no I/O): would ``run_mid_session_compact_async``
+    with the same ``force`` actually swap? Mirrors its two gates exactly —
+    the token-threshold predicate (bypassed by ``force``) AND a non-empty
+    older split given the reserve/keep window. ``%compact`` uses this to
+    skip the (expensive) pre-compact flush entirely when there is nothing
+    to compact, instead of flushing and then no-op'ing.
+    """
+    if not force and not will_mid_session_compact(cfg, rows):
+        return False
+    older, _ = _split_for_compaction(rows, cfg.compaction.reserve_tokens)
+    return bool(older)
+
+
 async def run_mid_session_compact_async(
     *,
     cfg: Config,
@@ -220,6 +234,7 @@ async def run_mid_session_compact_async(
     sid: str,
     rows_snapshot: list[dict[str, Any]],
     compaction_model: str,
+    force: bool = False,
 ) -> bool:
     """Run compaction off the critical path, then atomically swap.
 
@@ -234,9 +249,12 @@ async def run_mid_session_compact_async(
     swap was skipped (transcript shrank, race with another compactor, etc.).
 
     The caller is responsible for the predicate gate. We re-check here for
-    safety but expect the caller to have already decided.
+    safety but expect the caller to have already decided. ``force=True`` (a
+    manual ``%compact``) bypasses *only* the token-threshold predicate — the
+    "nothing compactable" early return below is still honored, so a forced
+    compact on a too-short transcript is a clean no-op (returns False).
     """
-    if not will_mid_session_compact(cfg, rows_snapshot):
+    if not force and not will_mid_session_compact(cfg, rows_snapshot):
         return False
 
     older, newer = _split_for_compaction(rows_snapshot, cfg.compaction.reserve_tokens)

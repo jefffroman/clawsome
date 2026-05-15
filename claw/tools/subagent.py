@@ -42,7 +42,9 @@ from typing import TYPE_CHECKING, Any
 
 from claw.channel.base import InboundMessage
 from claw.config import SubagentsConfig
+from claw.runctx import current_task_id, current_turn_id
 from claw.tools.base import Tool
+from claw.transcript import session_id
 
 if TYPE_CHECKING:
     from claw.agent import Agent
@@ -67,10 +69,19 @@ class ChildTask:
     origin_channel: str
     origin_peer_id: str
     started_at: datetime
-    status: str = "running"  # running | completed | failed
+    status: str = "running"  # running | completed | failed | cancelled
     completed_at: datetime | None = None
     result: str | None = None
     aio_task: asyncio.Task | None = field(default=None, repr=False)
+    # Turn that rooted this spawn (inherited transitively through the
+    # cascade) — %stop cancels by this. Empty if spawned outside a turn.
+    spawn_turn_id: str = ""
+    # The subagent that spawned this one ("" if spawned by the top-level
+    # agent) — lets a targeted %stop <task_id> cancel the whole subtree.
+    parent_task_id: str = ""
+    # Set by %stop on the whole-turn path: skip _deliver_completion so a
+    # stopped session is never resurrected by its own zombie subagents.
+    suppress_delivery: bool = False
 
 
 def _now() -> datetime:
@@ -161,6 +172,8 @@ class SubagentSpawner:
             origin_channel=origin_channel,
             origin_peer_id=origin_peer_id,
             started_at=_now(),
+            spawn_turn_id=current_turn_id.get(),
+            parent_task_id=current_task_id.get(),
         )
         self.tasks[task_id] = ct
         ct.aio_task = asyncio.create_task(
@@ -191,6 +204,10 @@ class SubagentSpawner:
         single-turn inference, stores the result on the ChildTask, and
         fires the synthetic completion message.
         """
+        # Tag this subagent's context so its bash (and any deeper spawn it
+        # makes) is attributable to ct.id; a grandchild's own _run_subagent
+        # overrides this for its subtree. Reset in the outer finally.
+        tok_task = current_task_id.set(ct.id)
         try:
             try:
                 async with self.semaphore:
@@ -204,7 +221,7 @@ class SubagentSpawner:
                     parent.id, ct.id, ct.persona,
                 )
                 ct.status = "cancelled"
-                ct.result = "(cancelled by parent via subagent_stop)"
+                ct.result = "(cancelled)"
             except Exception as e:
                 log.exception(
                     "[%s] subagent task_id=%s persona=%s raised",
@@ -213,17 +230,27 @@ class SubagentSpawner:
                 ct.status = "failed"
                 ct.result = f"error: subagent failed: {e}"
             ct.completed_at = _now()
-            # Deliver outside the semaphore for all three exit modes
-            # (completed/failed/cancelled) — the model gets a uniform
-            # notification shape regardless of how the run ended.
-            try:
-                await self._deliver_completion(parent, ct)
-            except asyncio.CancelledError:
-                # Loop is shutting down (gateway restart). Status is
-                # already set on ct; subagent_status will still report.
-                pass
+            if ct.suppress_delivery:
+                # Whole-turn %stop killed this cascade: do NOT inbound a
+                # completion, or the stopped session would be resurrected
+                # by its own zombie. Status is set; %subagents still shows.
+                log.info(
+                    "[%s] subagent task_id=%s completion suppressed "
+                    "(session stopped)", parent.id, ct.id,
+                )
+            else:
+                # Deliver outside the semaphore for all exit modes
+                # (completed/failed/cancelled) — uniform notification
+                # shape regardless of how the run ended.
+                try:
+                    await self._deliver_completion(parent, ct)
+                except asyncio.CancelledError:
+                    # Loop is shutting down (gateway restart). Status is
+                    # already set on ct; subagent_status will still report.
+                    pass
             self._gc_registry()
         finally:
+            current_task_id.reset(tok_task)
             self.children_by_parent[parent.id] = max(
                 0, self.children_by_parent.get(parent.id, 1) - 1,
             )
@@ -279,6 +306,80 @@ class SubagentSpawner:
         excess = len(self.tasks) - _MAX_REGISTRY_SIZE
         for ct in completed[:excess]:
             self.tasks.pop(ct.id, None)
+
+    # --- operator %stop support -----------------------------------------
+
+    def running_for_session(self, sid: str) -> list["ChildTask"]:
+        """Running subagents whose origin session is ``sid``, newest first.
+        Session-scoped (every turn's children) — for %subagents discovery.
+        """
+        out = [
+            ct for ct in self.tasks.values()
+            if ct.status == "running"
+            and session_id(ct.origin_channel, ct.origin_peer_id) == sid
+        ]
+        out.sort(key=lambda c: c.started_at, reverse=True)
+        return out
+
+    def cancel_turn(self, turn_id: str, *, suppress: bool) -> list[str]:
+        """Cancel every running subagent whose ``spawn_turn_id == turn_id``
+        — i.e. the entire cascade rooted at one turn, at any depth (the
+        turn id is inherited transitively). ``suppress`` sets
+        ``suppress_delivery`` first so a stopped session is not resurrected
+        by these children's completions. Returns the cancelled task ids.
+        """
+        if not turn_id:
+            return []
+        hit: list[str] = []
+        for ct in list(self.tasks.values()):
+            if ct.status != "running" or ct.spawn_turn_id != turn_id:
+                continue
+            ct.suppress_delivery = suppress
+            if ct.aio_task is not None and not ct.aio_task.done():
+                ct.aio_task.cancel()
+            hit.append(ct.id)
+        return hit
+
+    def cancel_subtree(self, task_id: str) -> list[str]:
+        """Cancel ``task_id`` and its transitive descendants (children via
+        ``parent_task_id``). The target keeps normal completion delivery
+        (the session is alive and should learn it was killed, same as the
+        model-facing subagent_stop); collateral descendants are suppressed
+        so they don't spam the session. Returns the cancelled task ids.
+        """
+        target = self.tasks.get(task_id)
+        if target is None:
+            return []
+        # BFS the parent_task_id forest from the target.
+        subtree = {task_id}
+        frontier = [task_id]
+        while frontier:
+            parent = frontier.pop()
+            for ct in self.tasks.values():
+                if ct.parent_task_id == parent and ct.id not in subtree:
+                    subtree.add(ct.id)
+                    frontier.append(ct.id)
+        hit: list[str] = []
+        for tid in subtree:
+            ct = self.tasks.get(tid)
+            if ct is None or ct.status != "running":
+                continue
+            ct.suppress_delivery = tid != task_id  # deliver only the target
+            if ct.aio_task is not None and not ct.aio_task.done():
+                ct.aio_task.cancel()
+            hit.append(tid)
+        return hit
+
+    def format_running(self, cts: list["ChildTask"]) -> str:
+        if not cts:
+            return "No subagents running for this session."
+        lines = [f"{len(cts)} subagent(s) running:"]
+        for ct in cts:
+            elapsed = _format_elapsed((_now() - ct.started_at).total_seconds())
+            lines.append(
+                f"  {ct.id}  persona={ct.persona}  elapsed={elapsed}"
+            )
+        return "\n".join(lines)
 
     # --- status (read-only) ---------------------------------------------
 

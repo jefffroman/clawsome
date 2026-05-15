@@ -85,6 +85,63 @@ Steps 1–4 happen on the user-reply critical path. Steps 5–6 dominate
 latency (Ollama generation). Background tasks (compaction, memory_flush,
 reindex) run off this path.
 
+## Control plane (in-band admin commands)
+
+A configured prefix (default `%`) turns a Matrix message into an
+operator command instead of a conversational turn. Commands are
+intercepted in `handle_inbound` **before** step 2 above — never
+enqueued, never written to the transcript, never sent to the model. A
+message is a command only if **all** hold: `commands.enabled`, the
+channel is `matrix`, the sender's MXID is in `commands.allow`, and the
+body parses. Any miss → it flows through as an ordinary turn with no
+reply and no hint a command was attempted (an unauthorized sender can't
+even probe the command set). The handler runs as a detached task so
+`handle_inbound` keeps its fast return; it takes the per-session lock
+itself, serializing behind any in-flight turn.
+
+**Scope vocabulary.** A *session* is one conversation (one peer/room,
+one `sid`, one transcript) and lives for days. A *turn* is one
+`_process_batch` — one (coalesced) inbound → one `run_turn` → one
+reply. A session has many turns. Every command *action* is bounded to a
+single turn, or one subagent subtree within it; nothing is session-wide
+except the read-only `%subagents` listing.
+
+| Command | Action |
+|---|---|
+| `%context` | Report the next turn's starting token floor (system prompt + pending recap + transcript rows) vs. the compaction threshold. Read-only. |
+| `%compact` | If a forced compaction would actually swap (transcript exceeds the reserve/keep window), run a pre-compact memory_flush then force-compact; else no-op *without* flushing. |
+| `%clear` | Final memory_flush, then archive the transcript + reset per-session state (same machinery as the daily rotate). |
+| `%stop [<task_id>] [--soft]` | Cancel the in-flight turn + its entire spawned cascade, suppress those subagents' completion delivery, and SIGKILL their bash trees. `<task_id>` instead cancels just that subagent + its descendant subtree (parent/siblings untouched). `--soft` skips only the bash kill. |
+| `%subagents` | List this session's running subagents (discovery). Read-only. |
+| `%verbose <on\|off>` | Toggle DEBUG logging process-wide at runtime (no restart). |
+
+**Turn / cascade identity.** Each turn gets a `turn_id` that
+`_process_batch` publishes via a ContextVar. `asyncio.create_task`
+copies the context, so a spawned subagent — and anything *it* spawns,
+at any depth — inherits the rooting turn's id. One `turn_id` therefore
+identifies an entire cascade with no tree-walking, which is how `%stop`
+cancels/kills exactly the stopped turn's subtree and nothing else. Bash
+runs in its own process group (`start_new_session=True`) tagged with
+`(turn_id, task_id)`, so one `killpg` reaps a whole tree and the kill
+scopes to one turn or one subagent. There is no session scope in the
+bash registry by construction.
+
+**`%stop` mechanics.** Cancelling the per-session drainer raises
+`CancelledError` (a `BaseException`, so `_process_batch`'s
+`except Exception` can't swallow it) inside `run_turn`; it unwinds the
+session-lock + typing context managers and the drainer ends.
+`handle_inbound` lazily recreates the drainer on the next inbound.
+Cancellation lands at the next `await` (Ollama HTTP / tool I/O) —
+prompt for I/O-bound turns; a turn wedged in a non-`await`ing section
+can only be ended by restarting the process. The triggering user
+message was persisted before `run_turn`, so a cancelled turn would
+otherwise leave an orphaned unanswered instruction the next turn
+re-attempts; `%stop` appends a synthetic user-role marker recording the
+operator cancellation so the agent treats it as abandoned rather than
+looping. Subagent completions normally re-enter the session as a
+synthetic inbound; `%stop` suppresses that for the cancelled cascade so
+a zombie can't resurrect a stopped conversation.
+
 ## Workspace contract
 
 | Path | Role | Read by |
@@ -120,14 +177,15 @@ Run off the user-reply critical path so latency stays bounded.
   since that last flush*, asking the agent to append durable knowledge
   to today's `memory/YYYY-MM-DD.md`. At most one flush is in flight per
   session; concurrent triggers skip rather than queue.
-- **Pre-compaction memory_flush.** Same flush (incremental, locked the
-  same way), fired from the request path when the transcript is within
-  `memory_flush.soft_threshold_tokens` of the compaction trigger.
-  Captures durable info before older turns get summarized away.
-- **Mid-session compaction.** When a transcript crosses
-  `compaction.mid_session_token_threshold`, the older portion is
-  summarized into a single `## Pre-compaction Recap` row and atomically
-  swapped in under the per-session lock.
+- **Pre-compact memory_flush + mid-session compaction.** When a
+  transcript crosses `compaction.mid_session_token_threshold`, the
+  request path spawns a single background task that runs the flush
+  (incremental, locked the same way as the periodic path) and then the
+  mid-session compaction in sequence. Both run on the compaction model
+  concurrently with the user's main reply. Compaction summarizes the
+  older portion into a single `## Pre-compaction Recap` row and
+  atomically swaps it in under the per-session lock — preserving rows
+  appended during the work.
 - **Idle recap.** On agent boot, the prior session's last-turn age
   decides resume vs. recap. *Younger* than
   `compaction.idle_recap_seconds` → the existing transcript stays loaded

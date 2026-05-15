@@ -8,9 +8,9 @@ Each inbound message:
 1. Run on-demand idle-recap (once per session per process) if not already done.
 2. Memory retrieval.
 3. Append user turn to transcript.
-4. **If transcript triggers flush or compaction predicates, spawn a single
-   background task that runs flush then mid-session compaction off the
-   critical path.** The user's reply is NOT delayed.
+4. **If transcript tokens exceed ``compaction.mid_session_token_threshold``,
+   spawn a single background task that runs flush then mid-session
+   compaction off the critical path.** The user's reply is NOT delayed.
 5. ``ollama.run_turn`` against the un-compacted history (the same-turn cost
    of bigger context is the explicit tradeoff for snappier UX).
 6. Append result turns. Send final assistant text back to the channel.
@@ -30,19 +30,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
+from claw import logsetup
+from claw.runctx import current_sid, current_turn_id
+from claw.tools.builtin import kill_subagent_bash, kill_turn_bash
 from claw.channel.base import Channel, InboundMessage
 from claw.channel.envelope import format_inbound_envelope
+from claw.commands import KNOWN, ParsedCommand, parse_command, usage
 from claw.compaction import (
     maybe_idle_recap,
     run_mid_session_compact_async,
+    will_compact,
     will_mid_session_compact,
 )
 from claw.config import AgentConfig, Config
 from claw.memory import MemoryIndex
-from claw.memory_flush import run_memory_flush, will_pre_compact_flush
+from claw.memory_flush import run_memory_flush
 from claw.ollama import OllamaClient
 from claw.tools.base import Tool
 from claw.tools.subagent import (
@@ -155,6 +161,13 @@ class Agent:
         # sync_forever blocks on each handle_inbound and msg N+1 sits on
         # Synapse until msg N's reply has been sent, defeating coalescing.
         self._drainer_tasks: dict[str, asyncio.Task] = {}
+        # Sid -> turn_id of the turn the drainer is actively inside
+        # _process_batch for (a real conversational turn, not idle-waiting
+        # / flush / compaction). Presence = a turn is in flight; the value
+        # is the turn id %stop cancels (and the key used to scope its
+        # cascade-cancel + bash-kill). Set by the drainer around the
+        # _process_batch call, popped in its finally.
+        self._inflight_turn: dict[str, str] = {}
         # At most one background flush+compact task per session at a time.
         self._bg_compaction: dict[str, asyncio.Task] = {}
         # Token count at last periodic flush per session, for delta-trigger.
@@ -236,6 +249,15 @@ class Agent:
             return self.agent_cfg.num_predict
         return self.cfg.ollama.num_predict
 
+    @property
+    def max_tool_turns(self) -> int:
+        """Effective tool-loop ceiling for this agent's run_turn calls.
+        Per-agent (or persona) override wins; otherwise global
+        OllamaConfig.max_tool_turns applies."""
+        if self.agent_cfg.max_tool_turns is not None:
+            return self.agent_cfg.max_tool_turns
+        return self.cfg.ollama.max_tool_turns
+
     def _session_lock(self, sid: str) -> asyncio.Lock:
         return self._session_locks.setdefault(sid, asyncio.Lock())
 
@@ -306,8 +328,7 @@ class Agent:
                             workspace_dir=self.agent_cfg.workspace,
                             rows=new_rows,
                             primary_model=self.compaction_model,
-                            tools=self.tools,
-                            workspace_system_block=self._workspace_system_block(),
+                            tools={"append_file": self.tools["append_file"]},
                             reason=reason,
                             tz_name=self.cfg.tz,
                         ),
@@ -387,6 +408,9 @@ class Agent:
             # resolution path as a top-level agent's override; None falls
             # back to the global OllamaConfig.num_predict.
             num_predict=persona_cfg.num_predict,
+            # Same pattern for max_tool_turns: persona-level override flows
+            # via child AgentConfig; None inherits the global.
+            max_tool_turns=persona_cfg.max_tool_turns,
         )
         base_tools = {
             k: v for k, v in self.tools.items()
@@ -451,6 +475,7 @@ class Agent:
                 workspace_dir=self.agent_cfg.workspace,
                 label=label,
                 num_predict=self.num_predict,
+                max_tool_turns=self.max_tool_turns,
             )
         except Exception:
             log.exception("[%s] subagent run_turn failed", self.id)
@@ -499,8 +524,37 @@ class Agent:
         events). This is what makes coalescing actually work — without
         the decoupling, nio serializes callbacks and msg N+1 doesn't reach
         the queue until msg N's _process_batch has already been popped.
+
+        An in-band admin command short-circuits here before enqueue, so the
+        command text is never transcribed and never reaches the LLM (see the
+        gate below).
         """
         sid = session_id(msg.channel, msg.peer_id)
+
+        # Control plane: in-band admin commands. A message is a command only
+        # when commands are enabled, it came from matrix (synthetic channels —
+        # cron / subagent_completion / initial_prompt — bypass via this
+        # check), the sender is on the command allowlist, and the body parses.
+        # If any condition fails, control falls through to the normal enqueue
+        # path and the text is processed as an ordinary turn — no command, no
+        # reply, no indication the sigil meant anything (identical to an
+        # unauthorized user typing it). Dispatched as a detached task so this
+        # method keeps its microsecond return; the task acquires the session
+        # lock itself inside clear_session / forced compaction and therefore
+        # serializes behind any in-flight turn for this session.
+        if (
+            msg.channel == "matrix"
+            and self.cfg.commands.enabled
+            and self._command_authorized(msg.sender_id)
+        ):
+            cmd = parse_command(msg.text, self.cfg.commands.prefix)
+            if cmd is not None:
+                asyncio.create_task(
+                    self._handle_command(sid, msg, cmd),
+                    name=f"cmd-{self.id}-{sid}-{cmd.name or 'help'}",
+                )
+                return  # not enqueued, not transcribed, not sent to the LLM
+
         self._pending_inbound.setdefault(sid, []).append(msg)
         # Lazy-create the drainer for this session on first inbound.
         if sid not in self._drainer_tasks or self._drainer_tasks[sid].done():
@@ -537,13 +591,20 @@ class Agent:
                                     "[%s] coalescing %d inbound messages into one turn",
                                     self.id, len(batch),
                                 )
-                            await self._process_batch(sid, batch)
+                            turn_id = f"{sid}#{secrets.token_hex(4)}"
+                            self._inflight_turn[sid] = turn_id
+                            try:
+                                await self._process_batch(sid, batch, turn_id)
+                            finally:
+                                self._inflight_turn.pop(sid, None)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("[%s] drainer iteration raised; continuing", self.id)
 
-    async def _process_batch(self, sid: str, msgs: list[InboundMessage]) -> None:
+    async def _process_batch(
+        self, sid: str, msgs: list[InboundMessage], turn_id: str = "",
+    ) -> None:
         """Process a batch of one or more inbound messages as a single turn.
 
         Combines all messages into one user-role transcript row (preserving
@@ -630,22 +691,36 @@ class Agent:
         history = [as_message(r) for r in rows]
         system = self._build_system_prompt(retrieval_block, recap_block)
 
+        # Make the session id AND this turn's id ambient for the whole
+        # turn so the bash tool tags spawned process groups with both, and
+        # so spawned subagents inherit the turn id (asyncio.create_task
+        # copies the context) — that's what lets %stop cancel exactly this
+        # turn's cascade and kill its bash. Covers nested subagent
+        # run_turns too. Reset in a finally so it's cleared even on
+        # cancellation / early return.
+        tok_sid = current_sid.set(sid)
+        tok_turn = current_turn_id.set(turn_id)
         try:
-            new_messages, final_text = await self.ollama.run_turn(
-                model=self.agent_cfg.primary_model,
-                history=history,
-                system=system,
-                tools=self.tools,
-                sid=sid,
-                workspace_dir=self.agent_cfg.workspace,
-                label=f"{self.id}:main:{peer_label}",
-                verbose_suffix=sid,
-                num_predict=self.num_predict,
-            )
-        except Exception:
-            log.exception("[%s] ollama.run_turn failed", self.id)
-            await self.channel.send(peer_id, "Sorry — I hit an error. Could you try again?")
-            return
+            try:
+                new_messages, final_text = await self.ollama.run_turn(
+                    model=self.agent_cfg.primary_model,
+                    history=history,
+                    system=system,
+                    tools=self.tools,
+                    sid=sid,
+                    workspace_dir=self.agent_cfg.workspace,
+                    label=f"{self.id}:main:{peer_label}",
+                    verbose_suffix=sid,
+                    num_predict=self.num_predict,
+                    max_tool_turns=self.max_tool_turns,
+                )
+            except Exception:
+                log.exception("[%s] ollama.run_turn failed", self.id)
+                await self.channel.send(peer_id, "Sorry — I hit an error. Could you try again?")
+                return
+        finally:
+            current_turn_id.reset(tok_turn)
+            current_sid.reset(tok_sid)
 
         for m in new_messages:
             self.transcripts.append(sid, m)
@@ -682,21 +757,20 @@ class Agent:
         sid: str,
         rows_snapshot: list[dict],
     ) -> bool:
-        """If a flush or compaction predicate trips and no task is currently
-        in flight for this session, spawn one. Returns True if a task was
-        spawned, False otherwise.
+        """If the compaction predicate trips and no task is currently in
+        flight for this session, spawn a single background task that runs
+        flush then compaction on the compaction model. Returns True if a
+        task was spawned.
         """
         existing = self._bg_compaction.get(sid)
         if existing is not None and not existing.done():
             return False
 
-        do_flush = will_pre_compact_flush(self.cfg, self.transcripts, sid, rows_snapshot)
-        do_compact = will_mid_session_compact(self.cfg, rows_snapshot)
-        if not (do_flush or do_compact):
+        if not will_mid_session_compact(self.cfg, rows_snapshot):
             return False
 
         task = asyncio.create_task(
-            self._run_bg_compaction(sid, rows_snapshot, do_flush, do_compact),
+            self._run_bg_compaction(sid, rows_snapshot),
             name=f"bg-compact-{self.id}-{sid}",
         )
         self._bg_compaction[sid] = task
@@ -706,35 +780,31 @@ class Agent:
         self,
         sid: str,
         rows_snapshot: list[dict],
-        do_flush: bool,
-        do_compact: bool,
     ) -> None:
-        """Background body. Runs flush (if needed) then compaction. Each
-        phase is independent so a flush failure doesn't block compaction
+        """Background body. Runs the pre-compact flush then mid-session
+        compaction in sequence on the compaction model, concurrent with
+        the main user-reply turn. A flush failure does not block compaction
         and vice-versa.
         """
         try:
-            if do_flush:
-                await self._run_flush_guarded(
+            await self._run_flush_guarded(
+                sid=sid,
+                full_rows=rows_snapshot,
+                reason="pre-compact",
+                mode="bg",
+            )
+            try:
+                await run_mid_session_compact_async(
+                    cfg=self.cfg,
+                    ollama=self.ollama,
+                    transcripts=self.transcripts,
+                    session_lock=self._session_lock(sid),
                     sid=sid,
-                    full_rows=rows_snapshot,
-                    reason="pre-compact",
-                    mode="bg",
+                    rows_snapshot=rows_snapshot,
+                    compaction_model=self.compaction_model,
                 )
-
-            if do_compact:
-                try:
-                    await run_mid_session_compact_async(
-                        cfg=self.cfg,
-                        ollama=self.ollama,
-                        transcripts=self.transcripts,
-                        session_lock=self._session_lock(sid),
-                        sid=sid,
-                        rows_snapshot=rows_snapshot,
-                        compaction_model=self.compaction_model,
-                    )
-                except Exception:
-                    log.exception("[%s] background compaction failed for %s", self.id, sid)
+            except Exception:
+                log.exception("[%s] background compaction failed for %s", self.id, sid)
         finally:
             # Drop our reference once done so the next trigger can spawn a
             # fresh task. Other code paths only check `.done()` so the task
@@ -767,7 +837,7 @@ class Agent:
             sid = entry[: -len(".jsonl")]
             existing = self._bg_compaction.get(sid)
             if existing is not None and not existing.done():
-                # A pre-compact flush is already running for this session;
+                # A pre-compact bg task is already running for this session;
                 # the periodic flush would duplicate work.
                 continue
             rows = self.transcripts.load(sid)
@@ -788,6 +858,362 @@ class Agent:
             )
             tasks.append(task)
         return tasks
+
+    # --- in-band admin commands ----------------------------------------
+
+    def _command_authorized(self, sender_id: str) -> bool:
+        # === AUTH SOURCE — single switch point =========================
+        # Dedicated fail-closed allowlist (empty tuple = nobody). To instead
+        # reuse the per-agent matrix DM allowlist, replace the next line with:
+        #     allowed = self.agent_cfg.matrix.allow_from
+        allowed = self.cfg.commands.allow
+        # ===============================================================
+        return bool(sender_id) and sender_id in allowed
+
+    async def _handle_command(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        """Detached task: run one admin command and reply.
+
+        Authorization is already enforced at the handle_inbound gate, so
+        there is no auth/reject branch here. Each session-mutating handler
+        (clear / compact) calls into code that takes the per-session lock
+        itself, so this serializes behind any in-flight turn for ``sid`` —
+        and never reentrantly, because handle_inbound returned before the
+        drainer acquired that lock. Unknown/bare commands echo usage (only
+        authorized senders ever reach this method).
+        """
+        peer = msg.peer_id
+        prefix = self.cfg.commands.prefix
+        handlers = {
+            "clear": self._cmd_clear,
+            "compact": self._cmd_compact,
+            "verbose": self._cmd_verbose,
+            "context": self._cmd_context,
+            "stop": self._cmd_stop,
+            "subagents": self._cmd_subagents,
+        }
+        handler = handlers.get(cmd.name)
+        try:
+            if handler is None:
+                await self.channel.send(peer, usage(prefix))
+                return
+            await handler(sid, msg, cmd)
+        except Exception:
+            log.exception(
+                "[%s] command handler raised (cmd=%r room=%s)",
+                self.id, cmd.name, peer,
+            )
+
+    async def _cmd_clear(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        rows_before = len(self.transcripts.load(sid))
+        if rows_before == 0:
+            await self.channel.send(
+                msg.peer_id, "Session already empty — nothing to clear."
+            )
+            return
+        # Long op: a sync pre-rotate flush turn on the compaction model,
+        # then archive. Immediate ack + keepalived typing indicator (same
+        # mechanism normal turns use) so it's visibly running; the
+        # completion message lands when done.
+        await self.channel.send(
+            msg.peer_id, "Flushing memory, then clearing the session…",
+        )
+        async with self.channel.typing(msg.peer_id):
+            archived = await self.clear_session(sid, run_final_flush=True)
+        if archived:
+            await self.channel.send(
+                msg.peer_id,
+                f"Session cleared — {rows_before} rows archived, memory "
+                f"flushed. Starting fresh.",
+            )
+        else:
+            await self.channel.send(
+                msg.peer_id, "Session already empty — nothing to clear."
+            )
+
+    async def _cmd_compact(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        rows = self.transcripts.load(sid)
+        if not rows:
+            await self.channel.send(
+                msg.peer_id, "Nothing to compact — session is empty."
+            )
+            return
+        # Gate the (expensive) pre-compact flush on the SAME predicate the
+        # compaction itself uses: if a forced compaction wouldn't swap
+        # (transcript fits within the reserve/keep window), skip flush AND
+        # compact and just say so — don't burn a flush turn to then no-op.
+        if not will_compact(self.cfg, rows, force=True):
+            await self.channel.send(
+                msg.peer_id,
+                "Nothing to compact — transcript fits within the keep "
+                "window. No flush run.",
+            )
+            return
+        # Long op: a sync pre-compact flush turn on the compaction model,
+        # then the summarize+swap. Immediate ack + keepalived typing
+        # indicator so it's visibly running; completion lands when done.
+        await self.channel.send(
+            msg.peer_id, "Flushing memory, then compacting…",
+        )
+        async with self.channel.typing(msg.peer_id):
+            # Flush durable knowledge BEFORE the lossy summarize, mirroring
+            # the automatic flush+compact path (_run_bg_compaction) and
+            # %clear's pre-wipe flush — otherwise %compact can summarize
+            # away knowledge never written to memory/. mode="sync" (not the
+            # bg path's skip-if-busy "bg"): a manual command waits out any
+            # in-flight flush. _run_flush_guarded swallows its own errors
+            # and returns a bool; guard anyway so a flush failure never
+            # blocks the compaction.
+            flushed = False
+            try:
+                flushed = await self._run_flush_guarded(
+                    sid=sid,
+                    full_rows=list(rows),
+                    reason="pre-compact",
+                    mode="sync",
+                )
+            except Exception:
+                log.exception(
+                    "[%s] pre-compact flush raised for %s", self.id, sid
+                )
+            swapped = await run_mid_session_compact_async(
+                cfg=self.cfg,
+                ollama=self.ollama,
+                transcripts=self.transcripts,
+                session_lock=self._session_lock(sid),
+                sid=sid,
+                rows_snapshot=list(rows),
+                compaction_model=self.compaction_model,
+                force=True,
+            )
+        if swapped:
+            reply = (
+                "Context compacted (memory flushed first)."
+                if flushed else "Context compacted."
+            )
+        else:
+            reply = "Nothing to compact (already below the compaction split)."
+        await self.channel.send(msg.peer_id, reply)
+
+    async def _cmd_verbose(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        arg = cmd.args.strip().lower()
+        if arg in ("on", "true", "1"):
+            target = True
+        elif arg in ("off", "false", "0"):
+            target = False
+        elif arg == "":
+            target = not logsetup.verbose_enabled()
+        else:
+            await self.channel.send(
+                msg.peer_id, f"usage: {self.cfg.commands.prefix}verbose <on|off>"
+            )
+            return
+        logsetup.set_verbose(target)
+        await self.channel.send(
+            msg.peer_id,
+            f"Verbose logging {'ON' if target else 'OFF'} "
+            f"(process-wide — affects all agents).",
+        )
+
+    async def _cmd_context(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        rows = self.transcripts.load(sid)
+        # The pending idle-recap summary (if a recap was installed at boot or
+        # last turn). Read the cache directly — do NOT call _idle_recap_for,
+        # which could trigger an LLM summarize. None when nothing's pending.
+        recap = self._idle_recap_blocks.get(sid)
+        # Reproduce exactly what the next turn's system prompt will be, minus
+        # the per-message memory-retrieval block (unknowable until the user
+        # types). _build_system_prompt is sync + side-effect-free.
+        system = self._build_system_prompt("", recap)
+        sys_toks = estimate_tokens([{"content": system}])
+        hist_toks = estimate_tokens(rows)
+        start_toks = sys_toks + hist_toks
+        thr = self.cfg.compaction.mid_session_token_threshold
+        # Auto-compaction is gated on transcript rows only (will_mid_session
+        # _compact uses estimate_tokens(rows)), not the full prompt — report
+        # the % against the number that actually triggers it.
+        pct = round(100 * hist_toks / thr) if thr else 0
+        recap_note = (
+            f", incl. ~{estimate_tokens([{'content': recap}]):,} pending recap"
+            if recap else ""
+        )
+        await self.channel.send(
+            msg.peer_id,
+            f"Context: next turn starts at ~{start_toks:,} tokens — system "
+            f"~{sys_toks:,}{recap_note} + {len(rows)} transcript rows "
+            f"~{hist_toks:,}, before your message / memory retrieval / tool "
+            f"schema. Auto-compaction triggers on transcript rows at "
+            f"{thr:,} (~{pct}% there).",
+        )
+
+    async def _cmd_stop(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        """The just-in-case button. Every action is bounded to a single
+        turn (or one subagent subtree within it) — never session-wide.
+
+        ``%stop`` — cancel this session's in-flight conversational turn:
+        cancel the per-session drainer while it's inside _process_batch
+        (CancelledError is a BaseException so _process_batch's
+        `except Exception` can't swallow it; it unwinds the session-lock +
+        typing CMs and ends the drainer; handle_inbound lazily recreates
+        it next inbound). Also cancel the *entire spawn cascade* rooted at
+        this turn (matched by turn_id, inherited transitively) and suppress
+        those subagents' completion so a zombie can't resurrect the
+        stopped session. By default SIGKILL the turn's bash process trees
+        (main + cascade); ``--soft`` (also ``-s`` / ``--keep-bash``) skips
+        only the bash kill — for the rare case where an in-flight,
+        non-idempotent shell command (backup / migration / build) should
+        be allowed to finish even though the agent is being stopped. A
+        synthetic user-role marker is appended so the next turn knows the
+        instruction was operator-cancelled and must not be auto-resumed.
+
+        ``%stop <task_id>`` — cancel just that subagent and its descendant
+        subtree; the parent turn and sibling subagents are untouched. The
+        target keeps its normal (cancelled) completion delivery — the
+        session is alive and should learn it died, same as the
+        model-facing subagent_stop. Its bash subtree is SIGKILLed unless
+        ``--soft``.
+
+        Background flush/compaction and an in-progress %clear/%compact run
+        off the drainer and are never affected.
+        """
+        tokens = cmd.args.split()
+        soft = any(t in ("--soft", "-s", "--keep-bash") for t in tokens)
+        target = next((t for t in tokens if not t.startswith("-")), None)
+        peer = msg.peer_id
+        prefix = self.cfg.commands.prefix
+
+        # ---- targeted: %stop <task_id> ---------------------------------
+        if target is not None:
+            sp = self.spawner
+            ct = sp.tasks.get(target) if sp is not None else None
+            if (
+                ct is None
+                or ct.status != "running"
+                or session_id(ct.origin_channel, ct.origin_peer_id) != sid
+            ):
+                await self.channel.send(
+                    peer,
+                    f"No running subagent {target!r} in this conversation "
+                    f"— {prefix}subagents to list them.",
+                )
+                return
+            cancelled = sp.cancel_subtree(target)
+            killed = 0 if soft else kill_subagent_bash(set(cancelled))
+            extra = len(cancelled) - 1
+            who = (
+                f"subagent {target}"
+                + (f" + {extra} descendant(s)" if extra > 0 else "")
+            )
+            bash = (
+                " Its bash was left running (--soft)." if soft
+                else f" {killed} bash group(s) killed."
+            )
+            await self.channel.send(
+                peer,
+                f"Cancelled {who}.{bash} Parent turn untouched.",
+            )
+            return
+
+        # ---- whole turn: %stop ----------------------------------------
+        turn_id = self._inflight_turn.get(sid)
+        task = self._drainer_tasks.get(sid)
+        if not turn_id or task is None or task.done():
+            await self.channel.send(
+                peer,
+                "Nothing running — no in-flight turn to stop. (Background "
+                "flush/compaction is not affected. For subagents still "
+                f"running from a prior turn: {prefix}subagents to list, "
+                f"{prefix}stop <task_id> to cancel one.)",
+            )
+            return
+
+        await self.channel.send(peer, "Stopping the current turn…")
+        # Cancel the turn's whole cascade FIRST, with suppression, so even
+        # a subagent that finishes in the cancel window can't deliver a
+        # completion back into the session we're stopping.
+        cancelled = (
+            self.spawner.cancel_turn(turn_id, suppress=True)
+            if self.spawner is not None else []
+        )
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        # Clean stop: drop anything queued/coalesced so a backlog doesn't
+        # fire on the next unrelated message, and clear the wake event.
+        self._pending_inbound.pop(sid, None)
+        ev = self._has_pending.get(sid)
+        if ev is not None:
+            ev.clear()
+        # Default: SIGKILL this turn's bash trees (main + cascade — all
+        # tagged with turn_id). Registry still has the pgids; dereg runs
+        # in the worker thread, not the cancelled await. --soft skips it.
+        killed = 0 if soft else kill_turn_bash(turn_id)
+
+        # Record the cancellation IN THE TRANSCRIPT so the next turn knows
+        # the prior instruction was deliberately killed by the operator —
+        # not an error, not the agent's own choice — and must not be
+        # auto-resumed (else the orphaned user message is re-attempted →
+        # stop/start loop). User-role + bracket matches claw's injection
+        # convention. Under the session lock (the cancelled drainer
+        # released it) so it serialises with any bg compaction/clear swap.
+        note = (
+            "[SYSTEM (out-of-band notice — not a user message, not an "
+            "error): the operator deliberately cancelled the previous "
+            "turn via the %stop command before it finished. That "
+            "instruction is abandoned — do NOT resume or retry it; treat "
+            "it as cancelled-by-user and wait for a new instruction. Any "
+            "side effects from it may be partial."
+        )
+        if cancelled:
+            note += (
+                f" {len(cancelled)} spawned subagent(s) were also cancelled."
+            )
+        note += (
+            " Shell processes from it were left running (--soft)."
+            if soft else
+            f" {killed} shell process group(s) were killed."
+        )
+        note += "]"
+        async with self._session_lock(sid):
+            self.transcripts.append(sid, {"role": "user", "content": note})
+
+        subs = f" {len(cancelled)} subagent(s) cancelled." if cancelled else ""
+        bash = (
+            " Bash left running (--soft)." if soft
+            else f" {killed} bash group(s) killed."
+        )
+        await self.channel.send(
+            peer,
+            "Stopped — turn cancelled, queued messages dropped."
+            + subs + bash,
+        )
+
+    async def _cmd_subagents(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        """Read-only discovery: list this conversation's running subagents
+        (session-scoped — every turn's children — since you need to see
+        them all to pick one to %stop <task_id>). Listing, not acting."""
+        if self.spawner is None:
+            await self.channel.send(
+                msg.peer_id, "Subagents are not enabled for this agent."
+            )
+            return
+        cts = self.spawner.running_for_session(sid)
+        await self.channel.send(msg.peer_id, self.spawner.format_running(cts))
 
     # --- session rotate (full-context clear) ---------------------------
 

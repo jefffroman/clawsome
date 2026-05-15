@@ -9,9 +9,8 @@ to specific keys point at `docs/configuration.md`.
 | Task | Trigger | Where it runs | What it produces |
 |---|---|---|---|
 | Periodic memory_flush | Maintenance loop, every 5 min, per-session if grew by `memory_flush.periodic_growth_threshold` since last flush | Background asyncio task | Bullets appended to `<workspace>/memory/YYYY-MM-DD.md` |
-| Pre-compaction memory_flush | Request path, when transcript within `memory_flush.soft_threshold_tokens` of compaction trigger | Background asyncio task (off the user-reply critical path) | Same as above |
+| Pre-compact memory_flush + mid-session compaction | Request path, when estimated transcript tokens > `compaction.mid_session_token_threshold`. A single bg task runs flush, then compaction, in sequence — flush captures durable items before older turns are summarized away. | Background asyncio task (off the user-reply critical path) | Bullets appended to `<workspace>/memory/YYYY-MM-DD.md`, then older portion of transcript collapsed to a `## Pre-compaction Recap` row |
 | Pre-rotate memory_flush | At `lifecycle.daily_session_rotate_hour`, once per active session before wipe | Synchronous under per-session lock | Same as above |
-| Mid-session compaction | Request path, when estimated transcript tokens > `compaction.mid_session_token_threshold` | Background asyncio task | Older portion of transcript collapsed to a `## Pre-compaction Recap` row |
 | Idle recap | Agent boot. Older than `compaction.idle_recap_seconds` → archive + recap; younger → transcript resumes intact, no recap | Synchronous, pre-live | `## Last Session Recap` row prepended on the fresh session; prior JSONL archived `.recap-<ts>` |
 | Periodic reindex | Maintenance loop, every 5 min, if memory source files' hash changed | Background asyncio task | Refreshed ChromaDB + BM25 + graph |
 | Daily session rotate | At `lifecycle.daily_session_rotate_hour` | Synchronous per session | Final memory_flush, JSONL archived `.reset-<ts>`, caches cleared |
@@ -32,6 +31,15 @@ At most one flush is in flight per session: background flushes
 (periodic, pre-compact) skip if another is running; the synchronous
 pre-rotate flush waits on the per-session flush lock.
 
+Long tool-call argument strings (e.g., a `write_file`/`append_file` with
+multi-KB content) are stubbed in the persisted assistant row at
+`ollama.TOOL_CALL_ARGS_MAX_CHARS` (default 200). The in-loop `messages`
+list and the `claw.ollama` DEBUG log keep the full args, so the model
+can chain on its own emissions during a single `run_turn` and verbose
+operators can see what was called. Stubbing in persistence prevents the
+flush model from re-seeing the prior content and re-capturing it on the
+next slice.
+
 The flush turn is **not persisted to the user-visible transcript** — only
 the side effect (the appended bullets) survives. This means:
 
@@ -45,15 +53,14 @@ the side effect (the appended bullets) survives. This means:
 Defaults target a 192K Ollama context. Scale together when changing
 context size — the relationships matter more than absolute values:
 
-| Context | mid_session_token_threshold | reserve_tokens | soft_threshold_tokens | periodic_growth_threshold |
-|---|---|---|---|---|
-| 64K | 32000 | 16000 | 4000 | 1300 |
-| 128K | 64000 | 32000 | 8000 | 2700 |
-| 192K | 96000 | 48000 | 12000 | 4000 |
+| Context | mid_session_token_threshold | reserve_tokens | periodic_growth_threshold |
+|---|---|---|---|
+| 64K | 32000 | 16000 | 1300 |
+| 128K | 64000 | 32000 | 2700 |
+| 192K | 96000 | 48000 | 4000 |
 
 Rule of thumb: `mid_session_token_threshold ≈ 50%` of context,
-`reserve_tokens ≈ 25%`, `soft_threshold_tokens ≈ trigger / 8`,
-`periodic_growth_threshold ≈ trigger / 24`.
+`reserve_tokens ≈ 25%`, `periodic_growth_threshold ≈ trigger / 24`.
 
 ### When flushes time out
 
@@ -184,12 +191,50 @@ away, two layers need fixing:
 
 Both layers must be addressed; either alone leaves the ghost.
 
+## Admin commands
+
+In-band operator commands over Matrix. Requires the `commands:` config
+block (see Configuration); a prefixed message from a non-allowlisted
+sender is silently treated as ordinary text. Every action is bounded to
+a single turn (or one subagent subtree); the only session-wide command
+is the read-only `%subagents`.
+
+| Command | When to use |
+|---|---|
+| `%context` | See how close the live transcript is to auto-compaction. Reports the next turn's starting floor. Read-only. |
+| `%compact` | Force a compaction now (e.g. before a long task) without waiting for the threshold. No-ops *without* flushing if the transcript already fits the keep window. |
+| `%clear` | Hard reset this conversation. Runs a final memory_flush first so durable knowledge survives; transcript archived `.reset-<ts>`. |
+| `%stop` | Panic button: a runaway/looping turn, or one you don't want to finish. Cancels the turn + its whole subagent cascade and SIGKILLs their bash. |
+| `%stop --soft` | Same, but leave in-flight shell commands running — when a non-idempotent command (DB dump/restore, migration, package install, large write) is mid-flight and a SIGKILL would corrupt it. You're stopping the agent, not that command. |
+| `%stop <task_id>` | Kill one specific subagent + its descendants without touching the parent turn or siblings. Get the id from `%subagents`. `--soft` spares its bash. |
+| `%subagents` | List this conversation's running subagents (task_id, persona, elapsed) — discovery for targeted `%stop`. |
+| `%verbose on` / `off` | Flip DEBUG logging at runtime, no restart. Process-wide. |
+
+`%stop` acts immediately and concurrently — it is not queued behind the
+turn. Cancellation lands at the running turn's next `await` (sub-second
+for I/O-bound work). A turn wedged with no `await` can only be ended by
+restarting the gateway (the realistic wedge — a long `bash` — is killed
+by the default `%stop`). After a cancel a synthetic
+`[SYSTEM … cancelled-by-user …]` marker is appended to the transcript
+so the agent treats the stopped instruction as abandoned instead of
+re-attempting it (which would loop). `%stop` suppresses the cancelled
+cascade's completion delivery so a zombie subagent can't resurrect a
+stopped conversation; a targeted `%stop <task_id>` lets the target's
+own (cancelled) completion deliver — the session is alive and should
+learn it died — but suppresses collateral descendants.
+
+Relevant log lines: the `cmd-<agent>-<sid>-<name>` command-handler task
+name; `claw.tools.bash` `killpg(...)` entries; subagent `cancelled` /
+`completion suppressed (session stopped)`.
+
 ## Troubleshooting
 
 ### Increase log verbosity
 
-Set `verbose: true` in `claw.yaml` and restart. Switches `claw.*`
-loggers to DEBUG. Verbose; flip back off when done investigating.
+`%verbose on` flips `claw.*` loggers to DEBUG at runtime — process-wide,
+no restart; `%verbose off` reverts (see Admin commands). For boot-time
+verbosity instead, set `verbose: true` in `claw.yaml` and restart.
+DEBUG is noisy — flip back off when done investigating.
 
 ### Common log signatures
 
