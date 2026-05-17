@@ -28,7 +28,7 @@ class OllamaConfig:
     # httpx read timeout per /api/chat call. Should comfortably exceed the
     # worst-case wall time for one num_predict-bounded generation on the
     # slowest agent's model. Bumped 2026-05-03 from 900 to 1800 to give
-    # 16K-cap turns on qwen3.5:122b (Thesa) headroom; recovery branch
+    # 16K-cap turns on qwen3.5:122b (persona-1) headroom; recovery branch
     # double-budgets a length-truncated turn (initial + recovery), each
     # call independently bounded by this timeout.
     request_timeout_s: float = 1800.0
@@ -284,7 +284,7 @@ def _parse(d: dict[str, Any]) -> Config:
     return Config(
         verbose=d.get("verbose", False),
         ollama=OllamaConfig(**d["ollama"]),
-        memory_retrieval=MemoryRetrievalConfig(**d.get("memory_retrieval", {})),
+        memory_retrieval=MemoryRetrievalConfig(**(d.get("memory_retrieval") or {})),
         searxng=SearxngConfig(**d["searxng"]),
         cron=CronConfig(
             enabled=d["cron"]["enabled"],
@@ -302,10 +302,10 @@ def _parse(d: dict[str, Any]) -> Config:
                 for name, spec in d["subagents"]["personas"].items()
             },
         ),
-        compaction=CompactionConfig(**d.get("compaction", {})),
-        memory_flush=MemoryFlushConfig(**d.get("memory_flush", {})),
-        lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
-        commands=_parse_commands(d.get("commands", {})),
+        compaction=CompactionConfig(**(d.get("compaction") or {})),
+        memory_flush=MemoryFlushConfig(**(d.get("memory_flush") or {})),
+        lifecycle=LifecycleConfig(**(d.get("lifecycle") or {})),
+        commands=_parse_commands(d.get("commands") or {}),
         agents=tuple(_parse_agent(a) for a in d["agents"]),
         tz=d.get("tz"),
     )

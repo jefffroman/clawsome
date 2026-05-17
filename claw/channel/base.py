@@ -14,7 +14,7 @@ class InboundMessage:
     For Matrix: ``peer_id`` is the room ID (DMs have one peer; group rooms
     are routed by mention). ``sender_name`` is the human display name.
     ``sender_id`` is the stable identifier — full MXID for matrix
-    (``@alice:example.org``), task_id for subagent_completion synthetics,
+    (``@user-1:example.org``), task_id for subagent_completion synthetics,
     empty otherwise (cron / initial_prompt fall back to sender_name for
     log labelling).
     """
@@ -35,6 +35,7 @@ class Channel(Protocol):
     async def send(self, peer_id: str, text: str) -> None: ...
     async def shutdown(self) -> None: ...
     def typing(self, peer_id: str) -> AsyncContextManager[None]: ...
+    async def clear_typing(self, peer_id: str) -> None: ...
 
 
 @asynccontextmanager

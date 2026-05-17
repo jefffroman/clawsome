@@ -183,7 +183,7 @@ commands:
   enabled: true
   prefix: "%"
   allow:
-    - "@operator:example.org"
+    - "@user-1:example.org"
 ```
 
 ## `agents:`
@@ -215,7 +215,7 @@ List of agent blocks. At least one required. Each block:
 | `encryption` | bool | `true` | Enable E2E encryption. Disable only if testing against a non-encrypted room. |
 | `auto_join` | `"always"` \| `"never"` | `"always"` | Whether to auto-join rooms the bot is invited to. |
 | `allow_bots` | `"mentions"` \| `"all"` \| `"none"` | `"mentions"` | Filter for group-room messages. `"mentions"` = reply only when explicitly `@`-mentioned. |
-| `allow_from` | list[str] (MXIDs) | `[]` | DM allowlist. The bot accepts DMs only from these MXIDs (e.g. `@alice:localhost.localnet`). Group rooms ignore this list. **Each entry must be a real account on the homeserver** — clawsome ships no signup flow, so register human users out-of-band (Synapse: `register_new_matrix_user`) before listing them here. |
+| `allow_from` | list[str] (MXIDs) | `[]` | DM allowlist. The bot accepts DMs only from these MXIDs (e.g. `@user-1:localhost.localnet`). Group rooms ignore this list. **Each entry must be a real account on the homeserver** — clawsome ships no signup flow, so register human users out-of-band (Synapse: `register_new_matrix_user`) before listing them here. |
 | `password_file` | path \| null | `null` | One-line file with the bot account login password. Needed only for the one-time cross-signing UIA challenge on `/keys/device_signing/upload`. If unset, cross-signing is skipped — the bot still works but appears as "user verification unavailable" in Element. Mode 0600. |
 | `force_cross_signing_replace` | bool | `false` | One-shot operator escape hatch: replace any existing cross-signing keys on the homeserver with freshly-generated ones. Use when migrating an account previously bootstrapped by another client. **Destructive** — invalidates prior device signatures and forces every other user to re-verify this account. Set `true` for one boot, then revert. |
 
@@ -224,3 +224,8 @@ List of agent blocks. At least one required. Each block:
 `load()` validates `can_spawn` entries against the persona registry —
 unknown persona names raise `ValueError` at startup. Other shape errors
 surface as standard YAML / dataclass errors with the offending field.
+
+An optional block written but left empty (e.g. `lifecycle:` with no
+value, which YAML parses as `null`) is treated identically to omitting
+it — defaults apply. The required blocks (`ollama`, `searxng`, `cron`,
+`subagents`, `agents`) still error if missing or empty.

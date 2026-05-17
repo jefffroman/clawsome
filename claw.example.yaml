@@ -42,7 +42,7 @@ cron:
   exposed_to: []
   # Fallback delivery target when cron_add is called without an explicit
   # deliver_to. Omit (or null) to require deliver_to per call.
-  # default_deliver_to: "@phone-user:example.com"
+  # default_deliver_to: "@user-1:example.com"
 
 subagents:
   max_concurrent: 8
@@ -60,9 +60,9 @@ subagents:
   # file inspection; grunts should stay tight on both; coders sit in
   # between.
   personas:                              # case-insensitive lookup
-    thesa:     { model: qwen3.5:122b,        role: researcher,  max_spawn_depth: 1, can_spawn: [chop-chop], num_predict: 16384, max_tool_turns: 60 }
-    cristal:   { model: qwen3-coder-next,    role: coder,       max_spawn_depth: 1, can_spawn: [chop-chop], num_predict: 8192,  max_tool_turns: 40 }
-    chop-chop: { model: qwen3.6:35b-a3b,     role: grunt,                                                   num_predict: 4096,  max_tool_turns: 20 }
+    persona-1: { model: qwen3.5:122b,        role: researcher,  max_spawn_depth: 1, can_spawn: [persona-3], num_predict: 16384, max_tool_turns: 60 }
+    persona-2: { model: qwen3-coder-next,    role: coder,       max_spawn_depth: 1, can_spawn: [persona-3], num_predict: 8192,  max_tool_turns: 40 }
+    persona-3: { model: qwen3.6:35b-a3b,     role: grunt,                                                   num_predict: 4096,  max_tool_turns: 20 }
 
 compaction:
   idle_recap_seconds: 3600
@@ -133,7 +133,7 @@ commands:
   # MXIDs allowed to run commands. Empty = nobody (fail closed). Kept separate
   # from per-agent matrix.allow_from so DM access doesn't grant control plane.
   allow:
-    - "@operator:matrix.example.com"
+    - "@user-1:matrix.example.com"
 
 agents:
   - id: example
@@ -144,7 +144,7 @@ agents:
     # Child fork's effective budget is min(this - 1, persona.max_spawn_depth).
     max_spawn_depth: 1
     # Optional persona allowlist. Omit (or null) to allow any persona.
-    # Example: can_spawn: [thesa, cristal, chop-chop]
+    # Example: can_spawn: [persona-1, persona-2, persona-3]
     # Optional per-agent override of ollama.num_predict. null inherits global.
     # num_predict: 12288
     # Optional per-agent override of ollama.max_tool_turns. null inherits global.
@@ -176,4 +176,4 @@ agents:
       auto_join: always
       allow_bots: mentions
       allow_from:
-        - "@operator:matrix.example.com"
+        - "@user-1:matrix.example.com"

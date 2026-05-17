@@ -113,7 +113,21 @@ except the read-only `%subagents` listing.
 | `%clear` | Final memory_flush, then archive the transcript + reset per-session state (same machinery as the daily rotate). |
 | `%stop [<task_id>] [--soft]` | Cancel the in-flight turn + its entire spawned cascade, suppress those subagents' completion delivery, and SIGKILL their bash trees. `<task_id>` instead cancels just that subagent + its descendant subtree (parent/siblings untouched). `--soft` skips only the bash kill. |
 | `%subagents` | List this session's running subagents (discovery). Read-only. |
-| `%verbose <on\|off>` | Toggle DEBUG logging process-wide at runtime (no restart). |
+| `%verbose <on\|off>` | Set DEBUG logging process-wide at runtime (no restart). Bare `%verbose` reports current state. |
+| `%thinking <on\|off\|full>` | Per-**session**: surface the model's reasoning trace (Ollama `message.thinking`) as a separate blockquoted message before the answer. `on` = the final answer turn's reasoning; `full` = every tool-loop iteration's. Bare `%thinking` reports current state. Ephemeral — never transcribed or logged; default off. |
+
+**Argument handling.** Commands take *explicit* arguments — there is no
+bare-prefix toggle. For a state command (`%verbose`, `%thinking`) the
+bare form is a status *read*; an explicit value sets it; an unknown or
+extra parameter is reported with that command's usage (never silently
+applied or ignored — a fat-fingered `%stop --frce` won't no-op
+silently).
+
+**Settings persistence.** `%verbose` and `%thinking` set in-memory
+runtime state only — nothing is written to `claw.yaml` or otherwise
+persisted. A gateway restart resets both: `%verbose` reverts to the
+`claw.yaml` `verbose` boot value, `%thinking` to off for every
+conversation. Re-issue the command after a restart to restore it.
 
 **Turn / cascade identity.** Each turn gets a `turn_id` that
 `_process_batch` publishes via a ContextVar. `asyncio.create_task`

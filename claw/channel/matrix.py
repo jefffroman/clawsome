@@ -737,6 +737,33 @@ class MatrixChannel:
             room_id = ""
         return _TypingContext(self._client, room_id)
 
+    async def clear_typing(self, peer_id: str) -> None:
+        """Force the room's typing state OFF (one-shot, no renew loop).
+
+        Used after a control-plane reply lands mid-turn: that reply
+        clears the bot's typing *client-side*, but the turn's typing
+        heartbeat only ever re-asserts ``True`` (never a transition), so
+        the server never re-broadcasts ``m.typing`` and the indicator
+        would stay gone for the rest of the turn. Dropping server typing
+        here makes the heartbeat's next re-assert a real ``false→true``
+        the client actually renders. Same MXID→room resolution as
+        ``typing()``; a no-op when there's no room behind ``peer_id``.
+        """
+        if self._client is None:
+            return
+        if peer_id.startswith("@"):
+            room_id = self._resolve_room_for_user(peer_id) or ""
+        elif peer_id.startswith("!"):
+            room_id = peer_id
+        else:
+            room_id = ""
+        if not room_id:
+            return
+        try:
+            await self._client.room_typing(room_id, False)
+        except Exception:
+            log.debug("clear_typing failed for %s", peer_id, exc_info=True)
+
     async def shutdown(self) -> None:
         log.info("[%s] shutting down", self.user_id)
         if self._sync_task is not None:

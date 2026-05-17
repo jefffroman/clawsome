@@ -280,8 +280,8 @@ class SubagentSpawner:
             # peer_label derivation in agent._derive_peer_label uses
             # sender_id when present; setting the task_id here gives the
             # parent's resulting run_turn label a useful tag like
-            # ``[quint:main:chop-chop-a1b2c3d4]`` instead of the
-            # ``subagent:chop-chop:chop-chop-a1b2c3d4`` sender_name fallback.
+            # ``[agent-1:main:persona-3-a1b2c3d4]`` instead of the
+            # ``subagent:persona-3:persona-3-a1b2c3d4`` sender_name fallback.
             sender_id=ct.id,
         )
         try:
@@ -508,7 +508,7 @@ def build_subagent_status_tool(parent: "Agent", spawner: SubagentSpawner) -> Too
                     "type": "string",
                     "description": (
                         "Task id returned by subagent_spawn (e.g. "
-                        "'chop-chop-a1b2c3d4')."
+                        "'persona-3-a1b2c3d4')."
                     ),
                 },
             },

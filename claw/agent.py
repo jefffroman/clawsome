@@ -32,6 +32,7 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 from claw import logsetup
@@ -39,7 +40,13 @@ from claw.runctx import current_sid, current_turn_id
 from claw.tools.builtin import kill_subagent_bash, kill_turn_bash
 from claw.channel.base import Channel, InboundMessage
 from claw.channel.envelope import format_inbound_envelope
-from claw.commands import KNOWN, ParsedCommand, parse_command, usage
+from claw.commands import (
+    KNOWN,
+    ParsedCommand,
+    command_usage,
+    parse_command,
+    usage,
+)
 from claw.compaction import (
     maybe_idle_recap,
     run_mid_session_compact_async,
@@ -80,8 +87,8 @@ log = logging.getLogger("claw.agent")
 
 def _derive_peer_label(msg: InboundMessage) -> str:
     """Short human-meaningful identifier for ``msg``'s sender, used in
-    run_turn labels. MXID localpart for matrix (``@alice:example.org`` ->
-    ``alice``), sender_name for synthetic channels (cron / initial_prompt
+    run_turn labels. MXID localpart for matrix (``@user-1:example.org`` ->
+    ``user-1``), sender_name for synthetic channels (cron / initial_prompt
     / subagent_completion), channel name as last resort.
     """
     sid = msg.sender_id
@@ -92,6 +99,76 @@ def _derive_peer_label(msg: InboundMessage) -> str:
     if msg.sender_name:
         return msg.sender_name
     return msg.channel or "?"
+
+
+def _has_visible_content(text: str) -> bool:
+    """True if *text* has at least one character that actually renders.
+
+    The reasoning-trace surface gates on this rather than ``str.strip()``.
+    ``str.strip()`` only removes *whitespace*, so a trace whose entire body
+    is zero-width / format / control characters — U+200B, U+FEFF, soft
+    hyphen, etc., which qwen3 occasionally emits as its whole final-turn
+    ``message.thinking`` — passes ``.strip()`` yet ``_as_thinking_blockquote``
+    then renders a header-only block with an invisible body. Reject when
+    every character is whitespace or in Unicode category C* (control /
+    format / surrogate / private-use / unassigned). Shared by both the
+    final-only (%thinking on) and every-step (%thinking full) paths so the
+    two modes suppress body-less traces identically.
+    """
+    return any(
+        not ch.isspace() and unicodedata.category(ch)[0] != "C"
+        for ch in text
+    )
+
+
+def _quote_body(text: str) -> str:
+    """Prefix every line with ``> `` (blank source lines become a bare
+    ``>`` so the blockquote doesn't terminate mid-body). The matrix
+    channel's markdown-it renderer turns this into a real
+    ``<blockquote>``; literal HTML is escaped by its ``html=False``.
+    """
+    return "\n".join(
+        f"> {line}" if line else ">" for line in text.splitlines()
+    )
+
+
+def _as_thinking_blockquote(text: str) -> str:
+    """Render a model reasoning trace as a 🧠-headed blockquote."""
+    return f"> 🧠 **reasoning**\n>\n{_quote_body(text)}"
+
+
+def _as_system_blockquote(text: str) -> str:
+    """Render a control-plane (admin command) reply as a 🖥️-headed
+    blockquote, so it reads visually as a *system* message — distinct
+    from the 🧠 reasoning surface and from ordinary agent prose.
+    """
+    return f"> 🖥️ **system**\n>\n{_quote_body(text)}"
+
+
+# Separator prefixed to the answer when another bot block already went
+# out this turn ahead of it — a %thinking reasoning block, or a 🖥️
+# system block a command emitted while the turn was in flight. Those are
+# consecutive same-sender Matrix events, which clients group tightly
+# with no speaker-switch gap.
+# A real blank line can't fix this: CommonMark discards body-edge
+# whitespace, so "\n"/"\n\n" prepended to the answer (or appended to the
+# block) renders identically to no separator — verified against the
+# channel's exact markdown-it config. We need visible structure, so we
+# prefix a zero-width-space (U+200B) then one newline: with the channel's
+# breaks=True, "\u200b\n" -> <p>U+200B<br>...answer...</p> \u2014 a single
+# hard line break above the answer (one-line gap). "\u200b\n\n" instead
+# makes a whole empty <p>U+200B</p> paragraph (two-line gap \u2014 the
+# original tuning, found heavier than needed). ZWSP rather than a bare
+# " " (-> empty/stripped) so the spacer line survives. If the answer
+# opens with a block construct (code fence, list, heading, blockquote)
+# it interrupts the ZWSP paragraph and renders exactly as the two-line
+# form did \u2014 a graceful content-preserving fallback.
+# U+200B is the one character _has_visible_content() rejects, but that
+# gate only ever inspects *reasoning traces*, never the answer, so
+# reusing it here as a deliberate spacer cannot interfere with
+# body-less-block suppression. Escape (not a literal ZWSP) so the source
+# stays greppable.
+_THINKING_ANSWER_SEP = "\u200b\n"
 
 
 class Agent:
@@ -168,6 +245,14 @@ class Agent:
         # cascade-cancel + bash-kill). Set by the drainer around the
         # _process_batch call, popped in its finally.
         self._inflight_turn: dict[str, str] = {}
+        # turn_ids that had a 🖥️ system (command) block emitted while
+        # in-flight. Mirrors the thinking_emitted flag: such a block and
+        # the turn's answer are consecutive same-sender events, so the
+        # answer gets the same one-line _THINKING_ANSWER_SEP gap. Tagged
+        # at the _cmd_reply chokepoint, read in _process_batch before the
+        # answer send, discarded by the drainer's finally (so it never
+        # leaks for answerless turns or post-answer system sends).
+        self._system_emitted_turns: set[str] = set()
         # At most one background flush+compact task per session at a time.
         self._bg_compaction: dict[str, asyncio.Task] = {}
         # Token count at last periodic flush per session, for delta-trigger.
@@ -202,6 +287,15 @@ class Agent:
         # Boot-time recap state, keyed by session id.
         self._idle_recapped: set[str] = set()
         self._idle_recap_blocks: dict[str, str] = {}
+        # Per-session reasoning-trace surfacing, set by %thinking. Maps
+        # sid -> "final" (the final answer turn's reasoning, =#53) or
+        # "full" (every loop iteration's reasoning, a superset — the
+        # final-only send is suppressed for that sid so the last block
+        # isn't duplicated). Absent => off. Ephemeral and in-memory:
+        # never persisted, resets on daemon restart (same as #53), and a
+        # default-empty map is zero behavior change until a conversation
+        # explicitly opts in.
+        self._thinking_mode: dict[str, str] = {}
 
         # Always expose memory_search — read-only retrieval over this agent's
         # MemoryIndex. Subagents inherit it via their parent's tool registry.
@@ -463,7 +557,7 @@ class Agent:
                 label = f"{self.parent_id}:subagent:{self.spawn_task_id}"
             else:
                 label = f"subagent:{sid}"
-            _new_messages, final_text = await self.ollama.run_turn(
+            _new_messages, final_text, _ = await self.ollama.run_turn(
                 model=self.agent_cfg.primary_model,
                 history=history,
                 system=system,
@@ -597,6 +691,7 @@ class Agent:
                                 await self._process_batch(sid, batch, turn_id)
                             finally:
                                 self._inflight_turn.pop(sid, None)
+                                self._system_emitted_turns.discard(turn_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -634,11 +729,11 @@ class Agent:
 
         # peer_label: short human-meaningful identifier for the conversation
         # partner who triggered this turn — used in the run_turn label so
-        # log lines self-identify (``[quint:main:alice]``). Prefer the MXID
+        # log lines self-identify (``[agent-1:main:user-1]``). Prefer the MXID
         # localpart when sender_id is a Matrix MXID; fall back to
         # sender_name (synthetic channels like cron/initial_prompt set
         # sender_name to a meaningful tag); ultimate fallback is the
-        # channel name so labels never collapse to bare ``[quint:main]``.
+        # channel name so labels never collapse to bare ``[agent-1:main]``.
         peer_label = _derive_peer_label(msgs[0])
         self._peer_label_by_sid[sid] = peer_label
         # Anchor log line at the top of every turn — closes the visibility
@@ -648,6 +743,7 @@ class Agent:
             "[%s:main:%s] turn starting (%d inbound)",
             self.id, peer_label, len(msgs),
         )
+        turn_t0 = time.monotonic()
 
         # Envelope wrap: gives the model a per-turn anchor for current date,
         # day-of-week, and elapsed time since the prior turn. Without this,
@@ -691,6 +787,36 @@ class Agent:
         history = [as_message(r) for r in rows]
         system = self._build_system_prompt(retrieval_block, recap_block)
 
+        # Per-conversation reasoning-trace mode (set by %thinking).
+        # "full" => stream every loop iteration's reasoning live via the
+        # run_turn callback; "final" => surface only the final turn's,
+        # sent after run_turn returns (below); None => off. The callback
+        # only sends — it never touches new_messages/transcript — so the
+        # ephemerality invariant holds even though it fires mid-loop
+        # (before the transcript append) rather than after.
+        thinking_mode = self._thinking_mode.get(sid)
+
+        # True once a *visible* reasoning block has actually been surfaced
+        # this turn — set by the full-mode callback below (after its
+        # visible-content gate) or by the final-mode post-send. Gates the
+        # answer's _THINKING_ANSWER_SEP prefix so the gap is added iff
+        # there is *both* a reasoning block and an answer; no spurious
+        # separator when thinking is off (the user->bot speaker switch
+        # already separates) or when a body-less trace was suppressed.
+        # This per-turn flag is the async-safe crux: in full mode whether
+        # any block was emitted isn't known until run_turn returns.
+        thinking_emitted = False
+
+        async def _emit_thinking(trace: str) -> None:
+            nonlocal thinking_emitted
+            # ollama fires this on .strip() truthiness; apply the stronger
+            # visible-content gate here so "full" suppresses body-less
+            # (zero-width/format-only) traces exactly like "final" does.
+            if not _has_visible_content(trace):
+                return
+            thinking_emitted = True
+            await self.channel.send(peer_id, _as_thinking_blockquote(trace))
+
         # Make the session id AND this turn's id ambient for the whole
         # turn so the bash tool tags spawned process groups with both, and
         # so spawned subagents inherit the turn id (asyncio.create_task
@@ -702,7 +828,7 @@ class Agent:
         tok_turn = current_turn_id.set(turn_id)
         try:
             try:
-                new_messages, final_text = await self.ollama.run_turn(
+                new_messages, final_text, final_thinking = await self.ollama.run_turn(
                     model=self.agent_cfg.primary_model,
                     history=history,
                     system=system,
@@ -713,6 +839,7 @@ class Agent:
                     verbose_suffix=sid,
                     num_predict=self.num_predict,
                     max_tool_turns=self.max_tool_turns,
+                    on_thinking=_emit_thinking if thinking_mode == "full" else None,
                 )
             except Exception:
                 log.exception("[%s] ollama.run_turn failed", self.id)
@@ -725,8 +852,63 @@ class Agent:
         for m in new_messages:
             self.transcripts.append(sid, m)
 
-        if final_text.strip():
-            await self.channel.send(peer_id, final_text.strip())
+        # Final-only reasoning surface (%thinking on). Sent AFTER the
+        # transcript append (final_thinking is never in new_messages —
+        # ephemeral by construction) and BEFORE the answer, as its own
+        # message so it and the answer occupy independent chunk streams.
+        # Skipped in "full" mode: the run_turn callback already emitted
+        # every iteration's reasoning (incl. this final turn's), so a
+        # post-send here would duplicate the last block. None => no-op.
+        # _has_visible_content (not .strip()) so a body-less trace never
+        # renders as a header-only block.
+        if thinking_mode == "final" and _has_visible_content(final_thinking):
+            thinking_emitted = True
+            await self.channel.send(
+                peer_id, _as_thinking_blockquote(final_thinking.strip())
+            )
+        answer = final_text.strip()
+        replied = bool(answer)
+        if replied:
+            # One-line gap above the answer iff some bot block already
+            # went out this turn ahead of it (see _THINKING_ANSWER_SEP):
+            # a %thinking reasoning block, OR a 🖥️ system block a command
+            # emitted while this turn was in flight. Either way they're
+            # consecutive same-sender events with no speaker-switch gap.
+            # `in`-test (not discard) here — the drainer's finally is the
+            # single owner of removal, so a system block that lands AFTER
+            # the answer doesn't wrongly gap a later turn. The prefix goes
+            # ONLY on the sent body — never on `answer`, which the
+            # turn-complete log measures — so "reply N chars" stays the
+            # true answer length and the separator never reaches the
+            # transcript (final_text alone is what was appended above).
+            pre_block = thinking_emitted or turn_id in self._system_emitted_turns
+            body = _THINKING_ANSWER_SEP + answer if pre_block else answer
+            await self.channel.send(peer_id, body)
+
+        # Close bracket, symmetric with "turn starting". INFO = metadata
+        # only (visible under normal operation); the reply snippet is
+        # appended only at DEBUG (%verbose on) — same noisy-detail-behind
+        # -DEBUG convention as ollama's verbose_suffix. "NO REPLY SENT"
+        # flags the empty-reply failure class explicitly.
+        tool_turns = sum(
+            1 for m in new_messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        reply_part = (
+            f"reply {len(answer)} chars" if replied
+            else "NO REPLY SENT"
+        )
+        tail = ""
+        if replied and log.isEnabledFor(logging.DEBUG):
+            snip = " ".join(final_text.split())
+            if len(snip) > 100:
+                snip = snip[:100] + "…"
+            tail = f': "{snip}"'
+        log.info(
+            "[%s:main:%s] turn complete (%d rows, %d tool turn(s), %s, %.1fs)%s",
+            self.id, peer_label, len(new_messages), tool_turns,
+            reply_part, time.monotonic() - turn_t0, tail,
+        )
 
     async def _idle_recap_for(self, sid: str) -> str | None:
         """Cached per-session idle recap. Computes once on first call,
@@ -870,6 +1052,25 @@ class Agent:
         # ===============================================================
         return bool(sender_id) and sender_id in allowed
 
+    async def _cmd_reply(self, peer_id: str, text: str) -> None:
+        """Send a control-plane reply, visually marked as a system
+        message (🖥️ blockquote). All command-handler output goes through
+        here so it's uniformly distinguishable from agent prose.
+
+        If a turn is in flight for this room's session, tag it so its
+        answer gets the same one-line gap a %thinking block earns — the
+        system block and the answer are otherwise consecutive same-sender
+        events. The command path is matrix-only, so the session id is
+        ``session_id("matrix", peer_id)`` (peer_id is the room id), the
+        same key the drainer uses. Tag before the send so the intent is
+        recorded regardless of send latency; the drainer's finally is the
+        sole remover.
+        """
+        tid = self._inflight_turn.get(session_id("matrix", peer_id))
+        if tid:
+            self._system_emitted_turns.add(tid)
+        await self.channel.send(peer_id, _as_system_blockquote(text))
+
     async def _handle_command(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
@@ -892,25 +1093,53 @@ class Agent:
             "context": self._cmd_context,
             "stop": self._cmd_stop,
             "subagents": self._cmd_subagents,
+            "thinking": self._cmd_thinking,
         }
         handler = handlers.get(cmd.name)
         try:
             if handler is None:
-                await self.channel.send(peer, usage(prefix))
-                return
-            await handler(sid, msg, cmd)
+                await self._cmd_reply(peer, usage(prefix))
+            else:
+                await handler(sid, msg, cmd)
+            # A reply sent while a turn is in flight clears the bot's
+            # typing client-side, but the turn's typing heartbeat only
+            # ever re-asserts True — never a transition — so the server
+            # never re-broadcasts m.typing and the indicator stays gone
+            # for the rest of the turn. Drop server typing here so the
+            # heartbeat's next (≤6 s) re-assert is a real false→true the
+            # client renders. Skip %stop: it tears the turn down and its
+            # own unwind handles typing.
+            if cmd.name != "stop" and self._inflight_turn.get(sid):
+                await self.channel.clear_typing(peer)
         except Exception:
             log.exception(
                 "[%s] command handler raised (cmd=%r room=%s)",
                 self.id, cmd.name, peer,
             )
 
+    async def _reject_extra_args(
+        self, name: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> bool:
+        """For no-argument commands: if any token was passed, report it
+        (specific per-command usage) and return True so the caller bails.
+        Incorrect parameters are surfaced, never silently ignored.
+        """
+        if cmd.args.strip():
+            await self._cmd_reply(
+                msg.peer_id,
+                command_usage(name, self.cfg.commands.prefix, cmd.args),
+            )
+            return True
+        return False
+
     async def _cmd_clear(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
+        if await self._reject_extra_args("clear", msg, cmd):
+            return
         rows_before = len(self.transcripts.load(sid))
         if rows_before == 0:
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id, "Session already empty — nothing to clear."
             )
             return
@@ -918,28 +1147,30 @@ class Agent:
         # then archive. Immediate ack + keepalived typing indicator (same
         # mechanism normal turns use) so it's visibly running; the
         # completion message lands when done.
-        await self.channel.send(
+        await self._cmd_reply(
             msg.peer_id, "Flushing memory, then clearing the session…",
         )
         async with self.channel.typing(msg.peer_id):
             archived = await self.clear_session(sid, run_final_flush=True)
         if archived:
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id,
                 f"Session cleared — {rows_before} rows archived, memory "
                 f"flushed. Starting fresh.",
             )
         else:
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id, "Session already empty — nothing to clear."
             )
 
     async def _cmd_compact(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
+        if await self._reject_extra_args("compact", msg, cmd):
+            return
         rows = self.transcripts.load(sid)
         if not rows:
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id, "Nothing to compact — session is empty."
             )
             return
@@ -948,7 +1179,7 @@ class Agent:
         # (transcript fits within the reserve/keep window), skip flush AND
         # compact and just say so — don't burn a flush turn to then no-op.
         if not will_compact(self.cfg, rows, force=True):
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id,
                 "Nothing to compact — transcript fits within the keep "
                 "window. No flush run.",
@@ -957,7 +1188,7 @@ class Agent:
         # Long op: a sync pre-compact flush turn on the compaction model,
         # then the summarize+swap. Immediate ack + keepalived typing
         # indicator so it's visibly running; completion lands when done.
-        await self.channel.send(
+        await self._cmd_reply(
             msg.peer_id, "Flushing memory, then compacting…",
         )
         async with self.channel.typing(msg.peer_id):
@@ -998,33 +1229,84 @@ class Agent:
             )
         else:
             reply = "Nothing to compact (already below the compaction split)."
-        await self.channel.send(msg.peer_id, reply)
+        await self._cmd_reply(msg.peer_id, reply)
 
     async def _cmd_verbose(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
         arg = cmd.args.strip().lower()
-        if arg in ("on", "true", "1"):
+        prefix = self.cfg.commands.prefix
+        if arg == "":
+            # No bare toggle — bare command is a status *read*: report
+            # current state + how to change it.
+            cur = "ON" if logsetup.verbose_enabled() else "OFF"
+            await self._cmd_reply(
+                msg.peer_id,
+                f"Verbose logging is {cur} (process-wide). "
+                f"Set with {prefix}verbose <on|off>.",
+            )
+            return
+        if arg == "on":
             target = True
-        elif arg in ("off", "false", "0"):
+        elif arg == "off":
             target = False
-        elif arg == "":
-            target = not logsetup.verbose_enabled()
         else:
-            await self.channel.send(
-                msg.peer_id, f"usage: {self.cfg.commands.prefix}verbose <on|off>"
+            # Unknown token: reported, not silently ignored.
+            await self._cmd_reply(
+                msg.peer_id, command_usage("verbose", prefix, cmd.args),
             )
             return
         logsetup.set_verbose(target)
-        await self.channel.send(
+        await self._cmd_reply(
             msg.peer_id,
             f"Verbose logging {'ON' if target else 'OFF'} "
             f"(process-wide — affects all agents).",
         )
 
+    async def _cmd_thinking(
+        self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
+    ) -> None:
+        arg = cmd.args.strip().lower()
+        prefix = self.cfg.commands.prefix
+        # Per-session and explicit-only: exactly one of on|off|full to
+        # *change* state (no bare toggle); bare command is a status read;
+        # any other token is a reported error. on/full are mutually
+        # exclusive for a sid (the map holds at most one mode).
+        labels = {
+            None: "OFF",
+            "final": "ON (final answer's reasoning)",
+            "full": "ON (full — every step's reasoning)",
+        }
+        if arg == "":
+            cur = labels[self._thinking_mode.get(sid)]
+            await self._cmd_reply(
+                msg.peer_id,
+                f"Reasoning trace is {cur} for this conversation. "
+                f"Set with {prefix}thinking <on|off|full>.",
+            )
+            return
+        if arg == "on":
+            self._thinking_mode[sid] = "final"
+        elif arg == "full":
+            self._thinking_mode[sid] = "full"
+        elif arg == "off":
+            self._thinking_mode.pop(sid, None)
+        else:
+            await self._cmd_reply(
+                msg.peer_id, command_usage("thinking", prefix, cmd.args),
+            )
+            return
+        await self._cmd_reply(
+            msg.peer_id,
+            f"Reasoning trace {labels[self._thinking_mode.get(sid)]} "
+            f"for this conversation (ephemeral — not transcribed or logged).",
+        )
+
     async def _cmd_context(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
+        if await self._reject_extra_args("context", msg, cmd):
+            return
         rows = self.transcripts.load(sid)
         # The pending idle-recap summary (if a recap was installed at boot or
         # last turn). Read the cache directly — do NOT call _idle_recap_for,
@@ -1046,7 +1328,7 @@ class Agent:
             f", incl. ~{estimate_tokens([{'content': recap}]):,} pending recap"
             if recap else ""
         )
-        await self.channel.send(
+        await self._cmd_reply(
             msg.peer_id,
             f"Context: next turn starts at ~{start_toks:,} tokens — system "
             f"~{sys_toks:,}{recap_note} + {len(rows)} transcript rows "
@@ -1087,11 +1369,20 @@ class Agent:
         Background flush/compaction and an in-progress %clear/%compact run
         off the drainer and are never affected.
         """
-        tokens = cmd.args.split()
-        soft = any(t in ("--soft", "-s", "--keep-bash") for t in tokens)
-        target = next((t for t in tokens if not t.startswith("-")), None)
         peer = msg.peer_id
         prefix = self.cfg.commands.prefix
+        # Strict: at most one positional (task_id) and only the soft-flag
+        # spellings. An unknown flag or a second positional is reported,
+        # not silently dropped (old next()/any() quietly ignored both).
+        tokens = cmd.args.split()
+        soft_flags = {"--soft", "-s", "--keep-bash"}
+        flags = [t for t in tokens if t.startswith("-")]
+        positionals = [t for t in tokens if not t.startswith("-")]
+        if any(f not in soft_flags for f in flags) or len(positionals) > 1:
+            await self._cmd_reply(peer, command_usage("stop", prefix, cmd.args))
+            return
+        soft = bool(flags)
+        target = positionals[0] if positionals else None
 
         # ---- targeted: %stop <task_id> ---------------------------------
         if target is not None:
@@ -1102,7 +1393,7 @@ class Agent:
                 or ct.status != "running"
                 or session_id(ct.origin_channel, ct.origin_peer_id) != sid
             ):
-                await self.channel.send(
+                await self._cmd_reply(
                     peer,
                     f"No running subagent {target!r} in this conversation "
                     f"— {prefix}subagents to list them.",
@@ -1119,7 +1410,7 @@ class Agent:
                 " Its bash was left running (--soft)." if soft
                 else f" {killed} bash group(s) killed."
             )
-            await self.channel.send(
+            await self._cmd_reply(
                 peer,
                 f"Cancelled {who}.{bash} Parent turn untouched.",
             )
@@ -1129,7 +1420,7 @@ class Agent:
         turn_id = self._inflight_turn.get(sid)
         task = self._drainer_tasks.get(sid)
         if not turn_id or task is None or task.done():
-            await self.channel.send(
+            await self._cmd_reply(
                 peer,
                 "Nothing running — no in-flight turn to stop. (Background "
                 "flush/compaction is not affected. For subagents still "
@@ -1138,7 +1429,7 @@ class Agent:
             )
             return
 
-        await self.channel.send(peer, "Stopping the current turn…")
+        await self._cmd_reply(peer, "Stopping the current turn…")
         # Cancel the turn's whole cascade FIRST, with suppression, so even
         # a subagent that finishes in the cancel window can't deliver a
         # completion back into the session we're stopping.
@@ -1195,7 +1486,7 @@ class Agent:
             " Bash left running (--soft)." if soft
             else f" {killed} bash group(s) killed."
         )
-        await self.channel.send(
+        await self._cmd_reply(
             peer,
             "Stopped — turn cancelled, queued messages dropped."
             + subs + bash,
@@ -1207,13 +1498,15 @@ class Agent:
         """Read-only discovery: list this conversation's running subagents
         (session-scoped — every turn's children — since you need to see
         them all to pick one to %stop <task_id>). Listing, not acting."""
+        if await self._reject_extra_args("subagents", msg, cmd):
+            return
         if self.spawner is None:
-            await self.channel.send(
+            await self._cmd_reply(
                 msg.peer_id, "Subagents are not enabled for this agent."
             )
             return
         cts = self.spawner.running_for_session(sid)
-        await self.channel.send(msg.peer_id, self.spawner.format_running(cts))
+        await self._cmd_reply(msg.peer_id, self.spawner.format_running(cts))
 
     # --- session rotate (full-context clear) ---------------------------
 

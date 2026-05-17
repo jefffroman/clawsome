@@ -58,6 +58,19 @@ Documentation = "https://github.com/jefffroman/clawsome/blob/main/README.md"
 [project.scripts]
 claw = "claw.main:cli"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "error",
+    # Third-party import churn (chromadb / matrix-nio / apscheduler) emits
+    # deprecation noise we don't control — keep non-fatal so their upgrades
+    # don't break our suite.
+    "default::DeprecationWarning",
+    "default::PendingDeprecationWarning",
+    "ignore::ResourceWarning",
+]
+
 [tool.setuptools.packages.find]
 include = ["claw*"]
 

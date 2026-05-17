@@ -16,8 +16,24 @@ from dataclasses import dataclass
 
 # Known command words. Dispatch for each lives in Agent._handle_command.
 KNOWN: tuple[str, ...] = (
-    "compact", "clear", "verbose", "context", "stop", "subagents",
+    "compact", "clear", "verbose", "context", "stop", "subagents", "thinking",
 )
+
+# Per-command argument grammar, keyed by command word. The value is the
+# spec rendered after ``{prefix}{name}`` in error/usage replies. Commands
+# that take no arguments map to ``""``; handlers reject any extra token
+# with the matching ``command_usage`` line so a fat-fingered parameter is
+# reported, never silently ignored. Single source of truth for both the
+# per-command error path and the global one-liner below.
+COMMAND_USAGE: dict[str, str] = {
+    "compact": "",
+    "clear": "",
+    "context": "",
+    "subagents": "",
+    "stop": "[<task_id>] [--soft]",
+    "verbose": "<on|off>",
+    "thinking": "<on|off|full>",
+}
 
 
 @dataclass(frozen=True)
@@ -64,5 +80,24 @@ def usage(prefix: str) -> str:
     return (
         f"commands: {prefix}compact, {prefix}clear, {prefix}context, "
         f"{prefix}stop [<task_id>] [--soft], {prefix}subagents, "
-        f"{prefix}verbose <on|off>"
+        f"{prefix}verbose <on|off>, {prefix}thinking <on|off|full>"
     )
+
+
+def command_usage(name: str, prefix: str, got: str = "") -> str:
+    """Specific usage line for one command, used when it's called with a
+    bad/unexpected parameter.
+
+    ``got`` (the offending arg text, if any) is quoted into the reply so the
+    sender sees exactly what was rejected rather than a generic hint. Falls
+    back to the global one-liner for an unknown command word.
+    """
+    spec = COMMAND_USAGE.get(name)
+    if spec is None:
+        return usage(prefix)
+    line = (
+        f"usage: {prefix}{name} {spec}" if spec
+        else f"{prefix}{name} takes no arguments"
+    )
+    got = got.strip()
+    return f"unexpected argument {got!r} — {line}" if got else line

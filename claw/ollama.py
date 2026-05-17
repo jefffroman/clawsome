@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -283,14 +284,21 @@ class OllamaClient:
         verbose_suffix: str = "",
         num_predict: int | None = None,
         max_tool_turns: int | None = None,
-    ) -> tuple[list[dict[str, Any]], str]:
+        on_thinking: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[list[dict[str, Any]], str, str]:
         """Drive ``/api/chat`` until the model stops requesting tools.
 
-        Returns ``(new_messages, final_text)``. ``new_messages`` is the list
-        of OpenAI-flat messages to append to the transcript (assistant turns
-        with tool_calls, role=tool result turns, and the final assistant
-        text). ``final_text`` is the text of the last assistant turn for
-        sending to the user.
+        Returns ``(new_messages, final_text, final_thinking)``.
+        ``new_messages`` is the list of OpenAI-flat messages to append to the
+        transcript (assistant turns with tool_calls, role=tool result turns,
+        and the final assistant text). ``final_text`` is the text of the last
+        assistant turn for sending to the user. ``final_thinking`` is that
+        same final no-tool-call turn's ``message.thinking`` (Ollama's
+        chain-of-trace), or ``""`` when the model emitted none or a
+        synthetic-string branch fired (truncation discard / tool-loop
+        ceiling). It is ephemeral — captured for optional out-of-band display
+        only; it is **never** placed in ``new_messages`` and never persisted
+        to the transcript.
 
         ``sid`` and ``workspace_dir`` are used to spool oversized tool
         results into ``<workspace>/.tool-results/<sid>/<call_id>.txt``: the
@@ -314,8 +322,8 @@ class OllamaClient:
         ``label`` is a caller-supplied prefix prepended to every
         ``claw.ollama`` log line emitted from this call. Always shown.
         Format convention: ``<agent_id>:<kind>[:<peer_or_task>]`` —
-        e.g. ``"quint:main:alice"``, ``"quint:flush:periodic-growth:alice"``,
-        ``"quint:subagent:chop-chop-a1b2c3d4"``.
+        e.g. ``"agent-1:main:user-1"``, ``"agent-1:flush:periodic-growth:user-1"``,
+        ``"agent-1:subagent:persona-3-a1b2c3d4"``.
 
         ``verbose_suffix`` is an optional addendum (joined with ``:``)
         appended only when ``claw.ollama`` is at DEBUG. Use it for
@@ -327,12 +335,31 @@ class OllamaClient:
         ``OllamaConfig.max_tool_turns`` at construction) for this call.
         Callers pass the agent's or persona's resolved value; ``None``
         falls back to the client-wide default.
+
+        ``on_thinking`` is an optional **send-only** sink, awaited once per
+        ``/api/chat`` call with that call's ``message.thinking`` (skipped
+        when blank) — i.e. EVERY loop iteration's reasoning, not just the
+        final turn's. It's the every-step (``%thinking full``) surface;
+        ``final_thinking`` (the return value) is the final-only surface.
+        Granularity ceiling is per call, not per token (we're
+        ``stream: false``). The callback only ever *emits*: it is never
+        appended to ``new_messages`` or the transcript, so ephemerality
+        holds by construction even though it fires mid-loop (before the
+        caller's transcript append) rather than after the cascade. A
+        truncated turn that then recovers fires twice (pre- + post-recovery
+        reasoning) — intended for the debug-honest ``full`` surface; the
+        final-only return value still carries just the recovered turn's.
         """
         messages: list[dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.extend(history)
         new_messages: list[dict[str, Any]] = []
+        # Final no-tool-call turn's chain-of-trace. Ephemeral: captured for
+        # optional display by the caller, never appended to new_messages /
+        # the transcript. Reassigned at each assistant-message parse so the
+        # value reflects the LAST parsed turn (incl. a recovery re-parse).
+        final_thinking: str = ""
 
         tool_specs = ollama_tool_spec(tools) if tools else None
         options: dict[str, Any] | None = None
@@ -368,6 +395,12 @@ class OllamaClient:
                     raise
             assistant_msg = response.get("message", {}) or {}
             content = assistant_msg.get("content", "") or ""
+            final_thinking = assistant_msg.get("thinking", "") or ""
+            # Per-iteration reasoning surface (%thinking full). Send-only;
+            # the recovery re-parse below fires it again for a recovered
+            # turn (pre- + post-recovery, by design for the debug surface).
+            if on_thinking and final_thinking.strip():
+                await on_thinking(final_thinking.strip())
             tool_calls = assistant_msg.get("tool_calls") or []
             done_reason = response.get("done_reason")
 
@@ -399,7 +432,7 @@ class OllamaClient:
                     return new_messages, (
                         "[claw: output truncated mid-code-fence; partial discarded; "
                         "retry with smaller scope]"
-                    )
+                    ), ""
                 recovery_used = True
                 if done_reason == "length":
                     log.info(
@@ -440,6 +473,12 @@ class OllamaClient:
                 )
                 assistant_msg = response.get("message", {}) or {}
                 content = assistant_msg.get("content", "") or ""
+                # Recovery replaced content — reassign thinking from the SAME
+                # message so a recovered reply carries its own trace, not the
+                # pre-recovery turn's.
+                final_thinking = assistant_msg.get("thinking", "") or ""
+                if on_thinking and final_thinking.strip():
+                    await on_thinking(final_thinking.strip())
                 tool_calls = assistant_msg.get("tool_calls") or []
 
             assistant_record: dict[str, Any] = {"role": "assistant", "content": content}
@@ -466,7 +505,7 @@ class OllamaClient:
                 new_messages.append(assistant_record)
 
             if not tool_calls:
-                return new_messages, content
+                return new_messages, content, final_thinking
 
             tc_counts = Counter(
                 ((tc.get("function") or {}).get("name") or "?")
@@ -520,7 +559,7 @@ class OllamaClient:
             "%shit max_tool_turns=%d without final assistant text",
             prefix, effective_max_tool_turns,
         )
-        return new_messages, "[hit tool-use limit; please try again]"
+        return new_messages, "[hit tool-use limit; please try again]", ""
 
     async def summarize(
         self,

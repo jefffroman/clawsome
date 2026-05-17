@@ -208,7 +208,8 @@ is the read-only `%subagents`.
 | `%stop --soft` | Same, but leave in-flight shell commands running — when a non-idempotent command (DB dump/restore, migration, package install, large write) is mid-flight and a SIGKILL would corrupt it. You're stopping the agent, not that command. |
 | `%stop <task_id>` | Kill one specific subagent + its descendants without touching the parent turn or siblings. Get the id from `%subagents`. `--soft` spares its bash. |
 | `%subagents` | List this conversation's running subagents (task_id, persona, elapsed) — discovery for targeted `%stop`. |
-| `%verbose on` / `off` | Flip DEBUG logging at runtime, no restart. Process-wide. |
+| `%verbose on` / `off` | Set DEBUG logging at runtime, no restart. Process-wide. Bare `%verbose` reports state. |
+| `%thinking on` / `off` / `full` | Surface the model's reasoning trace before replies. `on` = final answer turn's; `full` = every tool-loop iteration's. Per-**conversation** (unlike `%verbose`'s process-wide scope), runtime, ephemeral. Bare `%thinking` reports state. Default off. |
 
 `%stop` acts immediately and concurrently — it is not queued behind the
 turn. Cancellation lands at the running turn's next `await` (sub-second
@@ -232,9 +233,22 @@ name; `claw.tools.bash` `killpg(...)` entries; subagent `cancelled` /
 ### Increase log verbosity
 
 `%verbose on` flips `claw.*` loggers to DEBUG at runtime — process-wide,
-no restart; `%verbose off` reverts (see Admin commands). For boot-time
-verbosity instead, set `verbose: true` in `claw.yaml` and restart.
-DEBUG is noisy — flip back off when done investigating.
+no restart; `%verbose off` reverts; bare `%verbose` reports the current
+state (see Admin commands). For boot-time verbosity instead, set
+`verbose: true` in `claw.yaml` and restart. DEBUG is noisy — flip back
+off when done investigating.
+
+To inspect a model's chain-of-thought instead of log internals, use
+`%thinking on` — it surfaces the final answer turn's reasoning to
+Matrix for *this conversation* (not process-wide, no config key),
+leaving logs and transcripts untouched. `%thinking full` surfaces every
+tool-loop iteration's reasoning instead (verbose; for debugging a
+multi-step turn). Flip back `off` when done.
+
+Both `%verbose` and `%thinking` are in-memory runtime state, not
+persisted: a gateway restart resets `%verbose` to the `claw.yaml`
+`verbose` boot value and `%thinking` to off for every conversation.
+Re-issue after a restart if you need it back.
 
 ### Common log signatures
 
@@ -245,7 +259,7 @@ DEBUG is noisy — flip back off when done investigating.
 | `claw.memory_flush INFO [<sid>] memory flush starting (reason=<r>, N rows)` | Flush turn beginning. |
 | `claw.memory_flush INFO [<sid>] memory flush done (reason=<r>)` | Flush turn complete; durable bullets written. |
 | `claw.memory_flush ERROR [<sid>] memory flush turn failed (reason=<r>)` | Flush threw an exception (Traceback follows). Compaction will proceed regardless. |
-| `claw.ollama INFO [<label>] turn N: K tool_call(s) requested` | Tool round-trip. `<label>` shape: `<agent_id>:<kind>[:<peer_or_task>]` — e.g. `quint:main:alice` (user-facing turn from `@alice:example.org`), `quint:flush:periodic-growth:alice` (background memory flush of that user's session), `quint:subagent:chop-chop-a1b2c3d4` (subagent one-shot, parent's id + kind + the spawned task_id). At DEBUG verbosity an additional `:<sid>` correlation handle is appended for the matrix call sites (subagent labels stay as-is — the task_id is already a stable correlation handle). If N approaches `max_tool_turns`, the model is in a tool loop. |
+| `claw.ollama INFO [<label>] turn N: K tool_call(s) requested` | Tool round-trip. `<label>` shape: `<agent_id>:<kind>[:<peer_or_task>]` — e.g. `agent-1:main:user-1` (user-facing turn from `@user-1:example.org`), `agent-1:flush:periodic-growth:user-1` (background memory flush of that user's session), `agent-1:subagent:persona-3-a1b2c3d4` (subagent one-shot, parent's id + kind + the spawned task_id). At DEBUG verbosity an additional `:<sid>` correlation handle is appended for the matrix call sites (subagent labels stay as-is — the task_id is already a stable correlation handle). If N approaches `max_tool_turns`, the model is in a tool loop. |
 | `WARNING [<agent>] background flush timed out after Xs` | Flush exceeded `turn_timeout_s`. |
 | `claw.main INFO firing job <name>` | Cron-driven inbound being dispatched. |
 
