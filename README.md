@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/jefffroman/clawsome/2026.5.17/clawsome-logo.png" alt="Clawsome" width="80" align="left">
+<img src="https://raw.githubusercontent.com/jefffroman/clawsome/2026.5.20/clawsome-logo.png" alt="Clawsome" width="80" align="left">
 
 # Clawsome
 A lean python harness for running persistent AI agents.
