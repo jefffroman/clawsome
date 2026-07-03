@@ -71,6 +71,7 @@ from claw.transcript import (
     estimate_tokens,
     is_archived_transcript,
     session_id,
+    sid_for_key,
 )
 from claw.tools.memory_search import build_memory_search_tool
 from claw.triggers.initial_prompt import maybe_dispatch_initial_prompt
@@ -198,6 +199,10 @@ class Agent:
         self.tools = dict(tools)
         self.transcripts = transcripts
         self.channel = channel
+        # Additional outbound channels keyed by inbound channel name (e.g.
+        # "voice"). A turn's reply is delivered back to the channel the inbound
+        # arrived on; self.channel (the agent's primary, matrix) is the default.
+        self._channels: dict[str, Channel] = {}
         self.skill_catalog = skill_catalog
         self.spawner = spawner
         self.depth = depth
@@ -465,18 +470,44 @@ class Agent:
         self,
         retrieval_block: str,
         recap_block: str | None = None,
+        modality: str | None = None,
     ) -> str:
         parts: list[str] = []
         ws = self._workspace_system_block()
         if ws:
             parts.append(ws)
+        # Language steering for ALL modalities/channels: a bilingual model can
+        # code-switch (e.g. qwen replying in Chinese), which is merely odd on text
+        # but breaks voice — the TTS can't read non-Latin output. Gated on a
+        # configured language so it's opt-in.
+        if self.cfg.language:
+            parts.append(f"Always reply in {self.cfg.language}.")
         if self.skill_catalog:
             parts.append(self.skill_catalog)
+        # Voice-modality steering: when the turn's modality is "voice", prepend
+        # a note so the agent keeps its reply brief and speakable and accounts
+        # for STT homophones. Gated on modality (not channel) so a voice turn
+        # keeps the hint even when it lives in a shared "home" session next to
+        # non-voice (event/state) sources; gated on a non-empty hint so an
+        # operator can disable it via config.
+        voice_hint = self._voice_modality_hint(modality)
+        if voice_hint:
+            parts.append(voice_hint)
         if recap_block:
             parts.append(recap_block)
         if retrieval_block:
             parts.append(f"<retrieved_memory>\n{retrieval_block}\n</retrieved_memory>")
         return "\n\n".join(parts)
+
+    def _voice_modality_hint(self, modality: str | None) -> str:
+        """The configured voice-modality system note, or "" when the turn
+        isn't a voice turn / voice isn't configured / the hint is empty."""
+        if modality != "voice":
+            return ""
+        voice_cfg = self.cfg.voice
+        if voice_cfg is None or not voice_cfg.modality_hint:
+            return ""
+        return voice_cfg.modality_hint
 
     # --- subagent fork --------------------------------------------------
 
@@ -611,6 +642,18 @@ class Agent:
 
     # --- inbound handling -----------------------------------------------
 
+    def register_channel(self, name: str, channel: Channel) -> None:
+        """Register an additional outbound channel. A turn whose inbound
+        ``channel`` equals ``name`` delivers its reply here instead of the
+        agent's primary channel. Used to wire the voice channel so a voice
+        turn's reply (and TTS) goes back to the box, not to matrix."""
+        self._channels[name] = channel
+
+    def _channel_for(self, channel_name: str) -> Channel:
+        """Outbound channel for an inbound from ``channel_name``; falls back to
+        the agent's primary channel (matrix) for matrix + synthetic channels."""
+        return self._channels.get(channel_name, self.channel)
+
     async def handle_inbound(self, msg: InboundMessage) -> None:
         """Enqueue the message and signal the per-session drainer. Returns
         in microseconds so matrix-nio's sync_forever can immediately fire
@@ -623,7 +666,7 @@ class Agent:
         command text is never transcribed and never reaches the LLM (see the
         gate below).
         """
-        sid = session_id(msg.channel, msg.peer_id)
+        sid = sid_for_key(msg.session_key)
 
         # Control plane: in-band admin commands. A message is a command only
         # when commands are enabled, it came from matrix (synthetic channels —
@@ -653,25 +696,30 @@ class Agent:
         # Lazy-create the drainer for this session on first inbound.
         if sid not in self._drainer_tasks or self._drainer_tasks[sid].done():
             self._drainer_tasks[sid] = asyncio.create_task(
-                self._drain(sid, msg.peer_id),
+                self._drain(sid, msg.peer_id, msg.channel),
                 name=f"drain-{self.id}-{sid}",
             )
         # Wake the drainer.
         self._has_pending.setdefault(sid, asyncio.Event()).set()
 
-    async def _drain(self, sid: str, peer_id: str) -> None:
+    async def _drain(self, sid: str, peer_id: str, channel_name: str) -> None:
         """Long-lived per-session drainer. Waits on the wake event,
         acquires the session lock, drains the pending queue (coalescing
         whatever's in it into a single combined turn), then sleeps again.
 
         Runs forever until the asyncio loop shuts down.
+
+        ``channel_name`` is the inbound's channel (fixed per session, since the
+        session key encodes it); it selects the outbound channel so a voice
+        turn's typing + reply go back to the box, not to matrix.
         """
+        channel = self._channel_for(channel_name)
         has_pending = self._has_pending.setdefault(sid, asyncio.Event())
         while True:
             try:
                 await has_pending.wait()
                 async with self._session_lock(sid):
-                    async with self.channel.typing(peer_id):
+                    async with channel.typing(peer_id):
                         while True:
                             batch = self._pending_inbound.pop(sid, [])
                             if not batch:
@@ -688,7 +736,7 @@ class Agent:
                             turn_id = f"{sid}#{secrets.token_hex(4)}"
                             self._inflight_turn[sid] = turn_id
                             try:
-                                await self._process_batch(sid, batch, turn_id)
+                                await self._process_batch(sid, batch, turn_id, channel)
                             finally:
                                 self._inflight_turn.pop(sid, None)
                                 self._system_emitted_turns.discard(turn_id)
@@ -699,6 +747,7 @@ class Agent:
 
     async def _process_batch(
         self, sid: str, msgs: list[InboundMessage], turn_id: str = "",
+        channel: Channel | None = None,
     ) -> None:
         """Process a batch of one or more inbound messages as a single turn.
 
@@ -707,6 +756,11 @@ class Agent:
         ``ollama.run_turn``. The agent sees a single longer user message
         rather than multiple back-to-back turns.
         """
+        # Outbound channel for this turn's reply (threaded from the drainer;
+        # resolve from the batch as a fallback for any direct call).
+        if channel is None:
+            channel = self._channel_for(msgs[0].channel)
+
         # Idle recap — runs at most once per session per process, on the
         # first turn we see. boot_recap_known_sessions() may have already
         # run it; if not, we run it on demand.
@@ -785,7 +839,9 @@ class Agent:
         self._spawn_bg_compaction_if_needed(sid, list(rows))
 
         history = [as_message(r) for r in rows]
-        system = self._build_system_prompt(retrieval_block, recap_block)
+        system = self._build_system_prompt(
+            retrieval_block, recap_block, modality=msgs[0].modality
+        )
 
         # Per-conversation reasoning-trace mode (set by %thinking).
         # "full" => stream every loop iteration's reasoning live via the
@@ -815,7 +871,7 @@ class Agent:
             if not _has_visible_content(trace):
                 return
             thinking_emitted = True
-            await self.channel.send(peer_id, _as_thinking_blockquote(trace))
+            await channel.send(peer_id, _as_thinking_blockquote(trace))
 
         # Make the session id AND this turn's id ambient for the whole
         # turn so the bash tool tags spawned process groups with both, and
@@ -843,7 +899,7 @@ class Agent:
                 )
             except Exception:
                 log.exception("[%s] ollama.run_turn failed", self.id)
-                await self.channel.send(peer_id, "Sorry — I hit an error. Could you try again?")
+                await channel.send(peer_id, "Sorry — I hit an error. Could you try again?")
                 return
         finally:
             current_turn_id.reset(tok_turn)
@@ -863,7 +919,7 @@ class Agent:
         # renders as a header-only block.
         if thinking_mode == "final" and _has_visible_content(final_thinking):
             thinking_emitted = True
-            await self.channel.send(
+            await channel.send(
                 peer_id, _as_thinking_blockquote(final_thinking.strip())
             )
         answer = final_text.strip()
@@ -883,7 +939,7 @@ class Agent:
             # transcript (final_text alone is what was appended above).
             pre_block = thinking_emitted or turn_id in self._system_emitted_turns
             body = _THINKING_ANSWER_SEP + answer if pre_block else answer
-            await self.channel.send(peer_id, body)
+            await channel.send(peer_id, body)
 
         # Close bracket, symmetric with "turn starting". INFO = metadata
         # only (visible under normal operation); the reply snippet is
@@ -1383,6 +1439,10 @@ class Agent:
             return
         soft = bool(flags)
         target = positionals[0] if positionals else None
+        # Label for the log lines below, symmetric with the
+        # "[id:main:peer] turn starting/complete" anchors — a %stop used to
+        # produce no claw.log output at all (only the user-facing reply).
+        label = self._peer_label_by_sid.get(sid) or _derive_peer_label(msg)
 
         # ---- targeted: %stop <task_id> ---------------------------------
         if target is not None:
@@ -1391,7 +1451,7 @@ class Agent:
             if (
                 ct is None
                 or ct.status != "running"
-                or session_id(ct.origin_channel, ct.origin_peer_id) != sid
+                or ct.origin_session_key != sid
             ):
                 await self._cmd_reply(
                     peer,
@@ -1402,6 +1462,12 @@ class Agent:
             cancelled = sp.cancel_subtree(target)
             killed = 0 if soft else kill_subagent_bash(set(cancelled))
             extra = len(cancelled) - 1
+            log.info(
+                "[%s:main:%s] %sstop cancelled subagent %s (%d in subtree, %s)",
+                self.id, label, prefix, target, len(cancelled),
+                "bash kept (--soft)" if soft
+                else f"{killed} bash group(s) killed",
+            )
             who = (
                 f"subagent {target}"
                 + (f" + {extra} descendant(s)" if extra > 0 else "")
@@ -1420,6 +1486,10 @@ class Agent:
         turn_id = self._inflight_turn.get(sid)
         task = self._drainer_tasks.get(sid)
         if not turn_id or task is None or task.done():
+            log.info(
+                "[%s:main:%s] %sstop: no in-flight turn to cancel",
+                self.id, label, prefix,
+            )
             await self._cmd_reply(
                 peer,
                 "Nothing running — no in-flight turn to stop. (Background "
@@ -1452,6 +1522,14 @@ class Agent:
         # tagged with turn_id). Registry still has the pgids; dereg runs
         # in the worker thread, not the cancelled await. --soft skips it.
         killed = 0 if soft else kill_turn_bash(turn_id)
+        # Anchor the cancellation in claw.log, symmetric with "turn complete"
+        # — the operator-visible reply alone left no server-side trace.
+        log.info(
+            "[%s:main:%s] turn cancelled via %sstop (turn=%s, %d subagent(s), %s)",
+            self.id, label, prefix, turn_id, len(cancelled),
+            "bash kept (--soft)" if soft
+            else f"{killed} bash group(s) killed",
+        )
 
         # Record the cancellation IN THE TRANSCRIPT so the next turn knows
         # the prior instruction was deliberately killed by the operator —

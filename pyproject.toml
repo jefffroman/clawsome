@@ -40,6 +40,11 @@ dependencies = [
     "networkx>=3.2",
     "markdown-it-py>=3",
     "linkify-it-py>=2",
+    # HTTP server for claw's turn endpoint (claw.voice_http): a voice-gateway
+    # or a smart APK POSTs transcripts and gets the agent's reply back. Core
+    # because the endpoint is general (any text-bringing client), not voice-
+    # gateway-specific — enable it via the `http_api:` config block.
+    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +52,14 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
+# NOTE: there is no `voice` extra. The audio pipeline (box WebSocket, wake,
+# STT, TTS, resampling) is NOT part of clawsome — it lives in the separate
+# `voice-gateway` sibling, which is only usable by our custom edge firmware and
+# carries its own deps (wyoming, websockets, numpy, scipy, openwakeword,
+# onnxruntime). clawsome ships only the *claw-side* of voice: the HTTP turn
+# endpoint (aiohttp, core above) + the modality hint config. The in-house ONNX
+# wake *server* is likewise a standalone `wake-server` component with its own
+# deps; it imports nothing from clawsome.
 
 [project.urls]
 Homepage = "https://github.com/jefffroman/clawsome"

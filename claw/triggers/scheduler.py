@@ -47,9 +47,15 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from apscheduler.events import EVENT_JOB_EXECUTED, JobExecutionEvent
+from apscheduler.events import (
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    JobExecutionEvent,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -64,6 +70,44 @@ log = logging.getLogger("claw.triggers.scheduler")
 # kind=at job times are interpreted in tz (per-job or gateway default), so the
 # string must not embed its own zone — that's the whole point of the contract.
 _NAIVE_ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?")
+# Same shape but seconds-less, for normalization.
+_NAIVE_ISO_NO_SECONDS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+
+def _normalize_run_date(run_date: str) -> str:
+    """Ensure a naive ISO run_date carries seconds. ``_NAIVE_ISO_RE`` accepts
+    ``YYYY-MM-DDTHH:MM`` (seconds optional), but APScheduler's ``DateTrigger``
+    rejects it with ``Invalid date string`` — so a seconds-less time that
+    passed validation fails at registration. Normalize ``HH:MM -> HH:MM:00``."""
+    if _NAIVE_ISO_NO_SECONDS_RE.fullmatch(run_date):
+        return run_date + ":00"
+    return run_date
+
+
+def _build_missed_review(jobs: list[dict[str, Any]], deliver_to: str) -> str:
+    """Self-contained synthetic-turn message. It reaches the agent in the user
+    slot, so it opens with an explicit system-origin marker: this is an
+    automated internal turn, NOT a message from a person, and the recipient has
+    seen none of it. The agent's reply is what the recipient receives, so its
+    job is simply to tell that person, in its own first-person voice, what was
+    missed. Deliberately avoids "send"/"resend"/"deliver" language (which reads
+    as a dispatch task and nudges the agent toward re-scheduling)."""
+    lines = [
+        "⚙️ System-generated — automated cron review, NOT a message from a "
+        f"person. {deliver_to} has not seen any of the below and has no context "
+        "for it.\n\n"
+        "While the gateway was offline, the one-shot reminders listed below "
+        "came due and never went out. Write ONE short, friendly message "
+        "explaining what was missed — name every item and the time it was set "
+        "for, in your own voice. Speak directly (your reply IS what the user "
+        "receives). For anything still useful now, state it as a live reminder; "
+        "for anything whose moment has passed, let them know what slipped by.\n",
+    ]
+    for j in jobs:
+        when = j.get("run_date", "?")
+        text = (j.get("message") or "").strip()
+        lines.append(f"- (was set for {when}) {text}")
+    return "\n".join(lines)
 
 
 # APScheduler 3.x's ``CronTrigger.from_crontab`` passes the day-of-week
@@ -120,7 +164,11 @@ class JobRunner:
         self.agents = agents
         self.scheduler = AsyncIOScheduler()
         self.scheduler.add_listener(self._on_job_executed, EVENT_JOB_EXECUTED)
+        self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
         self._jobs_file = cfg.cron.jobs_file
+        # `at` jobs found already-missed-beyond-grace at load: pruned from disk
+        # and surfaced to their owning agent by review_missed_jobs() at boot.
+        self._missed_at_load: list[dict[str, Any]] = []
 
     def start(self) -> None:
         if not self.cfg.cron.enabled:
@@ -147,15 +195,60 @@ class JobRunner:
             log.exception("failed to read jobs file %s; starting with no jobs", self._jobs_file)
             return
         registered = 0
+        kept: list[dict[str, Any]] = []
+        grace = self.cfg.cron.misfire_grace_time
         for job in jobs:
             if not job.get("enabled", True):
+                kept.append(job)
+                continue
+            # One-shot `at` jobs whose time passed by more than `grace` while
+            # the daemon was down won't auto-fire — collect them for review and
+            # drop them from disk so they don't re-register/re-miss every boot.
+            if self._is_stale_at_job(job, grace):
+                self._missed_at_load.append(job)
+                log.info(
+                    "scheduler: collecting stale missed at-job %s (run_date=%s) "
+                    "for review; removing from disk",
+                    job.get("id") or job.get("name"), job.get("run_date"),
+                )
                 continue
             try:
                 self._register_job(job)
                 registered += 1
             except Exception:
                 log.exception("scheduler: failed to register job %s", job.get("name"))
-        log.info("scheduler: %d job(s) registered from %s", registered, self._jobs_file)
+            kept.append(job)
+        # Persist only if we pruned (also persists any id backfills on kept jobs).
+        if len(kept) != len(jobs):
+            try:
+                self._write_jobs(kept)
+            except OSError:
+                log.exception("scheduler: failed to rewrite jobs.json after pruning stale at-jobs")
+        log.info(
+            "scheduler: %d job(s) registered from %s (%d stale missed collected)",
+            registered, self._jobs_file, len(self._missed_at_load),
+        )
+
+    def _is_stale_at_job(self, job: dict[str, Any], grace: int) -> bool:
+        """True iff this is a one-shot ``at`` job whose ``run_date`` is already
+        in the past by more than ``grace`` seconds (missed while down, beyond
+        the auto-fire window). Unparseable/missing dates return False — those
+        fall through to ``_register_job`` which surfaces the real error."""
+        if job.get("kind", "cron") != "at":
+            return False
+        rd = job.get("run_date")
+        if not rd:
+            return False
+        tz_name = job.get("tz") or self.cfg.tz
+        try:
+            run_dt = datetime.fromisoformat(_normalize_run_date(rd))
+            tz = ZoneInfo(tz_name) if tz_name else None
+            if run_dt.tzinfo is None and tz is not None:
+                run_dt = run_dt.replace(tzinfo=tz)
+            now = datetime.now(tz) if tz else datetime.now()
+            return run_dt < now - timedelta(seconds=grace)
+        except Exception:
+            return False
 
     def _register_job(self, job: dict[str, Any]) -> None:
         # Backfill id for legacy entries (pre-uuid era when 'name' served as
@@ -190,12 +283,14 @@ class JobRunner:
             run_date = job.get("run_date")
             if not run_date:
                 raise ValueError(f"job {job_id}: 'run_date' is required for kind=at")
+            # Seconds-less times pass _NAIVE_ISO_RE but DateTrigger rejects them.
+            run_date = _normalize_run_date(run_date)
             trigger = DateTrigger(run_date=run_date, timezone=tz)
         else:
             raise ValueError(f"job {job_id}: unknown kind {kind!r}")
 
         message = job.get("message", "")
-        self.scheduler.add_job(
+        add_kwargs: dict[str, Any] = dict(
             func=self._dispatch,
             trigger=trigger,
             id=job_id,
@@ -203,6 +298,13 @@ class JobRunner:
             replace_existing=False,
             max_instances=self.cfg.cron.max_instances_per_job,
         )
+        # Give one-shot `at` jobs a grace window so a reminder missed by a short
+        # restart-straddle still fires late (-> EXECUTED -> deleteAfterRun
+        # cleanup). Recurring `cron` jobs keep APScheduler's default (passing
+        # None would mean *unlimited* grace, not the default).
+        if kind == "at":
+            add_kwargs["misfire_grace_time"] = self.cfg.cron.misfire_grace_time
+        self.scheduler.add_job(**add_kwargs)
         log.info(
             "scheduler: registered %s [%s] tz=%s -> agent=%s deliver_to=%s",
             job_id, kind, tz, agent_id, deliver_to,
@@ -227,9 +329,10 @@ class JobRunner:
         except Exception:
             log.exception("scheduler: handle_inbound raised for job %s", job_id)
 
-    def _on_job_executed(self, event: JobExecutionEvent) -> None:
-        """If a fired job is marked deleteAfterRun, remove it from jobs.json."""
-        job_id = event.job_id
+    def _cleanup_one_shot(self, job_id: str, reason: str) -> None:
+        """Remove a spent one-shot (deleteAfterRun) job from jobs.json. Shared
+        by the EXECUTED and MISSED listeners — a one-shot that ran OR missed is
+        done either way, so it must not linger to re-register next boot."""
         if not self._jobs_file.exists():
             return
         try:
@@ -242,9 +345,52 @@ class JobRunner:
         new_jobs = [j for j in jobs if j.get("id") != job_id]
         try:
             self._jobs_file.write_text(json.dumps(new_jobs, indent=2))
-            log.info("scheduler: removed one-shot job %s after execution", job_id)
+            log.info("scheduler: removed one-shot job %s (%s)", job_id, reason)
         except OSError:
-            log.exception("scheduler: failed to rewrite jobs.json after firing %s", job_id)
+            log.exception("scheduler: failed to rewrite jobs.json for %s (%s)", job_id, reason)
+
+    def _on_job_executed(self, event: JobExecutionEvent) -> None:
+        self._cleanup_one_shot(event.job_id, "after execution")
+
+    def _on_job_missed(self, event: JobExecutionEvent) -> None:
+        # A registered one-shot missed at runtime (loop blocked past its grace).
+        # Stale-at-load misses are handled in _load_jobs_from_disk before
+        # registration; this catches the rare runtime case so nothing lingers.
+        self._cleanup_one_shot(event.job_id, "missed at runtime")
+
+    async def review_missed_jobs(self) -> None:
+        """Surface at-jobs that were missed beyond grace (collected at load) to
+        their owning agent as a review turn — one per (agent, deliver_to) group
+        so the agent's reply re-delivers to the original target. The agent
+        decides per item whether to re-send (include in its reply) or discard.
+        Called once at startup, after the scheduler has loaded."""
+        if not self._missed_at_load:
+            return
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for job in self._missed_at_load:
+            agent_id = job.get("agent")
+            deliver_to = job.get("deliver_to")
+            if not agent_id or not deliver_to or agent_id not in self.agents:
+                log.warning(
+                    "scheduler: missed job %s has no usable agent/deliver_to; "
+                    "skipping review", job.get("id") or job.get("name"))
+                continue
+            groups.setdefault((agent_id, deliver_to), []).append(job)
+        for (agent_id, deliver_to), group in groups.items():
+            msg = InboundMessage(
+                peer_id=deliver_to,
+                sender_name="cron",
+                text=_build_missed_review(group, deliver_to),
+                channel="cron",
+            )
+            try:
+                await self.agents[agent_id].handle_inbound(msg)
+                log.info(
+                    "scheduler: dispatched missed-reminder review -> agent=%s "
+                    "deliver_to=%s (%d job(s))", agent_id, deliver_to, len(group))
+            except Exception:
+                log.exception("scheduler: missed-reminder review dispatch failed for %s", agent_id)
+        self._missed_at_load = []
 
     # --- live mutations (used by the cron_add / cron_remove tools) ------
 
@@ -263,17 +409,45 @@ class JobRunner:
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._read_jobs()
 
-    def add_job(self, job: dict[str, Any]) -> None:
+    @staticmethod
+    def _is_exact_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
+        """Exact-duplicate test for the cron_add guard: same agent, kind,
+        deliver_to and message, AND the same schedule — for ``at`` jobs the
+        run_date compared to the MINUTE (12:00:00 == 12:00:30, normalized so a
+        seconds-less time matches), for ``cron`` jobs the crontab expression.
+        Deliberately exact: near-dups (same event, different wording) are the
+        calendar skill's job to dedup by event, not this generic surface's."""
+        kind = b.get("kind", "cron")
+        if (a.get("agent"), a.get("kind", "cron"), a.get("deliver_to"),
+                (a.get("message") or "").strip()) != (
+                b.get("agent"), kind, b.get("deliver_to"),
+                (b.get("message") or "").strip()):
+            return False
+        if kind == "at":
+            return (_normalize_run_date(a.get("run_date") or "")[:16]
+                    == _normalize_run_date(b.get("run_date") or "")[:16])
+        return (a.get("cron") or "") == (b.get("cron") or "")
+
+    def add_job(self, job: dict[str, Any]) -> dict[str, Any] | None:
         """Append a new job to jobs.json AND register it live. Each job is
         keyed by an auto-generated uuid; agents identify jobs in cron_list /
-        cron_remove by short id prefix."""
+        cron_remove by short id prefix.
+
+        Returns the pre-existing job if ``job`` is an EXACT duplicate of one
+        already scheduled (same agent/kind/target/message + same-minute time);
+        in that case nothing is added. Returns None when added fresh."""
+        existing = self._read_jobs()
+        dup = next((j for j in existing if self._is_exact_duplicate(j, job)), None)
+        if dup is not None:
+            log.info("scheduler: cron_add rejected exact duplicate of %s", dup.get("id"))
+            return dup
         if "id" not in job or not job["id"]:
             job["id"] = uuid.uuid4().hex
-        existing = self._read_jobs()
         existing.append(job)
         self._write_jobs(existing)
         if job.get("enabled", True):
             self._register_job(job)
+        return None
 
     def remove_job(self, job_id: str) -> dict[str, Any] | None:
         """Remove a single job by id (full uuid or unique short prefix as
@@ -356,10 +530,15 @@ def build_cron_add_tool(
             return f"error: kind must be 'cron' or 'at', got {kind!r}"
 
         try:
-            runner.add_job(job)
+            dup = runner.add_job(job)
         except Exception as e:
             log.exception("cron_add failed")
             return f"error: {e}"
+        if dup is not None:
+            return (
+                f"already scheduled — exact duplicate of job "
+                f"{(dup.get('id') or '?')[:8]}; not added."
+            )
         return f"job {job['id'][:8]} added (delivers to {deliver_to})"
 
     deliver_to_doc = (

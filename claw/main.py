@@ -34,7 +34,9 @@ from claw import logsetup
 from claw.agent import Agent
 from claw.channel.matrix import MatrixChannel
 from claw.config import Config, load
+from claw.voice_http import HttpReplyChannel, VoiceHttpServer
 from claw.memory import MemoryIndex
+from claw.memory_curate import curate_all_agents
 from claw.ollama import OllamaClient
 from claw.skills import build_agent_registry
 from claw.tools.subagent import SubagentSpawner
@@ -103,16 +105,53 @@ async def _serve(cfg: Config) -> int:
         agents.append(agent)
         agents_by_id[ac.id] = agent
 
+    for agent, channel in zip(agents, channels):
+        await channel.start(agent.handle_inbound)
+
+    # HTTP turn endpoint: claw's transport-decoupled voice inbound. Stood up
+    # when http_api is enabled AND at least one device is configured. A caller
+    # (an external voice stack fronting a thin client, or a client with its own
+    # STT/TTS) POSTs {device_id, endpoint_id, text}; the device resolves to its
+    # bound agent, and the outbound reply routes back via HttpReplyChannel
+    # (resolving the request's future) rather than matrix. claw runs no audio —
+    # mic capture, wake, STT, and TTS live in the external voice stack.
+    voice_http: VoiceHttpServer | None = None
+    if cfg.http_api is not None and cfg.http_api.enabled and cfg.devices:
+        devices = {d.device_id: d for d in cfg.devices}
+        bound_agents = {d.agent for d in cfg.devices}
+        reply_channel = HttpReplyChannel()
+        handlers: dict[str, Any] = {}
+        for agent in agents:
+            if agent.id in bound_agents:
+                agent.register_channel(reply_channel.name, reply_channel)
+                handlers[agent.id] = agent.handle_inbound
+        voice_http = VoiceHttpServer(
+            bind_host=cfg.http_api.bind_host,
+            bind_port=cfg.http_api.bind_port,
+            devices=devices,
+            handlers=handlers,
+            reply_channel=reply_channel,
+        )
+        await voice_http.start()
+
     # Eagerly recap any session whose last activity was > idle_recap_seconds
     # ago, so the first live turn after boot doesn't pay summarizer latency.
-    for agent in agents:
+    # Run it in the BACKGROUND, AFTER channels are listening: a multi-minute
+    # summarize must not hold off channel bring-up, or the voice box (and matrix
+    # clients) can't (re)connect until it finishes — which stranded the box for
+    # ~90s after every restart, well past its ws keepalive window. The recap
+    # takes the session lock, so a live turn that lands first just serializes
+    # ahead of it (paying the latency it would have paid anyway).
+    async def _boot_recap(agent: Agent) -> None:
         try:
             await agent.boot_recap_known_sessions()
         except Exception:
             log.exception("[%s] boot recap pass raised; continuing", agent.id)
 
-    for agent, channel in zip(agents, channels):
-        await channel.start(agent.handle_inbound)
+    recap_tasks = [
+        asyncio.create_task(_boot_recap(agent), name=f"boot-recap-{agent.id}")
+        for agent in agents
+    ]
 
     # Start the cron scheduler now that all agents are wired and channels
     # are syncing. Jobs may begin firing immediately if their next trigger
@@ -127,6 +166,14 @@ async def _serve(cfg: Config) -> int:
         except Exception:
             log.exception("[%s] initial_prompt pass raised", agent.id)
 
+    # Surface any one-shot reminders missed beyond grace while we were down
+    # (collected during job_runner.start()) to their owning agent for
+    # deliver-late-or-discard review.
+    try:
+        await job_runner.review_missed_jobs()
+    except Exception:
+        log.exception("missed-reminder review pass raised")
+
     maintenance_task = asyncio.create_task(
         _maintenance_loop(agents, memory_indexes),
         name="maintenance-loop",
@@ -139,6 +186,13 @@ async def _serve(cfg: Config) -> int:
                 agents, cfg.lifecycle.daily_session_rotate_hour, cfg.tz,
             ),
             name="daily-session-rotate",
+        )
+
+    curation_task: asyncio.Task | None = None
+    if cfg.memory_curation.enabled:
+        curation_task = asyncio.create_task(
+            _nightly_curation_loop(agents, cfg),
+            name="nightly-curation",
         )
 
     stop_event = asyncio.Event()
@@ -159,6 +213,13 @@ async def _serve(cfg: Config) -> int:
 
     log.info("shutting down")
     job_runner.shutdown()
+    for t in recap_tasks:
+        t.cancel()
+    if voice_http is not None:
+        try:
+            await voice_http.shutdown()
+        except Exception:
+            log.exception("voice HTTP endpoint shutdown raised")
     for channel in channels:
         try:
             await channel.shutdown()
@@ -173,6 +234,12 @@ async def _serve(cfg: Config) -> int:
         rotate_task.cancel()
         try:
             await rotate_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if curation_task is not None:
+        curation_task.cancel()
+        try:
+            await curation_task
         except (asyncio.CancelledError, Exception):
             pass
     try:
@@ -271,6 +338,32 @@ async def _daily_session_rotate_loop(
         except Exception:
             log.exception("daily rotate loop iteration raised; continuing")
             # Don't busy-loop on persistent failure.
+            await asyncio.sleep(60)
+
+
+async def _nightly_curation_loop(agents: list[Agent], cfg: Config) -> None:
+    """Sleep until ``memory_curation.hour`` in ``cfg.tz``, run the nightly
+    memory curator for every agent (dedup / supersession / archive lapsed
+    ephemera), repeat. A quiet hour keeps the larger curator model off the
+    user-reply path and avoids racing the collector on today's daily note
+    (which the curator also skips).
+
+    Runs forever until cancelled.
+    """
+    hour = cfg.memory_curation.hour
+    while True:
+        try:
+            sleep_s = _seconds_until_next(hour, cfg.tz)
+            log.info(
+                "nightly curation: next run in %.0f s (hour=%02d:00 %s)",
+                sleep_s, hour, cfg.tz or "UTC",
+            )
+            await asyncio.sleep(sleep_s)
+            await curate_all_agents(agents, cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("nightly curation loop iteration raised; continuing")
             await asyncio.sleep(60)
 
 

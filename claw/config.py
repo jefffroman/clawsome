@@ -60,6 +60,14 @@ class CronConfig:
     # hardcode a deployment-specific phone MXID; pulled into config so the
     # source stays deployment-neutral.
     default_deliver_to: str | None = None
+    # Grace (seconds) for one-shot `at` jobs missed while the daemon was down
+    # (e.g. across a restart). Detected at the next boot. A reminder missed by
+    # <= this fires late then (delivered + cleaned via the normal executed
+    # path); one missed by more is collected and surfaced to its owning agent
+    # as a review turn (deliver-late-or-discard) rather than silently dropped
+    # or blindly re-fired. Applied to `at` jobs only — recurring `cron` jobs
+    # keep APScheduler's default to avoid a downtime burst.
+    misfire_grace_time: int = 3600
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,65 @@ class MemoryFlushConfig:
 
 
 @dataclass(frozen=True)
+class MemoryCurationConfig:
+    """Nightly "forgetory" curator — grooms each agent's markdown memory.
+
+    A separate, heavier pass than the frequent collector (memory_flush): once
+    per night a larger model dedups near-identical memories (recurring-cron
+    churn), marks superseded long-term facts with a forward ``[SUPERSEDED BY ->
+    <id>]`` pointer (retrieval auto-follows old->new), and archives lapsed
+    ephemera out of the indexed daily notes into ``memory/archive.md``. All
+    state lives in the markdown (the source of truth); ChromaDB/BM25 are
+    re-derived, so ``rm -rf .memory/`` rebuilds everything intact.
+
+    Coupled to the collector: only runs for agents when ``memory_flush`` is
+    enabled (no memory collected -> nothing to curate).
+    """
+    enabled: bool = False
+    # Local-tz hour (0-23) for the nightly pass. A quiet hour both keeps the
+    # 122b off the user-reply path and sidesteps the collector/curator file
+    # race (the curator also skips today's daily note).
+    hour: int = 4
+    # The curator re-scans this many days of recent daily notes for now-lapsed
+    # ephemera regardless of change — expiry is time-triggered, not
+    # change-triggered, so a pure changed-since-watermark set would never
+    # revisit "meeting Thursday" to archive it once Thursday passes.
+    recent_window_days: int = 14
+    # Bigger model than the collector — supersession/dedup is relational
+    # judgment worth the cost. Per-deployment so source stays neutral.
+    model: str = "qwen3.5:122b"
+    # Near-neighbours fetched per changed memory (via the existing hybrid
+    # search) so the curator can judge dedup/supersession against them.
+    near_neighbor_k: int = 8
+    # The curator processes ONE daily-note file per turn (a whole-corpus
+    # briefing wouldn't fit context). This caps candidate files per
+    # invocation (0 = unlimited); lets a large first bootstrap be chunked
+    # across runs. Each file is a separate bounded turn regardless.
+    max_files_per_run: int = 0
+    # Investigative latitude — the curator reads old notes / files before
+    # judging, so it needs more tool round-trips than a collector flush.
+    max_tool_turns: int = 80
+    # Per-generation token cap for the curator turn. Doubled vs the global
+    # default (OllamaConfig.num_predict, 8192): a single write_file that
+    # rewrites a whole daily note can be large, and truncating it mid-file
+    # would corrupt memory. None inherits the global.
+    num_predict: int | None = 16384
+    # Per-curation deadline. Generous: a full-corpus-ish nightly groom over a
+    # 122b legitimately takes a while. On timeout the pass is abandoned and
+    # retried next night (markdown is untouched-or-partially-edited but valid).
+    turn_timeout_s: float = 1800.0
+    # A superseded memory is kept searchable as a visible timeline, but once
+    # it's been superseded this many days the old version is usually dead
+    # weight. The nightly supersession-review turn is handed the COMPLETE
+    # superseded list (any age, whole corpus — not window-limited) with each
+    # one's age, and archives the stale ones case-by-case. Age is measured
+    # from the *superseding* memory's ts (the marker records when a memory was
+    # written, never when it was superseded; the replacement's ts is when the
+    # old fact went stale).
+    superseded_archive_days: int = 30
+
+
+@dataclass(frozen=True)
 class LifecycleConfig:
     # Hour (0-23, local time) at which to wipe in-flight session transcripts
     # for every agent and start fresh. None disables. Memory_flush runs once
@@ -153,6 +220,73 @@ class CommandsConfig:
     # Deliberately separate from per-agent matrix.allow_from so a sender who
     # may DM an agent does not automatically gain control-plane access.
     allow: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VoiceServiceConfig:
+    """Claw-side voice config — the *modality* of a voice interaction.
+
+    Slim by design: the audio pipeline (mic capture, wake, STT, TTS) lives in an
+    external voice stack, not in claw. All claw needs to know is how to *steer an
+    agent's reply* when the turn is voice — which applies to **any** voice
+    client, including one that does its own STT/TTS and reaches claw over the
+    HTTP turn endpoint. So this holds only the modality hint; reply rendering
+    (voice selection) is the external voice stack's concern.
+    """
+    # System-prompt note injected when a turn's ``modality == "voice"`` (see
+    # Agent._voice_modality_hint — gated on modality, never on channel). Steers
+    # replies to stay brief and speakable and warns the input is an STT
+    # transcript prone to homophones. Empty string disables the hint entirely.
+    modality_hint: str = (
+        "You are speaking over a voice channel: your reply is read aloud by "
+        "text-to-speech and the user's message is a speech-to-text transcript. "
+        "Keep replies brief and speakable — one or two short sentences, no "
+        "markdown, tables, code blocks, or bullet lists; spell out URLs, "
+        "symbols, and long numbers as words. The transcript may contain "
+        "mishearings (their/there, to/two, aria/area, digits, proper nouns); "
+        "when a load-bearing word is ambiguous, ask the user to confirm rather "
+        "than act on a possibly-misheard token."
+    )
+
+
+@dataclass(frozen=True)
+class HttpApiConfig:
+    """claw's HTTP turn endpoint (``claw.voice_http``).
+
+    A transport-agnostic inbound: a caller POSTs ``{device_id, endpoint_id,
+    text}`` and gets ``{reply, agent_id}`` back. Used both by an external voice
+    stack (fronting a thin client that can't do STT/TTS) and directly by a
+    client that does its own STT/TTS. Decoupled from voice: it only needs
+    ``devices:`` for routing/identity; the voice modality hint applies when the
+    resolved endpoint's ``type`` is ``"voice"``.
+    """
+    enabled: bool = False
+    # Binds ``0.0.0.0`` so a remote client can reach it over the network, not
+    # just loopback — consistent with how matrix and the other services bind.
+    # Auth for direct callers is still TODO; the closed LAN/tailnet is the
+    # boundary for now.
+    bind_host: str = "0.0.0.0"
+    bind_port: int = 11501
+
+
+@dataclass(frozen=True)
+class EndpointConfig:
+    """One logical source within a device (``id : name`` ≈ MXID : displayname,
+    scoped inside the device). ``sender_id = f"{device_id}/{id}"``;
+    ``sender_name = name``. A Box has one implicit ``voice`` endpoint."""
+    id: str
+    type: str          # modality: voice | event | state
+    name: str          # human label the agent hears as sender_name
+
+
+@dataclass(frozen=True)
+class DeviceConfig:
+    """A physical device. ``Hello.device_id`` resolves to one of these; the
+    bound ``agent`` answers, and the matching endpoint supplies identity."""
+    device_id: str
+    name: str
+    agent: str
+    endpoints: tuple[EndpointConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -214,6 +348,7 @@ class Config:
     subagents: SubagentsConfig
     compaction: CompactionConfig
     memory_flush: MemoryFlushConfig
+    memory_curation: MemoryCurationConfig
     lifecycle: LifecycleConfig
     commands: CommandsConfig
     agents: tuple[AgentConfig, ...]
@@ -224,6 +359,22 @@ class Config:
     # memory sync state, compaction bookkeeping) stay in UTC regardless —
     # this knob only affects what humans (and the model) see.
     tz: str | None = None
+    # Language every agent replies in, as a human-readable id with locale, e.g.
+    # "English (en_US)". Injected into the system prompt for ALL turns/channels so
+    # a bilingual model (e.g. qwen) doesn't code-switch — critical for the voice
+    # path, where TTS can't read non-Latin output and renders it as garbage.
+    # ``None`` = no language steering.
+    language: str | None = None
+    # Claw-side voice config (modality hint). ``None`` = no voice steering; a
+    # voice turn still works, it just gets no speakable-reply hint.
+    voice: VoiceServiceConfig | None = None
+    # claw's HTTP turn endpoint (for external voice stacks + direct clients).
+    # ``None`` / disabled = not stood up.
+    http_api: HttpApiConfig | None = None
+    # Physical devices keyed (at use-site) by device_id. A turn (HTTP or, in the
+    # gateway, a box Hello) resolves to one of these → its ``agent`` answers,
+    # and the matching endpoint supplies identity + modality.
+    devices: tuple[DeviceConfig, ...] = ()
 
 
 def load(path: Path | str) -> Config:
@@ -231,6 +382,7 @@ def load(path: Path | str) -> Config:
         raw = yaml.safe_load(f) or {}
     cfg = _parse(raw)
     _validate_can_spawn(cfg)
+    _validate_voice(cfg)
     return cfg
 
 
@@ -272,6 +424,60 @@ def _validate_can_spawn(cfg: "Config") -> None:
                 )
 
 
+def _validate_voice(cfg: "Config") -> None:
+    """Device routing sanity: every device must bind to a real agent and carry
+    at least one endpoint (so identity/modality resolution works). The audio
+    pipeline and per-agent reply voice are the external voice stack's concern,
+    not validated here."""
+    agent_ids = {ac.id for ac in cfg.agents}
+    for dev in cfg.devices:
+        if dev.agent not in agent_ids:
+            raise ValueError(
+                f"device {dev.device_id!r} binds to unknown agent "
+                f"{dev.agent!r}; known agents: {sorted(agent_ids)}"
+            )
+        if not dev.endpoints:
+            raise ValueError(
+                f"device {dev.device_id!r} has no endpoints"
+            )
+
+
+def _parse_voice_service(d: dict[str, Any] | None) -> VoiceServiceConfig | None:
+    if not d:
+        return None
+    return VoiceServiceConfig(
+        **({"modality_hint": d["modality_hint"]} if "modality_hint" in d else {}),
+    )
+
+
+def _parse_http_api(d: dict[str, Any] | None) -> HttpApiConfig | None:
+    if not d:
+        return None
+    return HttpApiConfig(
+        enabled=bool(d.get("enabled", False)),
+        bind_host=d.get("bind_host", "0.0.0.0"),
+        bind_port=int(d.get("bind_port", 11501)),
+    )
+
+
+def _parse_devices(d: list[dict[str, Any]] | None) -> tuple[DeviceConfig, ...]:
+    if not d:
+        return ()
+    out: list[DeviceConfig] = []
+    for spec in d:
+        endpoints = tuple(
+            EndpointConfig(id=e["id"], type=e["type"], name=e["name"])
+            for e in spec.get("endpoints", ())
+        )
+        out.append(DeviceConfig(
+            device_id=spec["device_id"],
+            name=spec["name"],
+            agent=spec["agent"],
+            endpoints=endpoints,
+        ))
+    return tuple(out)
+
+
 def _parse_commands(d: dict[str, Any]) -> CommandsConfig:
     return CommandsConfig(
         enabled=d.get("enabled", True),
@@ -304,10 +510,15 @@ def _parse(d: dict[str, Any]) -> Config:
         ),
         compaction=CompactionConfig(**(d.get("compaction") or {})),
         memory_flush=MemoryFlushConfig(**(d.get("memory_flush") or {})),
+        memory_curation=MemoryCurationConfig(**(d.get("memory_curation") or {})),
         lifecycle=LifecycleConfig(**(d.get("lifecycle") or {})),
         commands=_parse_commands(d.get("commands") or {}),
         agents=tuple(_parse_agent(a) for a in d["agents"]),
         tz=d.get("tz"),
+        language=d.get("language"),
+        voice=_parse_voice_service(d.get("voice")),
+        http_api=_parse_http_api(d.get("http_api")),
+        devices=_parse_devices(d.get("devices")),
     )
 
 

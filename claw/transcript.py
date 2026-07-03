@@ -24,8 +24,18 @@ from typing import Any
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
+def sid_for_key(session_key: str) -> str:
+    """Canonical sid: a filename-safe form of a message's ``session_key``.
+
+    Idempotent for already-safe keys (e.g. ``"home"``). This is the single
+    source of truth for the transcript key; ``session_id`` is the legacy
+    ``(channel, peer_id)`` convenience that builds the default key.
+    """
+    return _FILENAME_SAFE.sub("_", session_key)
+
+
 def session_id(channel: str, peer_id: str | int) -> str:
-    return _FILENAME_SAFE.sub("_", f"{channel}_{peer_id}")
+    return sid_for_key(f"{channel}_{peer_id}")
 
 
 def _path(transcripts_dir: Path, sid: str) -> Path:

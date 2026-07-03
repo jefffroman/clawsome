@@ -14,6 +14,7 @@ to specific keys point at `docs/configuration.md`.
 | Idle recap | Agent boot. Older than `compaction.idle_recap_seconds` → archive + recap; younger → transcript resumes intact, no recap | Synchronous, pre-live | `## Last Session Recap` row prepended on the fresh session; prior JSONL archived `.recap-<ts>` |
 | Periodic reindex | Maintenance loop, every 5 min, if memory source files' hash changed | Background asyncio task | Refreshed ChromaDB + BM25 + graph |
 | Daily session rotate | At `lifecycle.daily_session_rotate_hour` | Synchronous per session | Final memory_flush, JSONL archived `.reset-<ts>`, caches cleared |
+| Nightly curation (forgetory) | At `memory_curation.hour` (local tz), if `memory_curation.enabled` and the agent collects | Background asyncio task, one bounded turn per file | Deduped/superseded/archived markdown; ephemera moved to `memory/archive.md`; a reasoned line per decision in `/var/log/claw-curator.log` |
 
 ## Memory_flush in depth
 
@@ -136,12 +137,70 @@ around 1.41–1.44, gibberish plateaus at 1.50+).
 
 **Reindex cadence.** Maintenance loop checks `sourcesHash` every 5 min
 and reindexes if changed. Source-file edits (e.g., a memory_flush
-appending to today's file) get picked up within 5 min.
+appending to today's file, or the nightly curator rewriting a note) get
+picked up within 5 min.
+
+**Supersession.** A memory the curator has superseded carries a
+`supersededBy=<id>` marker; retrieval auto-follows the old→new chain and
+renders the current head last, so a stale fact stays searchable as a
+visible timeline without outranking its replacement. See curation below.
 
 **Tuning the floor.** If retrieval is too noisy or too sparse, recompute
 distances against a known-good query against your actual corpus and
 adjust `VECTOR_DISTANCE_MAX` in `claw/memory.py`. Keep it in source —
 this is calibration, not config.
+
+## Curation (forgetory) in depth
+
+The **collector** (`memory_flush`) captures durable knowledge frequently
+and cheaply. The **curator** (`memory_curation`, "forgetory") is the
+heavier, once-a-night counterpart that keeps the accumulated memory tight.
+It's off by default (`memory_curation.enabled: false`) and **coupled to
+`memory_flush`** — it only runs for agents that collect.
+
+**Model of record.** Memory is markdown; ChromaDB/BM25/graph are re-derived
+from it (`rm -rf <workspace>/.memory/` rebuilds intact). Each memory section
+carries an HTML-comment marker under its heading —
+`<!-- mem ts=<date> id=<id> status=<active|…> supersededBy=<id?> -->`. The
+collector seeds `ts`; the curator fills in the rest. Because every edit the
+curator makes is atomic markdown, a partial or timed-out pass always leaves
+memory in a valid state.
+
+**What a pass does.** Per night, for each selected daily-note file (one
+bounded turn each), the curator may:
+
+- **dedup** — collapse near-identical memories (e.g., recurring-cron churn)
+  to one canonical entry;
+- **supersede** — mark a stale long-term fact `supersededBy=<id>` pointing at
+  the memory that replaced it (retrieval follows the chain);
+- **archive** — move lapsed ephemera (past appointments, "today is X") out of
+  the indexed daily notes into `memory/archive.md` (preserved with provenance,
+  never indexed — the filename isn't date-shaped);
+- **uncertain** — leave a memory in place with an inline caveat when a
+  judgment (e.g., a dangling `supersededBy`) can't be made safely.
+
+**File selection.** The curator processes files whose section hashes changed
+since the last pass (a watermark at `<workspace>/.memory/curation_state.json`,
+written only by the curator) **plus** every daily note within
+`recent_window_days` (so time-lapsed ephemera gets revisited even if the file
+didn't change). Separately, a **whole-corpus supersession-review turn** runs
+every pass — it's handed the complete superseded list (any age, not
+window-limited) with each entry's age and archives ones stale for
+~`superseded_archive_days`+, case-by-case. Today's daily note is excluded from
+curation (it's still being written by the collector).
+
+**Audit trail.** The curator narrates its own decisions via a `record_action`
+tool — one reasoned line per `archive`/`supersede`/`dedup`/`uncertain` to
+`/var/log/claw-curator.log`. This is the primary window into *why* it did what
+it did; watch it for the first few nights after enabling.
+
+**First run re-curates everything (expected).** The watermark is written only
+by the curator, so before the first-ever pass `prev_hashes` is empty and every
+section reads as "changed" → the whole corpus is selected. On a large existing
+memory that first pass is long (one model turn per file). Either let it run
+(subsequent nights select only recent+changed files), cap it with
+`max_files_per_run` to chunk across nights, or — if you've just curated by hand
+— seed the watermark first so the first nightly sees only genuine changes.
 
 ## Matrix bot first-deploy
 

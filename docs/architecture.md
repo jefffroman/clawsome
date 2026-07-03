@@ -20,8 +20,9 @@ store, tool-result spool, transcripts). One workspace per agent. Path
 declared by `workspace:` under each agent block.
 
 **Channel.** An inbound surface that delivers `InboundMessage`s and accepts
-outbound text. The shipped channel is Matrix (`matrix-nio[e2e]`, one
-account per agent). The `Channel` protocol lives in
+outbound text. Two channels ship: **Matrix** (`matrix-nio[e2e]`, one account
+per agent) and **Voice** (an HTTP turn endpoint an external voice stack POSTs
+transcripts to — see the Voice section below). The `Channel` protocol lives in
 `claw/channel/base.py` — `start`, `send`, `shutdown`, `typing`. New
 surfaces (Slack, IRC, HTTP webhook, CLI) implement that protocol and
 register on the agent.
@@ -164,6 +165,7 @@ a zombie can't resurrect a stopped conversation.
 | `MEMORY.md` | Top-level durable knowledge. Indexed by the memory system. | On reindex |
 | `memory/YYYY-MM-DD.md` | Daily memory notes. Indexed (filename matches `^\d{4}-\d{2}-\d{2}\.md$`). | On reindex |
 | `memory/YYYY-MM-DD-<slug>.md` | Journal-only daily notes. **Not** indexed (anchored regex requires bare date). | (never) |
+| `memory/archive.md` | Curator sink for archived/lapsed ephemera. Preserved with provenance; **not** indexed (filename isn't a bare date). | (never) |
 | `skills/<name>/SKILL.md` | Skill description + usage. Catalog entry injected per turn. | Per turn (catalog) |
 | `skills/<name>/tool.py` | Optional tool implementation. `TOOL_SPEC` + `async def run(input)`. | At skill load |
 | `transcripts/<sid>.jsonl` | OpenAI-flat message log per session. | Per turn (load) |
@@ -171,6 +173,7 @@ a zombie can't resurrect a stopped conversation.
 | `.memory/bm25_corpus.json` | Lexical index. | On reindex / retrieve |
 | `.memory/memory_graph.json` | NetworkX co-occurrence graph for RRF fusion. | On reindex / retrieve |
 | `.memory/sync_state.json` | Source files hash + last reindex marker. | On boot / reindex |
+| `.memory/curation_state.json` | Curator watermark: section hashes at the last curation pass. Written only by the curator. | On curation |
 | `.matrix-store/` | matrix-nio crypto store (Olm sessions, group sessions). | Continuously |
 | `.matrix-store/cross_signing.json` | Master / SSK / USK seeds. Mode 0600. | On boot |
 | `.tool-results/<sid>/<call_id>.txt` | Spool for tool results > 8 KB. The model sees full results in-loop; transcripts get a truncated preview. | Per turn (when oversized) |
@@ -209,6 +212,18 @@ Run off the user-reply critical path so latency stays bounded.
   the prior turns.
 - **Periodic reindex.** Maintenance loop reindexes each agent's memory
   source files if their hash changed since last reindex.
+- **Nightly curation ("forgetory").** When `memory_curation.enabled`, a
+  once-per-night pass (at `memory_curation.hour`, local tz) grooms each
+  agent's markdown memory with a larger model: dedups near-identical
+  memories, marks superseded long-term facts with a forward
+  `[SUPERSEDED BY -> <id>]` pointer (retrieval auto-follows old→new), and
+  archives lapsed ephemera out of the indexed daily notes into
+  `memory/archive.md`. One daily-note file per turn; a whole-corpus
+  supersession-review turn runs every pass. Markdown stays the source of
+  truth (ChromaDB/BM25 are re-derived), so a partial/abandoned run leaves
+  memory valid. Coupled to `memory_flush` — skipped for agents that don't
+  collect. Heavier counterpart to the collector; see
+  `docs/operations.md`.
 - **Daily session rotate.** At `lifecycle.daily_session_rotate_hour`
   (local time), every active session gets a final memory_flush, the
   JSONL is archived with a `.reset-<ts>` suffix, and per-session caches
@@ -216,6 +231,40 @@ Run off the user-reply critical path so latency stays bounded.
 - **Cron / scheduled.** `triggers/scheduler.py` reads `cron.jobs_file` at
   boot; jobs synthesize `InboundMessage(channel="cron", ...)` and reach
   the same `handle_inbound` path as channel messages.
+
+## Voice (HTTP turn endpoint)
+
+claw handles voice as a **transport-decoupled turn**, not an audio pipeline. A
+voice client POSTs a transcript to claw's HTTP turn endpoint
+(`claw/voice_http.py`, stood up when `HttpApiConfig.enabled`) and gets the
+agent's reply text back; **claw never touches audio**. Mic capture, wake
+detection, STT, and TTS all live in an **external voice stack** that is one
+client of this endpoint — a self-contained client doing its own STT/TTS is
+another.
+
+- **Wire contract** (`POST <http_bind>/voice/turn`, JSON):
+  `{device_id, endpoint_id?, text}` → `{reply, agent_id}`. The caller identifies
+  the **device**, not an agent.
+- **Device resolution.** claw looks `device_id` up in its `devices:` config to
+  the bound agent and the endpoint, and derives the turn's **modality** from the
+  endpoint's `type` — so the speakable-reply hint is config-driven, not asserted
+  by the caller. An unknown device is rejected.
+- **One shared "home" session.** The dispatched `InboundMessage` carries four
+  identifiers — `channel` (`voice`), `session_key` (`"home"`, so every device
+  folds into one household transcript), `sender_id` (`device_id/endpoint_id`),
+  and `peer_id` (the reply route) — plus `modality` (`voice`), which drives the
+  speakable-reply prompt hint (keyed on modality, never on channel).
+- **Voice-modality steering.** A turn whose resolved `modality == "voice"` gets
+  a system note (`VoiceServiceConfig.modality_hint`) so replies stay brief and
+  speakable and the agent accounts for STT homophones.
+- **Reply routing.** The agent's reply round-trips the normal outbound path: it
+  calls `channel.send(peer_id, text)` on the `HttpReplyChannel` registered under
+  the `"voice"` channel name, which resolves the per-request future the handler
+  is awaiting. The turn otherwise runs the standard agent path (coalescing,
+  memory) unchanged.
+
+The external voice stack — its audio transport, server-side wake, STT/TTS, and
+any hardware wire contract — is a separate component, out of scope for this repo.
 
 ## Where state lives
 

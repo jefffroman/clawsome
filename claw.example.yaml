@@ -43,6 +43,11 @@ cron:
   # Fallback delivery target when cron_add is called without an explicit
   # deliver_to. Omit (or null) to require deliver_to per call.
   # default_deliver_to: "@user-1:example.com"
+  misfire_grace_time: 3600              # grace (s) for one-shot `at` jobs missed
+                                        # while down: <= this fires late on next
+                                        # boot; more is surfaced to the owning
+                                        # agent as a deliver-or-discard review.
+                                        # `at` jobs only; cron keeps the default.
 
 subagents:
   max_concurrent: 8
@@ -87,12 +92,47 @@ memory_flush:
                                         # flush is dropped and compaction
                                         # proceeds anyway.
 
+memory_curation:                        # nightly "forgetory" curator — a
+                                        # heavier pass than the collector above.
+                                        # Coupled to memory_flush: only runs
+                                        # when it's enabled.
+  enabled: true
+  hour: 4                               # local-tz hour (quiet: off the reply
+                                        # path; curator skips today's note).
+  recent_window_days: 14                # re-scan this many days of recent notes
+                                        # for now-lapsed ephemera (time-, not
+                                        # change-, triggered).
+  model: qwen3.5:122b                   # bigger model: supersession/dedup is
+                                        # relational judgment worth the cost.
+  near_neighbor_k: 8                    # near-neighbours per changed memory,
+                                        # for dedup/supersession judgment.
+  max_files_per_run: 0                  # ONE file per curator turn; cap files
+                                        # per invocation (0 = unlimited) to
+                                        # chunk a large first bootstrap.
+  max_tool_turns: 80                    # investigative latitude (reads + edits).
+  num_predict: 16384                    # 2x the global default — a whole-note
+                                        # rewrite in one write_file is large;
+                                        # truncation would corrupt memory.
+  turn_timeout_s: 1800.0                # per-curation deadline; retried nightly.
+  superseded_archive_days: 30           # a whole-corpus review turn (every pass,
+                                        # window-independent) is handed the full
+                                        # superseded list with ages and archives
+                                        # ones superseded ~this many+ days ago,
+                                        # case-by-case. Age = the superseding
+                                        # memory's ts.
+
 # IANA timezone name. Used for every operator-facing timestamp claw renders:
 # the inbound-message envelope (so the model sees today's date + day-of-week
 # on every turn), the daily-note filename `memory/YYYY-MM-DD.md`, and the
 # daily-session-rotate hour. Omit (or null) for UTC. Internal/persisted
 # timestamps (transcripts, memory sync state) stay UTC regardless.
 # tz: America/New_York
+
+# Language every agent replies in, as a human-readable id with locale (e.g.
+# "English (en_US)"). Injected into every system prompt so a bilingual model
+# doesn't code-switch — chiefly to keep the voice TTS from being handed
+# unreadable non-Latin output. Omit (or null) for no steering.
+# language: "English (en_US)"
 
 lifecycle:
   # Hour (0-23, in `tz` above) at which to rotate every agent's active
@@ -134,6 +174,48 @@ commands:
   # from per-agent matrix.allow_from so DM access doesn't grant control plane.
   allow:
     - "@user-1:matrix.example.com"
+
+# Voice pipeline — global service config. One WebSocket server fronts every
+# device on the gateway. Session-level tunings live here (they're global, not
+# per-device); the only per-agent voice setting is `piper_voice` (below).
+# Physical devices and their agent binding live in the `devices:` block.
+# Omit this whole block to disable voice gateway-wide.
+# voice:
+#   # WebSocket server bind address. 0.0.0.0 = listen on all interfaces.
+#   # Restrict to a Tailscale interface IP for tighter scoping.
+#   bind_host: 0.0.0.0
+#   bind_port: 11500
+#   # Shared token the firmware presents on connect. One line, mode 0600.
+#   # Omit to disable auth — only safe on a fully closed network.
+#   auth_token_file: /path/to/credentials/voice.token
+#   # Wyoming endpoints for STT / TTS / wake. Defaults assume local services
+#   # on the conventional Wyoming ports. The wake server loads its own *.onnx
+#   # models (its model dir IS the wake-word set); the gateway evaluates all
+#   # of them and any detection wakes the device's bound agent.
+#   piper_uri: tcp://127.0.0.1:10200
+#   whisper_uri: tcp://127.0.0.1:10300
+#   openwakeword_uri: tcp://127.0.0.1:10400
+#   # Session-level pipeline tunings (global):
+#   multi_turn_window_s: 7.0      # keep mic hot N s after a reply (0 = re-wake)
+#   preroll_seconds: 15.0         # prepend N s of pre-wake ambient to STT
+#   endpoint_silence_ms: 1000     # end-of-speech threshold pushed in HelloAck
+#   # Resample TTS to this rate before sending (Hz). Set it for devices whose
+#   # playback clock is fixed — e.g. the ESP32-S3-BOX-3, whose shared-clock I2S
+#   # locks the speaker to the 16 kHz the mic runs at. Default 16000. Use `null`
+#   # to send Piper's native rate untouched (hardware with an independent,
+#   # higher-rate playback clock).
+#   tts_sample_rate: 16000
+
+# Physical devices. Each device's Hello.device_id resolves here → the bound
+# `agent` answers, and the matching endpoint supplies identity (sender_id =
+# device_id/endpoint_id, sender_name = endpoint name). A device has one voice
+# endpoint plus, later, sensor endpoints (event/state). Omit if no devices.
+# devices:
+#   - device_id: box3            # what the firmware sends in Hello
+#     name: Box3                 # device-level label (logs/fallback)
+#     agent: example             # which agent this device talks to
+#     endpoints:
+#       - { id: voice, type: voice, name: "Box3" }
 
 agents:
   - id: example
@@ -177,3 +259,13 @@ agents:
       allow_bots: mentions
       allow_from:
         - "@user-1:matrix.example.com"
+    # Optional voice block: enables this agent for spoken replies. Requires
+    # the top-level `voice:` service block, and a device in `devices:` that
+    # binds to this agent. Omit to leave this agent matrix-only. The only
+    # per-agent voice setting is the TTS voice — wake words belong to the wake
+    # server, and session tunings are global (top-level `voice:`).
+    # voice:
+    #   # Piper voice for this agent's spoken replies. See
+    #   # https://github.com/rhasspy/piper/blob/master/VOICES.md for the
+    #   # current voice catalog. Each agent may use a distinct voice.
+    #   piper_voice: en_US-libritts-high

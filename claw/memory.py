@@ -45,6 +45,22 @@ EXCLUDED_SECTION_PATTERNS = re.compile(
 
 DAILY_NOTE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
+# The curator's archive sink. `memory/archive.md` (and any future
+# `archive-YYYY.md`) deliberately fails DAILY_NOTE_PATTERN, so `_daily_notes`
+# excludes it from BOTH indexing and the curator's recent-window rescan:
+# archived memories are preserved on disk, git-diffable, and never retrieved.
+# Keep any archive filename non-date-shaped if this pattern ever changes.
+ARCHIVE_NOTE = "archive.md"
+
+# Per-section memory marker, written as the first body line under a `##`
+# heading, e.g. `<!-- mem ts=2026-06-28 id=m-7f3a2c9e status=active
+# supersededBy=m-1a0b22f4 -->`. The collector seeds only `ts`; the nightly
+# curator adds `id`/`status`/`supersededBy`. Markdown is the source of truth
+# for all of it — these fields are parsed into DERIVED chunk metadata
+# (overwritten on every upsert), never read back to persist.
+_MEM_MARKER_RE = re.compile(r"^<!--\s*mem\s+(?P<fields>.*?)\s*-->$")
+_MEM_FIELD_RE = re.compile(r"(\w+)=([A-Za-z0-9._:\-]+)")
+
 # Indexing is disjoint from prompt injection (extra_paths in claw.yaml).
 # Files the model already sees verbatim every turn (IDENTITY/USER/SOUL/AGENTS/
 # TOOLS) shouldn't compete for retrieval slots — only large/growing content
@@ -116,17 +132,60 @@ class MemoryIndex:
         return out
 
     @staticmethod
-    def _parse_markdown(path: Path) -> list[dict[str, Any]]:
+    def _extract_marker(body: str) -> tuple[str, dict[str, str]]:
+        """Pull a leading ``<!-- mem ... -->`` marker off a section body.
+
+        Returns ``(body_without_marker, fields)``. The marker must be the
+        first non-blank line; otherwise nothing is recognized. Stripping it
+        keeps the marker out of the embedded/BM25 text."""
+        lines = body.split("\n")
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx < len(lines):
+            m = _MEM_MARKER_RE.match(lines[idx].strip())
+            if m:
+                fields = dict(_MEM_FIELD_RE.findall(m.group("fields")))
+                del lines[idx]
+                return "\n".join(lines).strip(), fields
+        return body, {}
+
+    @staticmethod
+    def _marker_metadata(fields: dict[str, str]) -> dict[str, Any]:
+        """Map raw marker fields onto chunk metadata. ``status`` defaults to
+        ``active``; optional keys are omitted (never stored as ``None``) so
+        Chroma metadata stays scalar."""
+        meta: dict[str, Any] = {"status": fields.get("status", "active")}
+        if "ts" in fields:
+            meta["ts"] = fields["ts"]
+        if "id" in fields:
+            meta["mem_id"] = fields["id"]
+        if "supersededBy" in fields:
+            meta["superseded_by"] = fields["supersededBy"]
+        return meta
+
+    @classmethod
+    def _parse_markdown(cls, path: Path) -> list[dict[str, Any]]:
         content = path.read_text()
         chunks: list[dict[str, Any]] = []
         sections = re.split(r"(^##\s+.*$)", content, flags=re.MULTILINE)
-        if sections[0].strip():
-            chunks.append({"content": sections[0].strip(), "metadata": {"section": "Intro"}})
+        intro_body, intro_fields = cls._extract_marker(sections[0].strip())
+        if intro_body:
+            meta = {"section": "Intro", **cls._marker_metadata(intro_fields)}
+            if meta["status"] != "archived":
+                chunks.append({"content": intro_body, "metadata": meta})
         for i in range(1, len(sections), 2):
             header = sections[i].strip().lstrip("#").strip()
-            body = sections[i + 1].strip() if i + 1 < len(sections) else ""
+            raw_body = sections[i + 1].strip() if i + 1 < len(sections) else ""
+            body, fields = cls._extract_marker(raw_body)
             if body and not EXCLUDED_SECTION_PATTERNS.match(header):
-                chunks.append({"content": body, "metadata": {"section": header}})
+                meta = {"section": header, **cls._marker_metadata(fields)}
+                # Defensive: archived memories should already live in
+                # archive.md (not indexed). If one is still tagged archived
+                # inside an indexed file, keep it out of retrieval anyway.
+                if meta["status"] == "archived":
+                    continue
+                chunks.append({"content": body, "metadata": meta})
         return chunks
 
     def _collect_sources(self) -> list[dict[str, Any]]:
@@ -282,7 +341,13 @@ class MemoryIndex:
         # indexed set and the searched set.
         corpus = [
             {"id": all_ids[i], "text": chunks[i]["content"],
-             "section": chunks[i]["metadata"]["section"]}
+             "section": chunks[i]["metadata"]["section"],
+             # Carried so retrieval can resolve supersession chains without
+             # re-reading markdown: mem_id is the durable link identity,
+             # superseded_by points forward to the successor's mem_id.
+             "mem_id": chunks[i]["metadata"].get("mem_id"),
+             "status": chunks[i]["metadata"].get("status", "active"),
+             "superseded_by": chunks[i]["metadata"].get("superseded_by")}
             for i in range(len(chunks))
         ]
         self._atomic_write_json(bm25_path, corpus)
@@ -324,6 +389,59 @@ class MemoryIndex:
             if not changed and not removed:
                 return {"status": "in_sync"}
             return await loop.run_in_executor(None, self.do_reindex, changed, removed)
+
+    # --- curation support ---------------------------------------------------
+
+    def collect_sections(self) -> list[dict[str, Any]]:
+        """Public view of the current parsed memory chunks (one per ``##``
+        section across MEMORY.md + indexed daily notes), each as
+        ``{content, metadata:{section, source, status, ts?, mem_id?,
+        superseded_by?}}``. The curator briefing-builder uses this."""
+        return self._collect_sources()
+
+    def search(self, query: str, n: int = 8) -> list[dict[str, Any]]:
+        """Public sync wrapper over the hybrid search — used by the curator to
+        gather near-neighbours of a changed memory for dedup/supersession
+        judgment. Blocking (Chroma + BM25); call from an executor."""
+        return self._hybrid_search(query, n=n)
+
+    def section_hashes(self) -> dict[str, str]:
+        """Per-section SHA1 keyed ``{source}#{section}`` over current content.
+        The curation watermark: sections whose hash differs from the stored
+        map are 'new/changed since last curation' and drive the dedup/
+        supersession pass."""
+        out: dict[str, str] = {}
+        for c in self._collect_sources():
+            key = f"{c['metadata']['source']}#{c['metadata']['section']}"
+            out[key] = hashlib.sha1(c["content"].encode("utf-8")).hexdigest()
+        return out
+
+    def _curation_state_path(self) -> Path:
+        return self.data_dir / "curation_state.json"
+
+    def load_curation_state(self) -> dict[str, Any]:
+        """Returns the persisted curation state (``{sectionHashes, lastCurated}``)
+        or ``{}`` if missing/unreadable (caller treats absent hashes as
+        'everything is new')."""
+        path = self._curation_state_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path) as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    def write_curation_state(self, section_hashes: dict[str, str]) -> None:
+        self._atomic_write_json(
+            self._curation_state_path(),
+            {
+                "agent_id": self.agent_id,
+                "sectionHashes": section_hashes,
+                "lastCurated": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     # --- retrieval ----------------------------------------------------------
 
@@ -375,7 +493,38 @@ class MemoryIndex:
 
         fused = self._rrf_fuse(bm25_ranked, vector_ranked)[:n]
         id_to_doc = {doc["id"]: doc for doc in corpus}
-        return [id_to_doc[fid] for fid in fused if fid in id_to_doc]
+        hits = [id_to_doc[fid] for fid in fused if fid in id_to_doc]
+        return self._resolve_supersession(corpus, hits)
+
+    @staticmethod
+    def _resolve_supersession(
+        corpus: list[dict[str, Any]], hits: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Follow each hit's ``superseded_by`` chain old->new to the current
+        head and append the heads AFTER the original hits, so current truth
+        renders last (closest to the model's generation point). Guards: a
+        per-walk ``visited`` set breaks cycles, a hop cap bounds runaway
+        chains, and a missing target (an archived/removed successor) stops the
+        walk at the last resolvable node. Heads already among ``hits`` are not
+        duplicated. Sets a transient ``_current`` flag on appended heads for
+        display."""
+        id_by_mem = {d["mem_id"]: d for d in corpus if d.get("mem_id")}
+        seen = {d["id"] for d in hits}
+        heads: list[dict[str, Any]] = []
+        for d in hits:
+            target = d.get("superseded_by")
+            visited: set[str] = set()
+            head: dict[str, Any] | None = None
+            while (target and target in id_by_mem
+                   and target not in visited and len(visited) < 8):
+                visited.add(target)
+                head = id_by_mem[target]
+                target = head.get("superseded_by")
+            if head is not None and head["id"] not in seen:
+                head["_current"] = True
+                heads.append(head)
+                seen.add(head["id"])
+        return hits + heads
 
     def _query_graph(self, query: str, top_n: int = 5) -> dict[str, Any]:
         graph_path = self.data_dir / "memory_graph.json"
@@ -415,7 +564,8 @@ class MemoryIndex:
             lines.append(f"\n### Hybrid Search ({len(chunks)} results — BM25 + vector + RRF)")
             for r in chunks:
                 snippet = r["text"][:150] if compact else r["text"][:300]
-                lines.append(f"- **[{r['section']}]** {snippet}")
+                tag = " (current)" if r.get("_current") else ""
+                lines.append(f"- **[{r['section']}]{tag}** {snippet}")
         else:
             lines.append("\n_No strong matches in memory for this query._")
         if graph["related"]:

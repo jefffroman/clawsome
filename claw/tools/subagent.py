@@ -42,9 +42,8 @@ from typing import TYPE_CHECKING, Any
 
 from claw.channel.base import InboundMessage
 from claw.config import SubagentsConfig
-from claw.runctx import current_task_id, current_turn_id
+from claw.runctx import current_sid, current_task_id, current_turn_id
 from claw.tools.base import Tool
-from claw.transcript import session_id
 
 if TYPE_CHECKING:
     from claw.agent import Agent
@@ -68,6 +67,10 @@ class ChildTask:
     prompt: str
     origin_channel: str
     origin_peer_id: str
+    # The sid of the turn that spawned this child. Carried explicitly (not
+    # rebuilt from channel+peer_id) so completions re-enter the right session
+    # even when that session is shared, e.g. voice's "home".
+    origin_session_key: str
     started_at: datetime
     status: str = "running"  # running | completed | failed | cancelled
     completed_at: datetime | None = None
@@ -171,6 +174,7 @@ class SubagentSpawner:
             prompt=prompt,
             origin_channel=origin_channel,
             origin_peer_id=origin_peer_id,
+            origin_session_key=current_sid.get(),
             started_at=_now(),
             spawn_turn_id=current_turn_id.get(),
             parent_task_id=current_task_id.get(),
@@ -277,6 +281,9 @@ class SubagentSpawner:
             sender_name=f"subagent:{ct.persona}:{ct.id}",
             text="\n".join(body_lines),
             channel=ct.origin_channel,
+            # Re-enter the spawning turn's session explicitly — channel+peer_id
+            # alone can't rebuild a shared key like voice's "home".
+            session_key=ct.origin_session_key,
             # peer_label derivation in agent._derive_peer_label uses
             # sender_id when present; setting the task_id here gives the
             # parent's resulting run_turn label a useful tag like
@@ -316,7 +323,7 @@ class SubagentSpawner:
         out = [
             ct for ct in self.tasks.values()
             if ct.status == "running"
-            and session_id(ct.origin_channel, ct.origin_peer_id) == sid
+            and ct.origin_session_key == sid
         ]
         out.sort(key=lambda c: c.started_at, reverse=True)
         return out

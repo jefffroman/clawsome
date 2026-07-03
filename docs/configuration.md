@@ -149,6 +149,28 @@ Flush turns that ask the agent to capture durable knowledge into
 | `periodic_growth_threshold` | int | `4000` | Periodic flush triggers when a session's transcript has grown by this many tokens since its last flush. With a 96K compaction trigger, 4K growth ≈ 4% — comfortable cadence. |
 | `turn_timeout_s` | float | `300.0` | Per-flush deadline. On timeout the flush is dropped and compaction proceeds anyway. |
 
+## `memory_curation:`
+
+The nightly **"forgetory" curator** — a heavier, once-a-night pass that grooms
+each agent's markdown memory (dedups recurring churn, marks superseded facts,
+archives lapsed ephemera). Distinct from the frequent `memory_flush` *collector*;
+see `docs/operations.md` for how it selects files and what it produces. Whole
+block optional; **coupled to `memory_flush`** — it only runs for agents whose
+`memory_flush` is enabled (nothing collected → nothing to curate).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. Off by default — opt in per deployment. |
+| `hour` | int | `4` | Local-tz hour (0–23) for the nightly pass. A quiet hour keeps the big model off the reply path and sidesteps the collector/curator file race (the curator also skips today's daily note). |
+| `recent_window_days` | int | `14` | Re-scan this many days of recent daily notes for now-lapsed ephemera *regardless of change* — expiry is time-triggered, so a pure changed-since-watermark set would never revisit "meeting Thursday" to archive it once Thursday passes. |
+| `model` | str | `qwen3.5:122b` | Model for the curator turn — deliberately bigger than the collector; supersession/dedup is relational judgment worth the cost. Per-deployment (source stays model-neutral). |
+| `near_neighbor_k` | int | `8` | Near-neighbours fetched per changed memory (via the existing hybrid search) so the curator can judge dedup/supersession against them. |
+| `max_files_per_run` | int | `0` | Caps candidate daily-note files per invocation (`0` = unlimited). The curator processes **one file per turn** regardless; this lets a large first bootstrap chunk across nights. |
+| `max_tool_turns` | int | `80` | Tool round-trips allowed per turn — the curator reads old notes/files before judging, so it needs more latitude than a collector flush. |
+| `num_predict` | int \| null | `16384` | Per-generation token cap for the curator turn (2× the global `ollama.num_predict`). A single `write_file` rewriting a whole daily note is large, and truncating it mid-file would corrupt memory. `null` inherits the global. |
+| `turn_timeout_s` | float | `1800.0` | Per-curation deadline. Generous — a full nightly groom on a large model legitimately takes a while. On timeout the pass is abandoned and retried next night (markdown is left valid). |
+| `superseded_archive_days` | int | `30` | The nightly whole-corpus supersession-review turn is handed the complete superseded list with each entry's age and archives ones superseded ~this many+ days ago, case-by-case. Age is measured from the *superseding* memory's `ts`. |
+
 ## `tz:` (top-level)
 
 Optional, top-level (not nested). IANA zone name used for every operator-facing timestamp claw renders: the inbound-message envelope (so the model sees today's date + day-of-week on every turn), the `memory/YYYY-MM-DD.md` daily-note filename, and the `lifecycle.daily_session_rotate_hour`. Internal/persisted timestamps (transcripts, memory sync state, compaction bookkeeping) stay UTC regardless. Omit (or `null`) for UTC. **Must be a valid IANA zone name installed in the host's tzdata** (e.g., `America/New_York`, `Europe/Berlin`).
