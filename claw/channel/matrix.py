@@ -670,6 +670,30 @@ class MatrixChannel:
         candidates.sort(reverse=True)
         return candidates[0][1]
 
+    def primary_session_key(self, peer_id: str) -> str | None:
+        """The ``session_key`` an *inbound* from ``peer_id`` would fold into —
+        i.e. the human-facing transcript for this conversation.
+
+        Used to mirror a synthetic turn's delivered reply (a cron reminder)
+        into the DM/room session the human actually replies in, so their
+        follow-up has context (see ``Agent._mirror_synthetic_reply``). Mirrors
+        ``send()``'s peer→room resolution exactly: an MXID resolves to its 1:1
+        DM room, a room id passes through. The returned key matches what
+        ``InboundMessage.__post_init__`` builds for a matrix inbound
+        (``f"{channel}_{room_id}"``). Returns None when the peer can't be
+        resolved to a joined room (no DM yet) — the same case where ``send()``
+        drops, so there is nothing to mirror into anyway.
+        """
+        if peer_id.startswith("@"):
+            room_id = self._resolve_room_for_user(peer_id)
+        elif peer_id.startswith("!"):
+            room_id = peer_id
+        else:
+            return None
+        if not room_id:
+            return None
+        return f"{self.name}_{room_id}"
+
     async def send(self, peer_id: str, text: str) -> None:
         if self._client is None:
             log.warning("send() before start(); dropping")

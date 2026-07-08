@@ -56,6 +56,15 @@ class FakeChannel:
     async def send(self, peer_id: str, text: str) -> None:
         self.sent.append((peer_id, text))
 
+    def primary_session_key(self, peer_id: str) -> str | None:
+        # Mirrors MatrixChannel: a room id / MXID maps to the matrix session
+        # key an inbound from that peer would fold into. (The real channel
+        # resolves an MXID to its DM room first; the fake has no room store,
+        # so tests exercising the mirror use a room id directly.)
+        if peer_id.startswith("@") or peer_id.startswith("!"):
+            return f"matrix_{peer_id}"
+        return None
+
     async def shutdown(self) -> None:
         self.shutdown_called = True
 

@@ -140,7 +140,7 @@ class MemoryCurationConfig:
     per night a larger model dedups near-identical memories (recurring-cron
     churn), marks superseded long-term facts with a forward ``[SUPERSEDED BY ->
     <id>]`` pointer (retrieval auto-follows old->new), and archives lapsed
-    ephemera out of the indexed daily notes into ``memory/archive.md``. All
+    ephemera out of the indexed daily notes into ``memory/archive/YYYY-MM.md``. All
     state lives in the markdown (the source of truth); ChromaDB/BM25 are
     re-derived, so ``rm -rf .memory/`` rebuilds everything intact.
 
@@ -152,11 +152,6 @@ class MemoryCurationConfig:
     # 122b off the user-reply path and sidesteps the collector/curator file
     # race (the curator also skips today's daily note).
     hour: int = 4
-    # The curator re-scans this many days of recent daily notes for now-lapsed
-    # ephemera regardless of change — expiry is time-triggered, not
-    # change-triggered, so a pure changed-since-watermark set would never
-    # revisit "meeting Thursday" to archive it once Thursday passes.
-    recent_window_days: int = 14
     # Bigger model than the collector — supersession/dedup is relational
     # judgment worth the cost. Per-deployment so source stays neutral.
     model: str = "qwen3.5:122b"

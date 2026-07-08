@@ -172,6 +172,32 @@ def _as_system_blockquote(text: str) -> str:
 _THINKING_ANSWER_SEP = "\u200b\n"
 
 
+# Provenance marker prepended (as its own user-slot row) to a cron reply when
+# it is mirrored into the human-facing session. Cron turns are stateless \u2014 they
+# keep no session transcript of their own (see _process_batch), so the mirror is
+# the *only* durable record of the interaction. It therefore carries both the
+# trigger prompt AND the reply, so a follow-up from the human reads against full
+# context (trigger \u2192 reply \u2192 their message) and the agent doesn't mistake the
+# mirrored reply for an answer to some missing user turn.
+#
+# It lives in the *content* of a user-role row, not a novel role: qwen3's chat
+# template silently drops messages whose role isn't system/user/assistant/tool
+# (verified empirically), so a "cron" role would vanish. User slot + a \u2699\ufe0f
+# self-label matches the existing persisted-annotation convention (the
+# missed-review turn, the per-turn envelope) that the model already reads as
+# meta without echoing. The row is transcript-only \u2014 never re-sent \u2014 so the
+# user never sees it.
+def _cron_mirror_note(trigger: str) -> str:
+    return (
+        "\u2699\ufe0f System note \u2014 not from the user. A scheduled (cron) trigger fired "
+        "with this instruction to you:\n\n"
+        f"{_quote_body(trigger)}\n\n"
+        "The assistant message that follows is the response you generated for "
+        "that trigger and delivered in this channel. Recorded for context in "
+        "case the user replies."
+    )
+
+
 class Agent:
     def __init__(
         self,
@@ -654,6 +680,53 @@ class Agent:
         the agent's primary channel (matrix) for matrix + synthetic channels."""
         return self._channels.get(channel_name, self.channel)
 
+    async def _mirror_synthetic_reply(
+        self, channel: Channel, peer_id: str, own_sid: str,
+        trigger: str, text: str,
+    ) -> None:
+        """Copy a cron turn's trigger + delivered reply into the human-facing
+        session for ``peer_id`` so a later reply from that human has context.
+
+        Cron turns are stateless (no session transcript of their own), and the
+        text delivered to ``deliver_to`` never lands in the matrix DM/room
+        transcript the human actually replies in. So this is the only durable
+        record: a user-slot provenance note carrying the ``trigger`` prompt,
+        then the assistant ``text``. The agent reads it as its own proactive
+        message (with the trigger that caused it), not an answer to a missing
+        user turn.
+
+        No-ops unless the outbound channel can resolve ``peer_id`` to a
+        *distinct* primary session (``primary_session_key``) — a normal matrix
+        turn resolves back to its own sid (guarded), and channels without the
+        capability are skipped. The two rows are appended under the target
+        session's lock, in one hold, so a mid-session compaction swap on that
+        session (which re-reads then rewrites the transcript) can neither split
+        the note from its reply nor race the append. Lock order is always
+        cron→matrix, never the reverse, so nesting it inside the cron turn's
+        own session lock can't deadlock.
+        """
+        resolver = getattr(channel, "primary_session_key", None)
+        if resolver is None:
+            return
+        try:
+            key = resolver(peer_id)
+        except Exception:
+            log.exception("[%s] primary_session_key(%s) raised", self.id, peer_id)
+            return
+        if not key:
+            return
+        target_sid = sid_for_key(key)
+        if target_sid == own_sid:
+            return
+        note = _cron_mirror_note(trigger)
+        async with self._session_lock(target_sid):
+            self.transcripts.append(target_sid, {"role": "user", "content": note})
+            self.transcripts.append(target_sid, {"role": "assistant", "content": text})
+        log.info(
+            "[%s] mirrored cron reply into primary session %s (from %s)",
+            self.id, target_sid, own_sid,
+        )
+
     async def handle_inbound(self, msg: InboundMessage) -> None:
         """Enqueue the message and signal the per-session drainer. Returns
         in microseconds so matrix-nio's sync_forever can immediately fire
@@ -761,10 +834,22 @@ class Agent:
         if channel is None:
             channel = self._channel_for(msgs[0].channel)
 
+        # Cron turns are stateless: each scheduled fire is an independent event,
+        # so it loads no prior history and writes no transcript of its own.
+        # Without this, every cron job delivering to a given target shared one
+        # rolling session and each fire answered against the *previous* cron
+        # job's turn — cross-event bleed. Continuity for cron comes from
+        # retrieved memory (relevance-ranked) instead, and the only durable
+        # record of the interaction is the mirror into the human-facing session
+        # (see _mirror_synthetic_reply). The sid still exists as a lock/drainer
+        # handle so cron turns stay concurrent with the human conversation.
+        stateless = msgs[0].channel == "cron"
+
         # Idle recap — runs at most once per session per process, on the
         # first turn we see. boot_recap_known_sessions() may have already
-        # run it; if not, we run it on demand.
-        recap_block = await self._idle_recap_for(sid)
+        # run it; if not, we run it on demand. Skipped for stateless turns
+        # (no transcript to recap).
+        recap_block = "" if stateless else await self._idle_recap_for(sid)
 
         # Combine the batch into one user-text. Each message keeps its
         # sender prefix so group-room attribution survives.
@@ -828,17 +913,21 @@ class Agent:
             log.exception("[%s] memory retrieve failed; continuing", self.id)
             retrieval_block = ""
 
-        self.transcripts.append(sid, {"role": "user", "content": user_text})
-
-        rows = self.transcripts.load(sid)
-
-        # If predicates trip, spawn a background flush+compact task. Doesn't
-        # block the user's reply — task runs concurrently with run_turn and
-        # subsequent turns. The atomic-swap pattern preserves any rows the
-        # agent appends during the work.
-        self._spawn_bg_compaction_if_needed(sid, list(rows))
-
-        history = [as_message(r) for r in rows]
+        user_row = {"role": "user", "content": user_text}
+        if stateless:
+            # No persistence, no prior history: this turn sees only its own
+            # (memory-augmented) prompt. Nothing to compact — the cron sid
+            # never accumulates a transcript.
+            history = [user_row]
+        else:
+            self.transcripts.append(sid, user_row)
+            rows = self.transcripts.load(sid)
+            # If predicates trip, spawn a background flush+compact task. Doesn't
+            # block the user's reply — task runs concurrently with run_turn and
+            # subsequent turns. The atomic-swap pattern preserves any rows the
+            # agent appends during the work.
+            self._spawn_bg_compaction_if_needed(sid, list(rows))
+            history = [as_message(r) for r in rows]
         system = self._build_system_prompt(
             retrieval_block, recap_block, modality=msgs[0].modality
         )
@@ -905,8 +994,9 @@ class Agent:
             current_turn_id.reset(tok_turn)
             current_sid.reset(tok_sid)
 
-        for m in new_messages:
-            self.transcripts.append(sid, m)
+        if not stateless:
+            for m in new_messages:
+                self.transcripts.append(sid, m)
 
         # Final-only reasoning surface (%thinking on). Sent AFTER the
         # transcript append (final_thinking is never in new_messages —
@@ -938,8 +1028,16 @@ class Agent:
             # true answer length and the separator never reaches the
             # transcript (final_text alone is what was appended above).
             pre_block = thinking_emitted or turn_id in self._system_emitted_turns
-            body = _THINKING_ANSWER_SEP + answer if pre_block else answer
-            await channel.send(peer_id, body)
+            send_body = _THINKING_ANSWER_SEP + answer if pre_block else answer
+            await channel.send(peer_id, send_body)
+
+        # A stateless cron turn leaves no transcript of its own, so mirror the
+        # trigger + delivered reply into the peer's human-facing session — the
+        # only durable record, and the context the human's follow-up needs.
+        # `body` is the raw trigger prompt(s) (unclobbered — the send text is
+        # the separately-named `send_body`); `answer` is the pristine reply.
+        if replied and stateless:
+            await self._mirror_synthetic_reply(channel, peer_id, sid, body, answer)
 
         # Close bracket, symmetric with "turn starting". INFO = metadata
         # only (visible under normal operation); the reply snippet is

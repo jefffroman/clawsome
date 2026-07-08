@@ -134,13 +134,14 @@ def test_resolve_supersession_no_duplicate_when_head_already_hit():
 
 def test_daily_notes_excludes_archive(tmp_path: Path):
     ws = tmp_path / "ws"
-    (ws / "memory").mkdir(parents=True)
+    (ws / "memory" / "archive").mkdir(parents=True)
     (ws / "memory" / "2026-06-28.md").write_text("## a\nbody\n")
-    (ws / "memory" / "archive.md").write_text("## old\nbody\n")
+    (ws / "memory" / "archive.md").write_text("## old\nbody\n")        # legacy flat
+    (ws / "memory" / "archive" / "2026-05.md").write_text("## s\nbody\n")  # sharded
     (ws / "memory" / "2026-06-28-note.md").write_text("journal only\n")
     idx = MemoryIndex("example", ws)
     names = {p.name for p in idx._daily_notes()}
-    assert names == {"2026-06-28.md"}                 # only date-shaped files
+    assert names == {"2026-06-28.md"}    # date-shaped only; archive/ subdir & flat excluded
 
 
 # --- working-set briefing selection (pure, fake index) ---------------------
@@ -167,31 +168,47 @@ def _section(source, section, content="content", **meta):
     return {"content": content, "metadata": {"source": source, "section": section, **meta}}
 
 
-def _h(content="content"):
-    import hashlib
-    return hashlib.sha1(content.encode()).hexdigest()
+def test_daily_note_date_parses_only_date_shaped():
+    assert mc._daily_note_date("memory/2026-06-27.md") == "2026-06-27"
+    assert mc._daily_note_date("MEMORY.md") is None
+    assert mc._daily_note_date("memory/archive/2026-05.md") is None  # shard, not a note
 
 
-def test_select_candidate_files_nightly_changed_and_recent():
+def test_iso_shift():
+    assert mc._iso_shift("2026-06-28", -1) == "2026-06-27"
+    assert mc._iso_shift("2026-03-01", -1) == "2026-02-28"
+
+
+def test_select_candidate_files_nightly_forward_of_cursor():
     today = "2026-06-28"
     sections = [
-        _section("memory/2026-06-28.md", "Today live"),        # excluded (today)
-        _section("memory/2026-06-27.md", "Changed one"),       # changed -> in
-        _section("memory/2026-06-26.md", "Unchanged recent"),  # recent -> in
-        _section("MEMORY.md", "Old root unchanged"),           # unchanged, not recent -> out
+        _section("memory/2026-06-28.md", "Today live"),     # excluded (today)
+        _section("memory/2026-06-27.md", "Yesterday"),      # after cursor -> in
+        _section("memory/2026-06-26.md", "Day before"),     # after cursor -> in
+        _section("memory/2026-06-20.md", "Before cursor"),  # at/before cursor -> out
+        _section("MEMORY.md", "Root"),                      # no filename date -> out
     ]
-    daily = ["2026-06-28.md", "2026-06-27.md", "2026-06-26.md"]
+    daily = ["2026-06-28.md", "2026-06-27.md", "2026-06-26.md", "2026-06-20.md"]
     mem = _FakeCurMemory(sections, daily)
-    prev = {
-        "memory/2026-06-26.md#Unchanged recent": _h(),
-        "MEMORY.md#Old root unchanged": _h(),
-    }
-    ordered, by_file, cur = mc._select_candidate_files(
-        mem, today, recent_window_days=14, full_corpus=False, prev_hashes=prev,
+    ordered, by_file = mc._select_candidate_files(
+        mem, today, curated_through="2026-06-25", full_corpus=False,
     )
     assert ordered == ["memory/2026-06-26.md", "memory/2026-06-27.md"]
-    assert "memory/2026-06-28.md" not in ordered    # today excluded
-    assert "MEMORY.md" not in ordered               # unchanged + out of window
+    assert "memory/2026-06-28.md" not in ordered   # today excluded
+    assert "memory/2026-06-20.md" not in ordered   # at/before cursor: never re-scanned
+    assert "MEMORY.md" not in ordered              # never a nightly candidate
+
+
+def test_select_candidate_files_excludes_note_dated_on_cursor():
+    # Strictly-after semantics: a note dated exactly ON the cursor is already
+    # curated and must not be re-selected.
+    today = "2026-06-28"
+    sections = [_section("memory/2026-06-27.md", "s"), _section("memory/2026-06-26.md", "s")]
+    mem = _FakeCurMemory(sections, ["2026-06-27.md", "2026-06-26.md"])
+    ordered, _ = mc._select_candidate_files(
+        mem, today, curated_through="2026-06-26", full_corpus=False,
+    )
+    assert ordered == ["memory/2026-06-27.md"]
 
 
 def test_select_candidate_files_fullcorpus_skips_fully_id_marked():
@@ -199,20 +216,21 @@ def test_select_candidate_files_fullcorpus_skips_fully_id_marked():
     sections = [
         _section("memory/2026-06-10.md", "A", mem_id="m-1"),   # fully id'd -> skip
         _section("memory/2026-06-11.md", "B"),                 # no id -> take
+        _section("MEMORY.md", "Root"),                         # bootstrap includes root
     ]
     mem = _FakeCurMemory(sections, ["2026-06-10.md", "2026-06-11.md"])
-    ordered, _, _ = mc._select_candidate_files(
-        mem, today, recent_window_days=14, full_corpus=True, prev_hashes={},
+    ordered, _ = mc._select_candidate_files(
+        mem, today, curated_through="", full_corpus=True,
     )
-    assert ordered == ["memory/2026-06-11.md"]      # resumable bootstrap
+    assert ordered == ["MEMORY.md", "memory/2026-06-11.md"]   # resumable; MEMORY.md sorts first
 
 
 def test_select_candidate_files_none_when_only_today():
     today = "2026-06-28"
     sections = [_section("memory/2026-06-28.md", "Only today")]
     mem = _FakeCurMemory(sections, ["2026-06-28.md"])
-    ordered, _, _ = mc._select_candidate_files(
-        mem, today, recent_window_days=14, full_corpus=False, prev_hashes={},
+    ordered, _ = mc._select_candidate_files(
+        mem, today, curated_through="2026-06-20", full_corpus=False,
     )
     assert ordered == []
 
@@ -324,16 +342,6 @@ def test_curator_search_tool_no_matches_when_only_today():
 def test_curation_config_has_superseded_archive_days_default():
     from claw.config import MemoryCurationConfig
     assert MemoryCurationConfig().superseded_archive_days == 30
-
-
-def test_recent_window_sources_respects_cutoff(tmp_path: Path):
-    ws = tmp_path / "ws"
-    (ws / "memory").mkdir(parents=True)
-    for name in ("2026-06-28.md", "2026-06-20.md", "2026-05-01.md"):
-        (ws / "memory" / name).write_text("## a\nbody\n")
-    idx = MemoryIndex("example", ws)
-    srcs = mc._recent_window_sources(idx, "2026-06-28", days=14)
-    assert srcs == {"memory/2026-06-28.md", "memory/2026-06-20.md"}  # 05-01 too old
 
 
 # --- record_action ledger tool (pure) --------------------------------------

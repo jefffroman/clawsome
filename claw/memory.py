@@ -45,12 +45,14 @@ EXCLUDED_SECTION_PATTERNS = re.compile(
 
 DAILY_NOTE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
-# The curator's archive sink. `memory/archive.md` (and any future
-# `archive-YYYY.md`) deliberately fails DAILY_NOTE_PATTERN, so `_daily_notes`
-# excludes it from BOTH indexing and the curator's recent-window rescan:
-# archived memories are preserved on disk, git-diffable, and never retrieved.
-# Keep any archive filename non-date-shaped if this pattern ever changes.
-ARCHIVE_NOTE = "archive.md"
+# The curator's archive sink: monthly shards under `memory/archive/YYYY-MM.md`.
+# They live in a SUBDIRECTORY, so the non-recursive `memory/*.md` source glob
+# never picks them up — archived memories are preserved on disk, git-diffable,
+# and never indexed/retrieved. Sharding keeps every archive file small so the
+# curator can grep/append cheaply instead of read-modify-writing a monolith.
+# (A legacy flat `memory/archive.md` also fails DAILY_NOTE_PATTERN, so any
+# pre-migration archive stays excluded from indexing too.)
+ARCHIVE_DIR = "archive"
 
 # Per-section memory marker, written as the first body line under a `##`
 # heading, e.g. `<!-- mem ts=2026-06-28 id=m-7f3a2c9e status=active
@@ -405,24 +407,16 @@ class MemoryIndex:
         judgment. Blocking (Chroma + BM25); call from an executor."""
         return self._hybrid_search(query, n=n)
 
-    def section_hashes(self) -> dict[str, str]:
-        """Per-section SHA1 keyed ``{source}#{section}`` over current content.
-        The curation watermark: sections whose hash differs from the stored
-        map are 'new/changed since last curation' and drive the dedup/
-        supersession pass."""
-        out: dict[str, str] = {}
-        for c in self._collect_sources():
-            key = f"{c['metadata']['source']}#{c['metadata']['section']}"
-            out[key] = hashlib.sha1(c["content"].encode("utf-8")).hexdigest()
-        return out
-
     def _curation_state_path(self) -> Path:
         return self.data_dir / "curation_state.json"
 
     def load_curation_state(self) -> dict[str, Any]:
-        """Returns the persisted curation state (``{sectionHashes, lastCurated}``)
-        or ``{}`` if missing/unreadable (caller treats absent hashes as
-        'everything is new')."""
+        """Returns the persisted curation state (``{curatedThrough, lastCurated}``)
+        or ``{}`` if missing/unreadable. ``curatedThrough`` is a ``YYYY-MM-DD``
+        date cursor: the latest daily note the curator has groomed. The nightly
+        selector walks strictly FORWARD from it — files at or before the cursor
+        are never re-scanned (they only resurface as near-neighbours), so the
+        curator is monotonic and its own edits never re-enqueue a file."""
         path = self._curation_state_path()
         if not path.exists():
             return {}
@@ -433,12 +427,12 @@ class MemoryIndex:
         except Exception:
             return {}
 
-    def write_curation_state(self, section_hashes: dict[str, str]) -> None:
+    def write_curation_state(self, curated_through: str) -> None:
         self._atomic_write_json(
             self._curation_state_path(),
             {
                 "agent_id": self.agent_id,
-                "sectionHashes": section_hashes,
+                "curatedThrough": curated_through,
                 "lastCurated": datetime.now(timezone.utc).isoformat(),
             },
         )

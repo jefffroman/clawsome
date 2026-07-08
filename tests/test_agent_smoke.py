@@ -133,6 +133,72 @@ def test_channel_for_falls_back_to_primary(
     assert agent._channel_for("cron") is fake_channel
 
 
+async def test_cron_turn_is_stateless_and_mirrors_trigger_and_reply(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """A cron turn is stateless — it writes NO transcript of its own — and its
+    trigger + delivered reply are mirrored into the human-facing (matrix)
+    session for the same peer. The mirror is a user-slot provenance note
+    carrying the trigger prompt, then the pristine assistant reply, so a
+    follow-up from the human reads against full context.
+    """
+    agent = _make_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
+                        fake_channel, transcripts)
+
+    # deliver_to is a room id here (the fake can't resolve MXID->DM room).
+    peer = "!room:example.org"
+    cron_sid = session_id("cron", peer)
+    trigger = "Remind the user that trash day is tomorrow."
+    msg = InboundMessage(
+        peer_id=peer, sender_name="cron", text=trigger, channel="cron",
+    )
+    await agent._process_batch(cron_sid, [msg], turn_id="c1")
+
+    # The reply was delivered over the (matrix) primary channel to the peer.
+    assert fake_channel.sent, "cron reply was not delivered"
+    assert fake_channel.sent[-1][0] == peer
+
+    # Stateless: the cron session accumulated NO transcript.
+    assert transcripts.load(cron_sid) == [], "cron turn should persist nothing"
+
+    # Mirrored into the matrix primary session: a user-slot note carrying the
+    # trigger prompt, then the pristine assistant reply.
+    matrix_sid = session_id("matrix", peer)
+    assert matrix_sid != cron_sid
+    mirrored = transcripts.load(matrix_sid)
+    assert len(mirrored) == 2, f"expected note + reply, got {mirrored}"
+    assert mirrored[0]["role"] == "user"
+    assert "cron" in mirrored[0]["content"].lower()
+    assert trigger in mirrored[0]["content"], "trigger prompt missing from note"
+    assert mirrored[1]["role"] == "assistant" and "hello back" in mirrored[1]["content"]
+
+
+async def test_matrix_turn_not_mirrored(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """A normal matrix turn is NOT mirrored: its own sid already equals the
+    channel's primary session key for the peer, so the equality guard makes
+    the mirror a no-op (no duplicate rows, no provenance note). It also
+    persists normally (not stateless)."""
+    agent = _make_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
+                        fake_channel, transcripts)
+    peer = "!room:example.org"
+    sid = session_id("matrix", peer)
+    msg = InboundMessage(
+        peer_id=peer, sender_name="user-1", text="hi",
+        channel="matrix", sender_id="@user-1:example.org",
+    )
+    await agent._process_batch(sid, [msg], turn_id="m1")
+
+    rows = transcripts.load(sid)
+    assert not any("System note" in (r.get("content") or "") for r in rows)
+    # Persisted normally: exactly one user turn (the real one) + assistant.
+    assert sum(1 for r in rows if r["role"] == "user") == 1
+    assert any(r["role"] == "assistant" for r in rows)
+    # Exactly one user turn (the real one) + assistant reply — no mirror dupes.
+    assert sum(1 for r in rows if r["role"] == "user") == 1
+
+
 async def test_system_block_gaps_the_answer(
     tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
 ):

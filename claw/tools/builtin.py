@@ -295,8 +295,11 @@ def build_builtin_tools(workspace_dir: Path) -> dict[str, Tool]:
         Tool(
             name="write_file",
             description=(
-                "Atomically write content to a path inside the agent's workspace. "
-                "Creates parent directories. Overwrites existing files."
+                "Atomically write a file inside the agent's workspace, creating "
+                "parent directories. Replaces the whole file — you must supply "
+                "its complete new contents, so cost scales with total file size. "
+                "For adding to the end of an existing (especially large) file, "
+                "use append_file instead."
             ),
             input_schema={
                 "type": "object",
@@ -312,12 +315,12 @@ def build_builtin_tools(workspace_dir: Path) -> dict[str, Tool]:
             name="append_file",
             description=(
                 "Atomically append content to a file inside the agent's "
-                "workspace, creating the file if it doesn't exist. Adds a "
-                "trailing newline if the content doesn't end with one. "
-                "Prefer this over read_file+write_file when you just want "
-                "to add new content at the end of an existing file — it's "
-                "one tool call instead of two and preserves prior content "
-                "by default."
+                "workspace, creating it if absent. Adds a trailing newline if "
+                "the content doesn't end with one. Strongly prefer this over "
+                "read_file+write_file for adding to the end of a file — "
+                "especially a large or append-only one (logs, archives): append "
+                "cost is fixed regardless of file size, whereas write_file must "
+                "re-emit the file's entire contents. Preserves prior content."
             ),
             input_schema={
                 "type": "object",

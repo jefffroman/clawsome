@@ -14,7 +14,7 @@ to specific keys point at `docs/configuration.md`.
 | Idle recap | Agent boot. Older than `compaction.idle_recap_seconds` → archive + recap; younger → transcript resumes intact, no recap | Synchronous, pre-live | `## Last Session Recap` row prepended on the fresh session; prior JSONL archived `.recap-<ts>` |
 | Periodic reindex | Maintenance loop, every 5 min, if memory source files' hash changed | Background asyncio task | Refreshed ChromaDB + BM25 + graph |
 | Daily session rotate | At `lifecycle.daily_session_rotate_hour` | Synchronous per session | Final memory_flush, JSONL archived `.reset-<ts>`, caches cleared |
-| Nightly curation (forgetory) | At `memory_curation.hour` (local tz), if `memory_curation.enabled` and the agent collects | Background asyncio task, one bounded turn per file | Deduped/superseded/archived markdown; ephemera moved to `memory/archive.md`; a reasoned line per decision in `/var/log/claw-curator.log` |
+| Nightly curation (forgetory) | At `memory_curation.hour` (local tz), if `memory_curation.enabled` and the agent collects | Background asyncio task, one bounded turn per file | Deduped/superseded/archived markdown; ephemera moved to `memory/archive/YYYY-MM.md`; a reasoned `claw.curator` line per decision in `claw.log` |
 
 ## Memory_flush in depth
 
@@ -174,33 +174,42 @@ bounded turn each), the curator may:
 - **supersede** — mark a stale long-term fact `supersededBy=<id>` pointing at
   the memory that replaced it (retrieval follows the chain);
 - **archive** — move lapsed ephemera (past appointments, "today is X") out of
-  the indexed daily notes into `memory/archive.md` (preserved with provenance,
-  never indexed — the filename isn't date-shaped);
+  the indexed daily notes into monthly shards `memory/archive/YYYY-MM.md`
+  (preserved with provenance, never indexed — they live in a subdirectory the
+  `memory/*.md` source glob doesn't recurse into). Sharding keeps each archive
+  file small so the curator appends cheaply instead of rewriting a monolith;
 - **uncertain** — leave a memory in place with an inline caveat when a
   judgment (e.g., a dangling `supersededBy`) can't be made safely.
 
-**File selection.** The curator processes files whose section hashes changed
-since the last pass (a watermark at `<workspace>/.memory/curation_state.json`,
-written only by the curator) **plus** every daily note within
-`recent_window_days` (so time-lapsed ephemera gets revisited even if the file
-didn't change). Separately, a **whole-corpus supersession-review turn** runs
-every pass — it's handed the complete superseded list (any age, not
-window-limited) with each entry's age and archives ones stale for
+**File selection (forward-only date cursor).** Nightly the curator grooms only
+daily notes dated **after** `curatedThrough` and **before** today, then advances
+the cursor to the last contiguously-curated date (a timeout pins it so that note
+retries next night rather than being skipped). `curatedThrough` (a `YYYY-MM-DD`
+date at `<workspace>/.memory/curation_state.json`) makes the curator monotonic:
+files at/before it are never re-scanned — they resurface only as near-neighbours
+when a newer note supersedes them — so the curator's own edits to a prior note
+never re-enqueue it. In steady state that's just yesterday's completed note.
+`MEMORY.md` carries no filename date and is **never** a nightly candidate; it's
+maintained as a side effect of curating the notes that supersede it (a
+full-corpus bootstrap still grooms it). Separately, a **whole-corpus
+supersession-review turn** runs every pass — handed the complete superseded list
+(any age, not window-limited) with each entry's age, archiving ones stale for
 ~`superseded_archive_days`+, case-by-case. Today's daily note is excluded from
 curation (it's still being written by the collector).
 
 **Audit trail.** The curator narrates its own decisions via a `record_action`
-tool — one reasoned line per `archive`/`supersede`/`dedup`/`uncertain` to
-`/var/log/claw-curator.log`. This is the primary window into *why* it did what
-it did; watch it for the first few nights after enabling.
+tool — one reasoned `claw.curator` line per `archive`/`supersede`/`dedup`/
+`uncertain` in `claw.log` (grep `claw.curator`). This is the primary window into
+*why* it did what it did; watch it for the first few nights after enabling.
 
-**First run re-curates everything (expected).** The watermark is written only
-by the curator, so before the first-ever pass `prev_hashes` is empty and every
-section reads as "changed" → the whole corpus is selected. On a large existing
-memory that first pass is long (one model turn per file). Either let it run
-(subsequent nights select only recent+changed files), cap it with
-`max_files_per_run` to chunk across nights, or — if you've just curated by hand
-— seed the watermark first so the first nightly sees only genuine changes.
+**Bootstrap the backlog, then seed the cursor.** There's no date cursor before
+the first-ever pass. Run the one-off full-corpus bootstrap
+(`python -m claw.memory_curate --config … --agent … [--dry-run]`), which grooms
+every not-yet-id-marked file (resumable — it skips fully-marked ones), optionally
+capped with `max_files_per_run` to chunk across runs. Once the backlog is clean,
+seed `curatedThrough` to the last curated date so the first nightly starts from
+there; if the cursor is ever missing, the nightly pass conservatively assumes
+everything through yesterday is done rather than re-curating the corpus.
 
 ## Matrix bot first-deploy
 

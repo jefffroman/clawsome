@@ -62,6 +62,14 @@ class Channel(Protocol):
     def typing(self, peer_id: str) -> AsyncContextManager[None]: ...
     async def clear_typing(self, peer_id: str) -> None: ...
 
+    # Optional capability — probed via ``getattr`` by the agent, not required.
+    # Returns the ``session_key`` an inbound from ``peer_id`` would fold into,
+    # so a synthetic turn (cron) can mirror its delivered reply into the
+    # human-facing session. Only channels that carry a distinct human-facing
+    # session (matrix) implement it; others simply omit it and mirroring
+    # no-ops. See ``MatrixChannel.primary_session_key``.
+    def primary_session_key(self, peer_id: str) -> str | None: ...
+
 
 @asynccontextmanager
 async def no_typing(_peer_id: str):

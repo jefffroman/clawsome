@@ -162,7 +162,6 @@ block optional; **coupled to `memory_flush`** — it only runs for agents whose
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch. Off by default — opt in per deployment. |
 | `hour` | int | `4` | Local-tz hour (0–23) for the nightly pass. A quiet hour keeps the big model off the reply path and sidesteps the collector/curator file race (the curator also skips today's daily note). |
-| `recent_window_days` | int | `14` | Re-scan this many days of recent daily notes for now-lapsed ephemera *regardless of change* — expiry is time-triggered, so a pure changed-since-watermark set would never revisit "meeting Thursday" to archive it once Thursday passes. |
 | `model` | str | `qwen3.5:122b` | Model for the curator turn — deliberately bigger than the collector; supersession/dedup is relational judgment worth the cost. Per-deployment (source stays model-neutral). |
 | `near_neighbor_k` | int | `8` | Near-neighbours fetched per changed memory (via the existing hybrid search) so the curator can judge dedup/supersession against them. |
 | `max_files_per_run` | int | `0` | Caps candidate daily-note files per invocation (`0` = unlimited). The curator processes **one file per turn** regardless; this lets a large first bootstrap chunk across nights. |

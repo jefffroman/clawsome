@@ -99,9 +99,6 @@ memory_curation:                        # nightly "forgetory" curator — a
   enabled: true
   hour: 4                               # local-tz hour (quiet: off the reply
                                         # path; curator skips today's note).
-  recent_window_days: 14                # re-scan this many days of recent notes
-                                        # for now-lapsed ephemera (time-, not
-                                        # change-, triggered).
   model: qwen3.5:122b                   # bigger model: supersession/dedup is
                                         # relational judgment worth the cost.
   near_neighbor_k: 8                    # near-neighbours per changed memory,

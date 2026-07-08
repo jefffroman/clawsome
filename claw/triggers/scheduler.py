@@ -5,9 +5,15 @@ enabled entry. When a job fires, dispatch synthesizes an
 ``InboundMessage(channel="cron", peer_id="heartbeat", text=<configured
 message>)`` and calls ``agent.handle_inbound`` — the agent then runs the
 same pipeline as a Matrix DM (memory retrieval, compaction, ollama
-tool-loop). Cron-driven replies typically reach the operator via tool
-calls (e.g., a notification skill posting to Matrix) rather than the
-channel-echo path.
+tool-loop). Cron turns are *stateless* — they load no prior history and
+persist no transcript (each scheduled fire is independent; continuity comes
+from retrieved memory), so the ``cron_<deliver_to>`` sid is only a
+lock/drainer handle. Cron-driven replies reach the operator either via tool
+calls (e.g., a notification skill posting to Matrix) or the channel-echo
+path (the turn's final text delivered to ``deliver_to``). A channel-echo
+reply — with its trigger prompt — is mirrored into the peer's human-facing
+session so a follow-up has context; that mirror is the only durable record
+of the interaction. See ``Agent._mirror_synthetic_reply``.
 
 ``jobs.json`` schema (flat list of job entries on disk):
 

@@ -82,6 +82,24 @@ For every inbound message:
 6. **Persist & reply.** Final assistant text goes to the transcript and to
    `channel.send(peer_id, text)`.
 
+**Stateless cron turns + mirroring.** A scheduled (cron) turn is *stateless*:
+each fire is an independent event, so it loads no prior history and writes no
+transcript of its own. (Otherwise every job delivering to a target shared one
+rolling `cron_<deliver_to>` session and each fire answered against the previous
+job's turn — cross-event bleed. Continuity for cron comes from retrieved memory
+instead, which is relevance-ranked.) The sid still exists as a lock/drainer
+handle, so cron turns run concurrently with — and never interleave into — the
+human's conversation.
+
+Because a cron turn persists nothing, the reply it *delivers* would vanish from
+the record — so after step 6 the trigger prompt + delivered reply are mirrored
+into the peer's human-facing session (`channel.primary_session_key(peer_id)`
+resolves it, e.g. an MXID → its DM room's `matrix_<room>` sid). This is the only
+durable record of the interaction, and the context the human's follow-up needs.
+The mirror is a user-slot provenance note carrying the trigger + the pristine
+assistant reply, appended under the target session's lock. Ordinary matrix turns
+resolve to their own sid and are skipped by an equality guard.
+
 Steps 1–4 happen on the user-reply critical path. Steps 5–6 dominate
 latency (Ollama generation). Background tasks (compaction, memory_flush,
 reindex) run off this path.

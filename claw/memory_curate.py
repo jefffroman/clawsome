@@ -9,21 +9,28 @@ per night a larger model grooms each agent's markdown memory:
   with ``supersededBy=<id>``; retrieval auto-follows old->new so the timeline
   stays visible (see ``MemoryIndex._resolve_supersession``);
 - **archive** — move lapsed ephemera (past appointments, "today is X") out of
-  the indexed daily notes into ``memory/archive.md`` (preserved, never
-  retrieved);
+  the indexed daily notes into monthly shards under ``memory/archive/`` (preserved,
+  never retrieved);
 - **uncertain** — flag genuine unresolved contradictions with an inline caveat.
 
 Markdown is the source of truth: the curator edits the ``.md`` files directly
 and the index is re-derived, so ``rm -rf .memory/`` rebuilds everything intact.
 Because the edits are agentic (the model investigates and rewrites files
-itself), the audit trail is ``/var/log/claw-curator.log``: a reasoned action
-ledger the curator writes itself via the ``record_action`` tool — one line per
-archive/supersede/dedup/uncertain decision with its justification — interleaved
+itself), the audit trail is the reasoned action ledger the curator writes via
+the ``record_action`` tool — one ``claw.curator`` log line per
+archive/supersede/dedup/uncertain decision with its justification, interleaved
 with the harness's own progress lines (working-set size, per-file start,
-timeouts). The mechanical per-tool-call spam is intentionally *not* logged here;
-claw.log already records tool-call names per turn, and the ``reason`` field
-captures the conclusion of any investigation. The markdown diff is the ground
-truth for the edits themselves.
+timeouts). These land in claw.log alongside the per-turn tool-call names; the
+``reason`` field captures the conclusion of any investigation, and the markdown
+diff is the ground truth for the edits themselves.
+
+Nightly selection is a monotonic **date cursor** (``curatedThrough`` in
+``curation_state.json``): each pass grooms only daily notes dated after the
+cursor and before today, then advances the cursor. Files at/before the cursor
+are never re-scanned — they resurface only as near-neighbours when a newer note
+supersedes them — so the curator can edit any prior file without re-enqueuing
+it. MEMORY.md is groomed only during a full-corpus bootstrap; nightly it is
+maintained purely as a side effect of curating the notes that supersede it.
 
 The curator is coupled to the collector: it only runs for agents when
 ``memory_flush`` is enabled (no memory collected -> nothing to curate).
@@ -38,14 +45,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import logging
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from claw.config import Config, load
-from claw.memory import ARCHIVE_NOTE, MemoryIndex
+from claw.memory import ARCHIVE_DIR, DAILY_NOTE_PATTERN, MemoryIndex
 from claw.memory_flush import today_iso_date
 from claw.ollama import OllamaClient
 from claw.tools.base import Tool
@@ -53,10 +59,22 @@ from claw.tools.memory_search import build_curator_search_tool
 
 log = logging.getLogger("claw.memory_curate")
 
-# Workspace-relative path to the curator's non-indexed archive sink. Single
-# sourced from memory.ARCHIVE_NOTE so the "not date-shaped -> not indexed"
-# guarantee and this path can never drift apart.
-ARCHIVE_PATH = f"memory/{ARCHIVE_NOTE}"
+# Workspace-relative directory for the curator's non-indexed archive shards
+# (``memory/archive/YYYY-MM.md``). Single-sourced from memory.ARCHIVE_DIR so the
+# "in a subdir -> not indexed" guarantee and this path can never drift apart.
+ARCHIVE_DIR_PATH = f"memory/{ARCHIVE_DIR}"
+
+
+def _daily_note_date(src: str) -> str | None:
+    """The ``YYYY-MM-DD`` date of a daily-note source key (``memory/<date>.md``),
+    or None if it isn't a date-shaped daily note (e.g. MEMORY.md)."""
+    name = src.rsplit("/", 1)[-1]
+    return name[:-3] if DAILY_NOTE_PATTERN.match(name) else None
+
+
+def _iso_shift(day: str, delta: int) -> str:
+    return (date.fromisoformat(day) + timedelta(days=delta)).isoformat()
+
 
 # Tools the curator gets — a narrowed, investigation-capable set pulled from the
 # agent's full registry (no subagent_*/cron_*/web_search).
@@ -67,29 +85,17 @@ CURATOR_TOOL_NAMES = (
 # Mutating tools whose calls are recorded to the audit log.
 _MUTATING_TOOLS = ("write_file", "append_file", "bash")
 
-_CURATOR_LOG_PATH = "/var/log/claw-curator.log"
-
 
 # --- audit logging ----------------------------------------------------------
 
 def curator_logger() -> logging.Logger:
-    """Dedicated logger writing to ``/var/log/claw-curator.log`` (the audit
-    trail for the agentic edits). Falls back to the default handlers if the
-    file isn't writable (e.g. a dev box running the bootstrap CLI)."""
+    """The curator's audit logger (``claw.curator``). It owns no handlers of its
+    own — records propagate to the root handlers and land in claw.log, tagged
+    ``claw.curator`` so the reasoned action ledger stays greppable
+    (``grep claw.curator``). One line per archive/supersede/dedup/uncertain
+    decision, interleaved with the harness's progress lines."""
     logger = logging.getLogger("claw.curator")
-    if getattr(logger, "_curator_configured", False):
-        return logger
     logger.setLevel(logging.INFO)
-    try:
-        h = logging.FileHandler(_CURATOR_LOG_PATH)
-        h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        logger.addHandler(h)
-    except OSError:
-        logger.warning(
-            "curator log %s not writable; using default handlers",
-            _CURATOR_LOG_PATH,
-        )
-    logger._curator_configured = True  # type: ignore[attr-defined]
     return logger
 
 
@@ -113,8 +119,8 @@ def build_record_action_tool(
     """The curator's own decision ledger. Every archive/supersede/dedup/uncertain
     edit must be preceded by a ``record_action`` call, so the audit trail carries
     the model's *reasoning* — not just the mechanical tool call (which claw.log
-    already records per turn). One reasoned line per decision lands in
-    ``/var/log/claw-curator.log``."""
+    already records per turn). One reasoned ``claw.curator`` line per decision
+    lands in claw.log."""
     async def _run(args: dict[str, Any]) -> str:
         action = (args.get("action") or "").strip().lower()
         target = (args.get("target") or "").strip()
@@ -221,76 +227,50 @@ def _marker_display(meta: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _recent_window_sources(
-    memory: MemoryIndex, today: str, days: int,
-) -> set[str]:
-    """Source keys of daily notes whose filename-date is within ``days`` of
-    today — the time-triggered rescan set for lapsed ephemera."""
-    try:
-        cutoff = date.fromisoformat(today) - timedelta(days=days)
-    except ValueError:
-        return set()
-    out: set[str] = set()
-    for p in memory._daily_notes():
-        try:
-            d = date.fromisoformat(p.name[:-3])
-        except ValueError:
-            continue
-        if d >= cutoff:
-            out.add(f"memory/{p.name}")
-    return out
-
-
-def _section_key(c: dict[str, Any]) -> str:
-    return f"{c['metadata']['source']}#{c['metadata']['section']}"
-
-
 def _select_candidate_files(
     memory: MemoryIndex,
     today: str,
-    recent_window_days: int,
+    curated_through: str,
     full_corpus: bool,
-    prev_hashes: dict[str, str],
-) -> tuple[list[str], dict[str, list[dict[str, Any]]], dict[str, str]]:
+) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
     """Group current sections by source file and choose which files get a
-    curation turn this run. Returns ``(ordered_files, by_file, cur_hashes)``.
+    curation turn this run. Returns ``(ordered_files, by_file)``.
 
     The curator processes ONE file per turn (a whole-corpus briefing wouldn't
     fit context), so the working set is a list of *files*:
     - today's daily note is always excluded (the collector may be appending);
-    - ``full_corpus`` (bootstrap): every non-today file whose sections aren't
-      ALL already id-marked — so an interrupted bootstrap resumes (fully
-      curated files are skipped);
-    - nightly: files with a section changed since the watermark, plus
-      recent-window files re-scanned for lapsed ephemera.
+    - ``full_corpus`` (bootstrap): every non-today file (incl. MEMORY.md) whose
+      sections aren't ALL already id-marked — so an interrupted bootstrap
+      resumes (fully curated files are skipped);
+    - nightly: daily notes dated strictly AFTER ``curated_through`` and BEFORE
+      today. This is a forward-only cursor — files at/before it are never
+      re-scanned (they resurface only as near-neighbours), so the curator's own
+      edits to a prior note never re-enqueue it. MEMORY.md carries no filename
+      date and is therefore never a nightly candidate; it's maintained as a
+      side effect of curating the notes that supersede it.
+
+    Both branches return files in chronological order (MEMORY.md sorts first),
+    which the caller relies on to advance the cursor contiguously.
     """
     by_file: dict[str, list[dict[str, Any]]] = {}
-    cur_hashes: dict[str, str] = {}
     for c in memory.collect_sections():
-        cur_hashes[_section_key(c)] = hashlib.sha1(
-            c["content"].encode("utf-8")
-        ).hexdigest()
         by_file.setdefault(c["metadata"]["source"], []).append(c)
 
     today_src = f"memory/{today}.md"
-    recent_srcs = _recent_window_sources(memory, today, recent_window_days)
 
     ordered: list[str] = []
     for src in sorted(by_file):  # MEMORY.md first, then daily notes chronological
         if src == today_src:
             continue
-        secs = by_file[src]
         if full_corpus:
-            take = not all(c["metadata"].get("mem_id") for c in secs)
-        else:
-            changed = any(
-                prev_hashes.get(_section_key(c)) != cur_hashes[_section_key(c)]
-                for c in secs
-            )
-            take = changed or src in recent_srcs
-        if take:
+            secs = by_file[src]
+            if not all(c["metadata"].get("mem_id") for c in secs):
+                ordered.append(src)
+            continue
+        d = _daily_note_date(src)
+        if d is not None and curated_through < d < today:
             ordered.append(src)
-    return ordered, by_file, cur_hashes
+    return ordered, by_file
 
 
 def _build_file_briefing(
@@ -452,9 +432,9 @@ def _curation_system_prompt(today: str) -> str:
         "are more than a day old. Lift out any durable fact they carry first "
         "(a rescheduled appointment, a new standing arrangement) as its own "
         "memory — but the fired/delivered log itself is not worth keeping. "
-        "Move the ENTIRE `##` section out of its daily note into "
-        f"`{ARCHIVE_PATH}`, setting `status=archived` on its marker. Archived "
-        "memories are preserved on disk but never retrieved.\n"
+        "Move the ENTIRE `##` section out of its daily note into the archive "
+        f"(`{ARCHIVE_DIR_PATH}/YYYY-MM.md`), setting `status=archived` on its "
+        "marker. Archived memories are preserved on disk but never retrieved.\n"
         "4. **Uncertain.** Reserve ONLY for a genuine conflict, contradiction, "
         "or glaring illogic between memories that you cannot resolve — NOT for "
         "facts you merely can't verify right now (absence of proof is not a "
@@ -464,11 +444,18 @@ def _curation_system_prompt(today: str) -> str:
         "## How to edit (mechanics)\n"
         "- ARCHIVE a section: `read_file` the daily note, `write_file` it back "
         "WITHOUT that section, then `append_file` the removed section (marker "
-        f"set to `status=archived`) to `{ARCHIVE_PATH}`.\n"
-        "- Mark SUPERSESSION / add an id / add a caveat: `read_file` the file, "
-        "edit the one section's marker or text, `write_file` the whole file "
-        "back. Change ONLY the intended section.\n"
-        "- Use `bash` (grep/cat) to investigate, but make all changes via "
+        f"set to `status=archived`) to `{ARCHIVE_DIR_PATH}/YYYY-MM.md`, where "
+        "`YYYY-MM` is the year-month of the note you took it from (e.g. a "
+        f"section from `memory/2026-05-13.md` -> `{ARCHIVE_DIR_PATH}/2026-05.md`). "
+        "ALWAYS reach the archive with `append_file` — NEVER `read_file` or "
+        "`write_file` it. The archive is large and append-only; rewriting it "
+        "means re-emitting the whole file and will time out. To check whether "
+        "something is already archived, `bash` a bounded `grep` over "
+        f"`{ARCHIVE_DIR_PATH}/`, never a full read.\n"
+        "- Mark SUPERSESSION / add an id / add a caveat: `read_file` the daily "
+        "note, edit the one section's marker or text, `write_file` the whole "
+        "note back. Change ONLY the intended section.\n"
+        "- Use `bash` (grep) to investigate, but make all changes via "
         "read_file/write_file/append_file.\n\n"
         "## Record every decision (REQUIRED)\n"
         "IMMEDIATELY BEFORE each archive/supersede/dedup/uncertain edit, call "
@@ -480,7 +467,7 @@ def _curation_system_prompt(today: str) -> str:
         "needs no record_action — only the four decision types do.)\n\n"
         "## Rules\n"
         "- Edit ONLY: `MEMORY.md`, `memory/YYYY-MM-DD.md` daily notes, and "
-        f"`{ARCHIVE_PATH}`.\n"
+        f"archive shards `{ARCHIVE_DIR_PATH}/YYYY-MM.md` (append-only).\n"
         f"- NEVER edit today's note `memory/{today}.md` — a live session may be "
         "appending to it.\n"
         "- NEVER touch IDENTITY/USER/SOUL/AGENTS/TOOLS files, transcripts, or "
@@ -503,10 +490,13 @@ def _supersession_review_prompt(today: str, archive_days: int) -> str:
         f"- **Archive** it when its replacement is PRESENT and it has been "
         f"superseded long enough (rule of thumb ~{archive_days}+ days, measured "
         "from the replacement's date) that its history no longer earns its keep. "
-        f"Move the ENTIRE `##` section out of its daily note into `{ARCHIVE_PATH}` "
-        "with `status=archived`: `read_file` the note, `write_file` it back "
-        "without that section, then `append_file` the section (marker flipped to "
-        "`status=archived`, keep its id/ts/supersededBy) to the archive.\n"
+        "Move the ENTIRE `##` section out of its daily note into the archive "
+        f"shard `{ARCHIVE_DIR_PATH}/YYYY-MM.md` (year-month of the note it came "
+        "from) with `status=archived`: `read_file` the note, `write_file` it "
+        "back without that section, then `append_file` the section (marker "
+        "flipped to `status=archived`, keep its id/ts/supersededBy) to the "
+        "shard. ALWAYS `append_file` the archive — NEVER `read_file`/`write_file` "
+        "it (it's large and append-only; rewriting it times out).\n"
         "- **Flag uncertain** when its replacement is MISSING (the supersededBy "
         "id matches no existing memory): the supersession can't be verified, so "
         "do NOT archive. Instead add a short inline caveat to the memory's text "
@@ -518,7 +508,8 @@ def _supersession_review_prompt(today: str, archive_days: int) -> str:
         "Use `memory_search` (it returns ids) and `read_file` to confirm the "
         "replacement really is the current canonical version before archiving. "
         "Be conservative: when unsure, keep.\n\n"
-        f"Edit ONLY daily notes and `{ARCHIVE_PATH}`. NEVER edit today's note "
+        f"Edit ONLY daily notes and append-only archive shards "
+        f"`{ARCHIVE_DIR_PATH}/YYYY-MM.md`. NEVER edit today's note "
         f"`memory/{today}.md`, and never touch IDENTITY/USER/SOUL/AGENTS/TOOLS, "
         "transcripts, or `.memory/`.\n\n"
         "IMMEDIATELY BEFORE each archive or uncertain-flag edit, call "
@@ -546,18 +537,25 @@ async def run_curation_turn(
     """Run a curation pass for an agent: ONE curator turn per candidate file
     (per-file batching — a whole-corpus briefing wouldn't fit context), THEN one
     whole-corpus supersession-review turn that GCs long-superseded memories.
-    Each per-file turn investigates and edits that file itself; the watermark is
-    advanced per file so an interrupted run resumes. The review turn runs every
-    pass, independent of the working set. Returns True iff anything was curated."""
+    Each per-file turn investigates and edits that file itself. Nightly selection
+    walks a forward-only date cursor (``curatedThrough``): only daily notes after
+    it and before today are groomed, and the cursor advances to the last
+    contiguously-curated date so a timeout retries that note next night rather
+    than skipping it. The review turn runs every pass, independent of the working
+    set. Returns True iff anything was curated."""
     today = today_iso_date(cfg.tz)
     cur = cfg.memory_curation
-    prev_hashes = memory.load_curation_state().get("sectionHashes", {}) or {}
+    # Forward-only cursor: the latest daily note already groomed. Absent (fresh
+    # deploy / post-bootstrap) -> assume everything through yesterday is clean so
+    # we don't re-curate the backlog; the one-off migration seeds it explicitly.
+    curated_through = memory.load_curation_state().get("curatedThrough") \
+        or _iso_shift(today, -1)
 
     loop = asyncio.get_running_loop()
     async with memory.lock:
-        ordered, by_file, _ = await loop.run_in_executor(
+        ordered, by_file = await loop.run_in_executor(
             None, _select_candidate_files,
-            memory, today, cur.recent_window_days, full_corpus, prev_hashes,
+            memory, today, curated_through, full_corpus,
         )
 
     curator_tools = _curator_tools(tools, logger, agent_id, dry_run)
@@ -579,8 +577,9 @@ async def run_curation_turn(
         agent_id, today, full_corpus, dry_run, len(ordered),
     )
 
-    seen = dict(prev_hashes)
     done = 0
+    blocked = False  # once a file fails, stop advancing the cursor past it
+    new_cursor = curated_through
     for i, src in enumerate(ordered, 1):
         async with memory.lock:
             briefing = await loop.run_in_executor(
@@ -608,31 +607,34 @@ async def run_curation_turn(
                 "[%s] curation of %s timed out after %.0fs; moving on",
                 agent_id, src, cur.turn_timeout_s,
             )
+            blocked = True
             continue
         except Exception:
             log.exception("[%s] curation of %s raised; moving on", agent_id, src)
+            blocked = True
             continue
         done += 1
-        # Resumable watermark: refresh this file's section hashes from disk
-        # (post-edit) so a re-run skips it. Section keys are prefixed by
-        # source, so drop the file's old keys and overlay its current ones.
-        if not dry_run:
+        # Advance the cursor to this note's date — but only while the run is
+        # still contiguous from the cursor (ordered is chronological), so a
+        # failed note pins the cursor at the last clean date and retries next
+        # night rather than being skipped.
+        if not blocked:
+            d = _daily_note_date(src)
+            if d and d > new_cursor:
+                new_cursor = d
+
+    # Persist the forward-only cursor (nightly only; a full-corpus bootstrap is
+    # operator-driven and seeds the cursor out-of-band once it's fully clean).
+    # A clean nightly run covers everything through yesterday — including gap
+    # days with no note — so jump the cursor there.
+    if not dry_run and not full_corpus:
+        if not blocked:
+            new_cursor = max(new_cursor, _iso_shift(today, -1))
+        if new_cursor != curated_through:
             try:
-                fresh = await loop.run_in_executor(None, memory.section_hashes)
-                pfx = src + "#"
-                seen = {k: v for k, v in seen.items() if not k.startswith(pfx)}
-                seen.update({k: v for k, v in fresh.items() if k.startswith(pfx)})
-                memory.write_curation_state(seen)
+                memory.write_curation_state(new_cursor)
             except OSError:
                 log.exception("[%s] failed to persist curation state", agent_id)
-
-    # Final clean baseline over the whole corpus (captures cross-file edits,
-    # e.g. supersededBy pointers added into MEMORY.md).
-    if not dry_run and done:
-        try:
-            memory.write_curation_state(memory.section_hashes())
-        except OSError:
-            log.exception("[%s] failed to persist final curation state", agent_id)
 
     # Whole-corpus supersession review — runs every pass, independent of the
     # per-file working set, so memories superseded long ago still get GC'd on
@@ -700,13 +702,8 @@ async def _run_supersession_review(
     except Exception:
         log.exception("[%s] supersession review raised", agent_id)
         return False
-    if not dry_run:
-        try:
-            memory.write_curation_state(memory.section_hashes())
-        except OSError:
-            log.exception(
-                "[%s] failed to persist curation state after review", agent_id,
-            )
+    # No cursor write here: the review edits OLD (pre-cursor) files, and the
+    # forward-only date cursor already guarantees they're never re-enqueued.
     return True
 
 
