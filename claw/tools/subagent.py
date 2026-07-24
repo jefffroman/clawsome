@@ -14,6 +14,18 @@ sender_name="subagent:<persona>:<task_id>")`` into the parent's
 drainer — the parent's next turn carries the result in context.
 ``subagent_status(task_id)`` exists for explicit polling.
 
+The completion the parent sees is deliberately compact: the caller-
+supplied ``task_name`` (so it knows which task finished) plus a short
+response preview and the workspace path of the full record, which is
+spooled to ``<workspace>/.tool-results/<sid>/``. The spool file holds the
+original **prompt** *and* the full **result** — the prompt is preserved
+there (its only on-disk home; the transcript stubs the spawn-call args and
+the registry is in-memory) but is NOT echoed into the transcript, and the
+full result is NOT inlined — that round-trip was the dominant
+transcript-bloat source, since (unlike tool results) it bypassed the
+persistence-side truncation. Have subagents pass/return file paths,
+not contents.
+
 Spawn permission is per-agent: each agent carries a
 ``remaining_spawn_budget`` (top-level agents seed it from
 ``AgentConfig.max_spawn_depth``; forks compute
@@ -35,9 +47,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claw.channel.base import InboundMessage
@@ -58,6 +72,12 @@ ABSOLUTE_MAX_CHAIN_DEPTH = 5
 # entries are evicted; running entries are never evicted.
 _MAX_REGISTRY_SIZE = 100
 
+# A subagent's full result is spooled to a workspace file; only this many
+# leading chars are inlined into the completion the parent receives. Keeps a
+# large result (e.g. a whole HTML file) out of the parent's persisted
+# transcript — the parent read_file's the spooled path for the full output.
+_RESULT_PREVIEW_CHARS = 200
+
 
 @dataclass
 class ChildTask:
@@ -75,6 +95,13 @@ class ChildTask:
     status: str = "running"  # running | completed | failed | cancelled
     completed_at: datetime | None = None
     result: str | None = None
+    # Short caller-supplied label, echoed back in the completion so the parent
+    # can match a result to its request without the prompt being echoed
+    # verbatim. The subagent itself never sees it.
+    task_name: str = ""
+    # Workspace-relative path of the spooled full result, set once the child
+    # finishes. None if there was nothing to spool or the write failed.
+    result_path: str | None = None
     aio_task: asyncio.Task | None = field(default=None, repr=False)
     # Turn that rooted this spawn (inherited transitively through the
     # cascade) — %stop cancels by this. Empty if spawned outside a turn.
@@ -109,6 +136,65 @@ def _format_elapsed(seconds: float) -> str:
     return f"{h}h{m % 60}m"
 
 
+def _task_slug(name: str, maxlen: int = 40) -> str:
+    """Filesystem-safe slug from a task_name, for the spool filename."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return slug[:maxlen].strip("-") or "task"
+
+
+def _result_preview(result: str) -> str:
+    if len(result) <= _RESULT_PREVIEW_CHARS:
+        return result
+    more = len(result) - _RESULT_PREVIEW_CHARS
+    return f"{result[:_RESULT_PREVIEW_CHARS]}… (+{more:,} more chars in the file)"
+
+
+def _spool_contents(ct: "ChildTask") -> str:
+    """The full spool payload: a task header, the ORIGINAL PROMPT, then the
+    RESULT.
+
+    The prompt is included here because the spool is the **only** place it's
+    kept on disk — the parent's persisted transcript stubs the spawn-call args
+    once they pass 200 chars (``_truncate_persisted_tool_call_args``), the
+    spawn log line records only metadata, and the in-memory registry is lost on
+    restart / evicted after ~100 tasks. So the ref'd file is the sole durable
+    (for the ~24h scratch lifetime) record of what the subagent was asked.
+    The completion preview stays response-only — it reads ``ct.result``, not
+    this payload.
+    """
+    return (
+        f"=== SUBAGENT TASK {ct.task_name!r}  "
+        f"(persona={ct.persona}, task_id={ct.id}, status={ct.status}) ===\n\n"
+        f"--- PROMPT ---\n{ct.prompt}\n\n"
+        f"--- RESULT ---\n{ct.result or ''}\n"
+    )
+
+
+def _spool_result(ct: "ChildTask", workspace_dir: Path) -> str | None:
+    """Write the prompt + ``ct.result`` to a transient spool file under
+    ``<workspace>/.tool-results/<origin_sid>/`` and return its
+    workspace-relative path. Reuses the same scratch tree as large tool
+    results, so ``Agent.sweep_spool_tree`` (run after each nightly rotate)
+    reaps it on the same >24h grace. Returns None if there is nothing to
+    spool or the write fails — the caller then falls back to a bounded
+    inline result rather than losing it.
+    """
+    if ct.result is None:
+        return None
+    try:
+        spool_dir = workspace_dir / ".tool-results" / ct.origin_session_key
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        path = spool_dir / f"{_task_slug(ct.task_name)}-{ct.id}.txt"
+        path.write_text(_spool_contents(ct))
+        return str(path.relative_to(workspace_dir))
+    except OSError:
+        log.exception(
+            "[%s] failed to spool subagent result for task_id=%s",
+            ct.parent_id, ct.id,
+        )
+        return None
+
+
 class SubagentSpawner:
     def __init__(self, cfg: SubagentsConfig) -> None:
         self.cfg = cfg
@@ -126,6 +212,7 @@ class SubagentSpawner:
         parent: "Agent",
         persona: str,
         prompt: str,
+        task_name: str,
         depth: int,
         origin_channel: str,
         origin_peer_id: str,
@@ -172,6 +259,7 @@ class SubagentSpawner:
             parent_id=parent.id,
             persona=persona_key,
             prompt=prompt,
+            task_name=task_name,
             origin_channel=origin_channel,
             origin_peer_id=origin_peer_id,
             origin_session_key=current_sid.get(),
@@ -234,6 +322,7 @@ class SubagentSpawner:
                 ct.status = "failed"
                 ct.result = f"error: subagent failed: {e}"
             ct.completed_at = _now()
+            ct.result_path = _spool_result(ct, parent.agent_cfg.workspace)
             if ct.suppress_delivery:
                 # Whole-turn %stop killed this cascade: do NOT inbound a
                 # completion, or the stopped session would be resurrected
@@ -267,15 +356,27 @@ class SubagentSpawner:
         elapsed = ""
         if ct.completed_at is not None:
             elapsed = f" elapsed={_format_elapsed((ct.completed_at - ct.started_at).total_seconds())}"
-        body_lines = [
-            f"task_id={ct.id} persona={ct.persona} status={ct.status}{elapsed}",
-            "",
-            "Original prompt:",
-            ct.prompt,
-            "",
-            "Result:",
-            ct.result or "(no output)",
-        ]
+        header = (
+            f"Subagent task {ct.task_name!r} finished. "
+            f"task_id={ct.id} persona={ct.persona} status={ct.status}{elapsed}"
+        )
+        preview = _result_preview(ct.result or "(no output)")
+        if ct.result_path is not None:
+            body_lines = [
+                header,
+                "",
+                f"Full prompt + result saved to: {ct.result_path}",
+                "(Transient scratch — reaped ~24h after the next session "
+                "rotate. read_file / bash that path for the full prompt and "
+                "output; copy it elsewhere to keep it.)",
+                "",
+                f"Preview (first {_RESULT_PREVIEW_CHARS} chars):",
+                preview,
+            ]
+        else:
+            # Spool unavailable — inline a bounded preview rather than the
+            # full result, so a disk hiccup can't reintroduce the bloat.
+            body_lines = [header, "", "Result:", preview]
         msg = InboundMessage(
             peer_id=ct.origin_peer_id,
             sender_name=f"subagent:{ct.persona}:{ct.id}",
@@ -384,7 +485,8 @@ class SubagentSpawner:
         for ct in cts:
             elapsed = _format_elapsed((_now() - ct.started_at).total_seconds())
             lines.append(
-                f"  {ct.id}  persona={ct.persona}  elapsed={elapsed}"
+                f"  {ct.id}  task_name={ct.task_name!r}  "
+                f"persona={ct.persona}  elapsed={elapsed}"
             )
         return "\n".join(lines)
 
@@ -400,10 +502,17 @@ class SubagentSpawner:
         elapsed = ""
         if ct.completed_at is not None:
             elapsed = f" elapsed={_format_elapsed((ct.completed_at - ct.started_at).total_seconds())}"
-        return (
-            f"task_id={ct.id} persona={ct.persona} status={ct.status}{elapsed}\n"
-            f"\nResult:\n{ct.result or '(no output)'}"
+        head = (
+            f"task_id={ct.id} task_name={ct.task_name!r} persona={ct.persona} "
+            f"status={ct.status}{elapsed}"
         )
+        if ct.result_path is not None:
+            return (
+                f"{head}\n\nFull prompt + result saved to: {ct.result_path}\n\n"
+                f"Preview (first {_RESULT_PREVIEW_CHARS} chars):\n"
+                f"{_result_preview(ct.result or '(no output)')}"
+            )
+        return f"{head}\n\nResult:\n{ct.result or '(no output)'}"
 
 
 def build_subagent_spawn_tool(
@@ -426,10 +535,17 @@ def build_subagent_spawn_tool(
     async def _run(args: dict[str, Any]) -> str:
         prompt = (args.get("prompt") or "").strip()
         persona = (args.get("persona") or "").strip()
+        task_name = (args.get("task_name") or "").strip()
         if not prompt:
             return "error: prompt is required"
         if not persona:
             return "error: persona is required"
+        if not task_name:
+            return (
+                "error: task_name is required — a short label for this task "
+                "(e.g. 'convert homepage HTML'), echoed back to you when it "
+                "finishes so you can match the result to the request"
+            )
         # Capture the parent's currently-active inbound so the eventual
         # completion message lands in the same session. _active_inbound
         # is set by _process_batch; outside a turn (e.g. run_one_shot in
@@ -440,7 +556,7 @@ def build_subagent_spawn_tool(
         if origin is None:
             return "error: subagent_spawn called outside an active session"
         return spawner.spawn_async(
-            parent, persona, prompt, depth + 1, origin[0], origin[1],
+            parent, persona, prompt, task_name, depth + 1, origin[0], origin[1],
         )
 
     return Tool(
@@ -451,7 +567,13 @@ def build_subagent_spawn_tool(
             "shares your workspace, tools, and memory. Persona is "
             "case-insensitive. This tool returns a task id immediately; "
             "you'll get a prompt when the task completes. (subagent_status "
-            "is available for polling.) Available personas: " + persona_list
+            "is available for polling.)\n\n"
+            "Keep both sides' context small: pass file PATHS in your prompt, "
+            "not pasted file contents — the subagent shares your workspace "
+            "and can read_file them itself. Its output comes back as a short "
+            "preview plus a path to the full result on disk (not inlined), "
+            "so prefer having it write large artifacts to a file too. "
+            "Available personas: " + persona_list
         ),
         input_schema={
             "type": "object",
@@ -463,15 +585,27 @@ def build_subagent_spawn_tool(
                         + (", ".join(persona_keys) if persona_keys else "(none)")
                     ),
                 },
+                "task_name": {
+                    "type": "string",
+                    "description": (
+                        "A short label for this task (a few words, e.g. "
+                        "'convert homepage HTML'). Echoed back to you when the "
+                        "subagent finishes so you can tell which result is "
+                        "which; the subagent itself never sees it."
+                    ),
+                },
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "What you want the subagent to do. Be specific — "
-                        "they have no other context beyond the workspace."
+                        "What you want the subagent to do. Be specific — they "
+                        "have no other context beyond the workspace. Pass file "
+                        "paths, not pasted file contents: the subagent can "
+                        "read_file them from the shared workspace, and it "
+                        "keeps both contexts small."
                     ),
                 },
             },
-            "required": ["persona", "prompt"],
+            "required": ["persona", "task_name", "prompt"],
         },
         run=_run,
     )

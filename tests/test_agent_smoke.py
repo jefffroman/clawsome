@@ -199,6 +199,63 @@ async def test_matrix_turn_not_mirrored(
     assert sum(1 for r in rows if r["role"] == "user") == 1
 
 
+async def test_compaction_deferred_to_turn_end_with_notice(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """When the compaction predicate trips, background compaction is spawned
+    at turn-END (after the reply) — never before run_turn, where it would
+    contend for GPU with the reply — and a 🖥️ system notice is dropped into
+    the room. The reply goes out first, the notice second.
+    """
+    from claw.config import CompactionConfig
+    # Threshold of 1 token guarantees the (overhead-inclusive) predicate trips.
+    cfg = make_cfg(tmp_path, compaction=CompactionConfig(
+        mid_session_token_threshold=1, reserve_tokens=1))
+    agent_cfg = cfg.agents[0]
+    agent_cfg.workspace.mkdir(parents=True, exist_ok=True)
+    agent = Agent(
+        cfg=cfg, agent_cfg=agent_cfg, ollama=fake_ollama, memory=fake_memory,
+        tools={}, transcripts=transcripts, channel=fake_channel,
+        spawner=None, job_runner=None,
+    )
+    peer = "!room:example.org"
+    sid = session_id("matrix", peer)
+    msg = InboundMessage(
+        peer_id=peer, sender_name="user-1", text="hello",
+        channel="matrix", sender_id="@user-1:example.org",
+    )
+    await agent._process_batch(sid, [msg], turn_id="t1")
+
+    texts = [t for _, t in fake_channel.sent]
+    reply_idx = next(i for i, t in enumerate(texts) if "hello back" in t)
+    notice_idx = next(
+        i for i, t in enumerate(texts) if "Auto-compaction in progress" in t
+    )
+    # Reply first, compaction notice second (proves turn-END spawn).
+    assert notice_idx > reply_idx
+    assert "🖥️" in texts[notice_idx]
+
+
+async def test_no_compaction_notice_below_threshold(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """A short turn well under the threshold neither spawns compaction nor
+    emits the notice (the notice fires only when a compaction actually starts).
+    """
+    agent = _make_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
+                        fake_channel, transcripts)  # default 96k threshold
+    peer = "!room:example.org"
+    sid = session_id("matrix", peer)
+    msg = InboundMessage(
+        peer_id=peer, sender_name="user-1", text="hi",
+        channel="matrix", sender_id="@user-1:example.org",
+    )
+    await agent._process_batch(sid, [msg], turn_id="t1")
+    assert not any(
+        "Auto-compaction" in t for _, t in fake_channel.sent
+    ), "notice sent despite being far below the compaction threshold"
+
+
 async def test_system_block_gaps_the_answer(
     tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
 ):

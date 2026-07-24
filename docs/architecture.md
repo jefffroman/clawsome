@@ -31,7 +31,8 @@ register on the agent.
 role label, spawn budget, optional `can_spawn` allowlist — declared once
 under `subagents.personas:` in `claw.yaml` and shared across every agent
 in the deployment. A *subagent* is a transient `Agent` fork instantiated
-from a persona by the `subagent_spawn` tool: one-shot, no transcript
+from a persona by the `subagent_spawn` tool (`persona` + `prompt` + a
+required short `task_name` label): one-shot, no transcript
 persistence, no compaction, sharing the parent's workspace, memory
 index, and tool registry (minus the `subagent_*` family and `cron_*`).
 Spawns are **async**: the fork's `run_one_shot(prompt)` runs as a
@@ -40,8 +41,15 @@ detached `asyncio.Task` held by the spawner registry, and the
 the parent's drainer to handle other inbound while the child works.
 On completion (success, failure, or cancellation) the spawner fires a
 synthetic `InboundMessage` whose `(channel, peer_id)` match the
-original spawn site, so the result arrives as the parent's next turn
-with the original prompt + result body already in context. The
+original spawn site, so the result arrives as the parent's next turn.
+That completion is deliberately compact: the child's full output is
+spooled to a workspace file (`<workspace>/.tool-results/<sid>/`, reaped
+with the other tool-result scratch) and the message carries the
+`task_name`, a bounded preview, and that path — **not** the prompt echo
+or the full result inline. Echoing both verbatim was the dominant
+transcript-bloat source, since (unlike ordinary tool results) the
+completion bypassed the persistence-side truncation; the `task_name`
+lets the parent match result→request without it. The
 companion tools `subagent_status`, `subagent_list`, and `subagent_stop`
 cover polling, roster inspection, and cancellation. Spawn budgets
 shrink strictly down each chain (`min(parent_remaining - 1,
@@ -212,15 +220,24 @@ Run off the user-reply critical path so latency stays bounded.
   since that last flush*, asking the agent to append durable knowledge
   to today's `memory/YYYY-MM-DD.md`. At most one flush is in flight per
   session; concurrent triggers skip rather than queue.
-- **Pre-compact memory_flush + mid-session compaction.** When a
-  transcript crosses `compaction.mid_session_token_threshold`, the
-  request path spawns a single background task that runs the flush
-  (incremental, locked the same way as the periodic path) and then the
-  mid-session compaction in sequence. Both run on the compaction model
-  concurrently with the user's main reply. Compaction summarizes the
-  older portion into a single `## Pre-compaction Recap` row and
-  atomically swaps it in under the per-session lock — preserving rows
-  appended during the work.
+- **Pre-compact memory_flush + mid-session compaction.** When the
+  estimated real prompt — transcript rows **plus** the system-prompt
+  overhead (workspace files + skill catalog + retrieved memory) — crosses
+  `compaction.mid_session_token_threshold`, a single background task runs
+  the flush (incremental, locked the same way as the periodic path) and
+  then the mid-session compaction in sequence, both on the compaction
+  model. Compaction summarizes the older portion into a single
+  `## Pre-compaction Recap` row and atomically swaps it in under the
+  per-session lock — preserving rows appended during the work. The task is
+  spawned at turn-**end**, after the reply is sent — *not* concurrently
+  with the reply's own generation. Overlapping them only starved the reply
+  for GPU bandwidth (batch-1, bandwidth-bound box) for no benefit:
+  compaction can't shrink a prompt that's already built, and the swap
+  serializes behind the turn's session lock either way. Deferring keeps
+  the reply's generation uncontended while still shrinking the *next*
+  turn. Because it can only ever help the next turn, the counting includes
+  the overhead so it fires at the true prompt size rather than
+  transcript-only (which undercounted by tens of thousands of tokens).
 - **Idle recap.** On agent boot, the prior session's last-turn age
   decides resume vs. recap. *Younger* than
   `compaction.idle_recap_seconds` → the existing transcript stays loaded

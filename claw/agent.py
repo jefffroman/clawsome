@@ -922,12 +922,14 @@ class Agent:
         else:
             self.transcripts.append(sid, user_row)
             rows = self.transcripts.load(sid)
-            # If predicates trip, spawn a background flush+compact task. Doesn't
-            # block the user's reply — task runs concurrently with run_turn and
-            # subsequent turns. The atomic-swap pattern preserves any rows the
-            # agent appends during the work.
-            self._spawn_bg_compaction_if_needed(sid, list(rows))
             history = [as_message(r) for r in rows]
+            # NB: background flush+compaction is spawned at turn-END now (see
+            # the tail of this method), not here. Spawning it before run_turn
+            # made its compaction-model summarize contend for GPU bandwidth
+            # with this turn's own reply generation on the (batch-1,
+            # bandwidth-bound) box — for zero benefit, since the reply prompt
+            # is already built and the swap serializes behind this turn's
+            # session lock regardless. Deferring removes the contention.
         system = self._build_system_prompt(
             retrieval_block, recap_block, modality=msgs[0].modality
         )
@@ -1064,6 +1066,34 @@ class Agent:
             reply_part, time.monotonic() - turn_t0, tail,
         )
 
+        # Background flush + compaction — spawned HERE, after the reply is
+        # sent, so its compaction-model summarize never contends for GPU with
+        # the reply's own generation. The snapshot is the post-turn transcript
+        # (includes this turn's rows), and the predicate is fed the system
+        # prompt's token cost as overhead so it fires at the true prompt size
+        # (workspace files + skill catalog + retrieved memory), not
+        # transcript-only. When a compaction actually starts, drop a one-line
+        # 🖥️ system notice into the room so the user knows the background work
+        # is underway (matrix only — a voice channel would read it aloud).
+        if not stateless:
+            rows_now = self.transcripts.load(sid)
+            # System-prompt overhead (workspace + skills + retrieved memory),
+            # counted the same way %context does so the trigger and the report
+            # agree. `system` here is the real prompt built for this turn.
+            overhead_tokens = estimate_tokens([{"content": system}])
+            started = self._spawn_bg_compaction_if_needed(
+                sid, rows_now, overhead_tokens=overhead_tokens
+            )
+            if started and msgs[0].channel == "matrix":
+                await channel.send(
+                    peer_id,
+                    _as_system_blockquote(
+                        "Auto-compaction in progress — condensing the earlier "
+                        "part of this conversation to free up context. Running "
+                        "in the background."
+                    ),
+                )
+
     async def _idle_recap_for(self, sid: str) -> str | None:
         """Cached per-session idle recap. Computes once on first call,
         returns the cached block on subsequent calls.
@@ -1092,21 +1122,29 @@ class Agent:
         self,
         sid: str,
         rows_snapshot: list[dict],
+        *,
+        overhead_tokens: int = 0,
     ) -> bool:
         """If the compaction predicate trips and no task is currently in
         flight for this session, spawn a single background task that runs
         flush then compaction on the compaction model. Returns True if a
         task was spawned.
+
+        ``overhead_tokens`` is the estimated size of the non-transcript part
+        of the prompt (system block + retrieved memory); it's added to the
+        transcript-token estimate so the trigger reflects the real prompt.
         """
         existing = self._bg_compaction.get(sid)
         if existing is not None and not existing.done():
             return False
 
-        if not will_mid_session_compact(self.cfg, rows_snapshot):
+        if not will_mid_session_compact(
+            self.cfg, rows_snapshot, overhead_tokens=overhead_tokens
+        ):
             return False
 
         task = asyncio.create_task(
-            self._run_bg_compaction(sid, rows_snapshot),
+            self._run_bg_compaction(sid, rows_snapshot, overhead_tokens=overhead_tokens),
             name=f"bg-compact-{self.id}-{sid}",
         )
         self._bg_compaction[sid] = task
@@ -1116,11 +1154,14 @@ class Agent:
         self,
         sid: str,
         rows_snapshot: list[dict],
+        *,
+        overhead_tokens: int = 0,
     ) -> None:
         """Background body. Runs the pre-compact flush then mid-session
-        compaction in sequence on the compaction model, concurrent with
-        the main user-reply turn. A flush failure does not block compaction
-        and vice-versa.
+        compaction in sequence on the compaction model. Spawned at turn-end
+        (after the reply is sent), so it no longer overlaps — and no longer
+        starves — the reply generation. A flush failure does not block
+        compaction and vice-versa.
         """
         try:
             await self._run_flush_guarded(
@@ -1138,6 +1179,7 @@ class Agent:
                     sid=sid,
                     rows_snapshot=rows_snapshot,
                     compaction_model=self.compaction_model,
+                    overhead_tokens=overhead_tokens,
                 )
             except Exception:
                 log.exception("[%s] background compaction failed for %s", self.id, sid)
@@ -1474,10 +1516,13 @@ class Agent:
         hist_toks = estimate_tokens(rows)
         start_toks = sys_toks + hist_toks
         thr = self.cfg.compaction.mid_session_token_threshold
-        # Auto-compaction is gated on transcript rows only (will_mid_session
-        # _compact uses estimate_tokens(rows)), not the full prompt — report
-        # the % against the number that actually triggers it.
-        pct = round(100 * hist_toks / thr) if thr else 0
+        # Auto-compaction counts the real prompt — system-prompt overhead
+        # (workspace + skills + retrieved memory) PLUS transcript rows — so
+        # report the % against that combined figure, not transcript-only.
+        # (This estimate omits the per-message memory-retrieval block, which
+        # is unknowable until the user types, so the live trigger fires a
+        # touch earlier than shown.)
+        pct = round(100 * start_toks / thr) if thr else 0
         recap_note = (
             f", incl. ~{estimate_tokens([{'content': recap}]):,} pending recap"
             if recap else ""
@@ -1487,7 +1532,7 @@ class Agent:
             f"Context: next turn starts at ~{start_toks:,} tokens — system "
             f"~{sys_toks:,}{recap_note} + {len(rows)} transcript rows "
             f"~{hist_toks:,}, before your message / memory retrieval / tool "
-            f"schema. Auto-compaction triggers on transcript rows at "
+            f"schema. Auto-compaction triggers on the full prompt at "
             f"{thr:,} (~{pct}% there).",
         )
 

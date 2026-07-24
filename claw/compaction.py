@@ -6,12 +6,14 @@ Two distinct triggers, two distinct headings:
   last turn is older than ``compaction.idle_recap_seconds``. Archives the old
   JSONL and prepends the recap as a system block on the next prompt. Runs
   synchronously since it's pre-live.
-* ``## Pre-compaction Recap`` — fires when estimated transcript tokens exceed
-  ``compaction.mid_session_token_threshold``. **Runs as a background task off
-  the user-reply critical path**: the slow summarize() call happens against a
-  snapshot, then the swap into the on-disk transcript happens under the
-  per-session lock so any user turns that arrived during summarize are
-  preserved.
+* ``## Pre-compaction Recap`` — fires when the estimated *real prompt*
+  (transcript tokens + system/memory ``overhead_tokens``) exceeds
+  ``compaction.mid_session_token_threshold``. **Runs as a background task,
+  spawned at turn-end** (after the reply is sent, by ``Agent._process_batch``)
+  so its summarize() never contends for GPU with the reply's own generation:
+  the slow summarize() happens against a snapshot, then the swap into the
+  on-disk transcript happens under the per-session lock so any user turns that
+  arrived during summarize are preserved.
 
 Recap blocks are stable across turns so prompt caches stay warm.
 """
@@ -204,14 +206,35 @@ def _split_for_compaction(
     return rows[:cut], rows[cut:]
 
 
-def will_mid_session_compact(cfg: Config, rows: list[dict[str, Any]]) -> bool:
+def will_mid_session_compact(
+    cfg: Config,
+    rows: list[dict[str, Any]],
+    *,
+    overhead_tokens: int = 0,
+) -> bool:
     """Predicate-only check (no I/O). The agent uses this to decide whether
     to spawn a background compaction task.
+
+    ``overhead_tokens`` accounts for the non-transcript portion of the real
+    prompt — the system block (workspace files + skill catalog) and the
+    retrieved-memory injection — which ``estimate_tokens(rows)`` alone omits.
+    Passing it makes the trigger fire at the *actual* prompt size rather than
+    transcript-only, which otherwise undercounts by tens of thousands of
+    tokens (2026-07-23: a "96k of transcript" trigger was a ~129k real prompt).
     """
-    return estimate_tokens(rows) > cfg.compaction.mid_session_token_threshold
+    return (
+        estimate_tokens(rows) + overhead_tokens
+        > cfg.compaction.mid_session_token_threshold
+    )
 
 
-def will_compact(cfg: Config, rows: list[dict[str, Any]], *, force: bool = False) -> bool:
+def will_compact(
+    cfg: Config,
+    rows: list[dict[str, Any]],
+    *,
+    force: bool = False,
+    overhead_tokens: int = 0,
+) -> bool:
     """Predicate-only (no I/O): would ``run_mid_session_compact_async``
     with the same ``force`` actually swap? Mirrors its two gates exactly —
     the token-threshold predicate (bypassed by ``force``) AND a non-empty
@@ -219,7 +242,9 @@ def will_compact(cfg: Config, rows: list[dict[str, Any]], *, force: bool = False
     skip the (expensive) pre-compact flush entirely when there is nothing
     to compact, instead of flushing and then no-op'ing.
     """
-    if not force and not will_mid_session_compact(cfg, rows):
+    if not force and not will_mid_session_compact(
+        cfg, rows, overhead_tokens=overhead_tokens
+    ):
         return False
     older, _ = _split_for_compaction(rows, cfg.compaction.reserve_tokens)
     return bool(older)
@@ -235,6 +260,7 @@ async def run_mid_session_compact_async(
     rows_snapshot: list[dict[str, Any]],
     compaction_model: str,
     force: bool = False,
+    overhead_tokens: int = 0,
 ) -> bool:
     """Run compaction off the critical path, then atomically swap.
 
@@ -254,7 +280,9 @@ async def run_mid_session_compact_async(
     "nothing compactable" early return below is still honored, so a forced
     compact on a too-short transcript is a clean no-op (returns False).
     """
-    if not force and not will_mid_session_compact(cfg, rows_snapshot):
+    if not force and not will_mid_session_compact(
+        cfg, rows_snapshot, overhead_tokens=overhead_tokens
+    ):
         return False
 
     older, newer = _split_for_compaction(rows_snapshot, cfg.compaction.reserve_tokens)

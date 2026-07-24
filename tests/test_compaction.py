@@ -52,6 +52,19 @@ def test_will_mid_session_compact(make_cfg, tmp_path):
     assert will_mid_session_compact(low, big_rows) is True
 
 
+def test_will_mid_session_compact_counts_overhead(make_cfg, tmp_path):
+    # Transcript alone is under threshold; the system-prompt overhead is what
+    # pushes the real prompt over. Without overhead accounting the trigger
+    # would never fire (this is the 2026-07-23 undercount bug).
+    cfg = make_cfg(tmp_path, compaction=CompactionConfig(
+        mid_session_token_threshold=100, reserve_tokens=5))
+    small_rows = [{"role": "user", "content": "x" * 200}]  # 50 tokens < 100
+    assert will_mid_session_compact(cfg, small_rows) is False
+    assert will_mid_session_compact(cfg, small_rows, overhead_tokens=0) is False
+    # + 60 tokens of system/memory overhead -> 110 > 100 -> fires.
+    assert will_mid_session_compact(cfg, small_rows, overhead_tokens=60) is True
+
+
 def test_will_compact_gates(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path)
     # Below threshold, no force -> the predicate gate short-circuits.
