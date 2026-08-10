@@ -25,8 +25,8 @@ A skill lives at ``<workspace>/skills/<name>/``:
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
+import inspect
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,7 +140,12 @@ def _load_tool_py(path: Path, default_name: str, default_description: str) -> To
     run_fn = getattr(mod, "run", None)
     if not isinstance(tool_spec, dict):
         raise ValueError(f"{path}: TOOL_SPEC must be a dict")
-    if not asyncio.iscoroutinefunction(run_fn):
+    # inspect, not asyncio: asyncio.iscoroutinefunction is deprecated and
+    # removed in Python 3.16. Equivalent here — the only behavioural
+    # difference was @asyncio.coroutine, gone since 3.11, and both unwrap
+    # functools.partial. This line never warned because it only runs for a
+    # skill shipping a tool.py, and every current skill is markdown-only.
+    if not inspect.iscoroutinefunction(run_fn):
         raise ValueError(f"{path}: run must be defined as `async def run(input: dict) -> str`")
 
     return Tool(

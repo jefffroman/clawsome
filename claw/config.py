@@ -102,6 +102,11 @@ class SubagentsConfig:
 @dataclass(frozen=True)
 class CompactionConfig:
     idle_recap_seconds: int = 3600
+    # Floor for the idle recap. A session smaller than this is left verbatim
+    # rather than summarized: below it the recap is no smaller than the rows
+    # it replaces, so compressing is pure loss. Guards the observed case of a
+    # 2-turn session being recapped at boot.
+    idle_recap_min_tokens: int = 4000
     # Mid-session compaction fires when estimated transcript tokens exceed
     # this. Defaults are tuned for a 192K context window — set so compaction
     # triggers around 50% of context, leaving generation headroom and a

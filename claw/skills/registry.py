@@ -30,7 +30,7 @@ def build_agent_registry(
     """
     tools: dict[str, Tool] = build_builtin_tools(workspace_dir)
     if cfg.searxng.base_url:
-        ws = build_web_search_tool(cfg.searxng.base_url)
+        ws = build_web_search_tool(cfg.searxng.base_url, workspace_dir)
         tools[ws.name] = ws
 
     skills = load_skills(workspace_dir)

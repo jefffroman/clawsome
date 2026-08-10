@@ -36,13 +36,18 @@ from nio import (
     RoomMessageUnknown,
 )
 import json as _json
-from olm import PkSigning
 from nio.crypto import Sas
 from nio.crypto.sas import SasState
 from nio.events.room_events import UnknownEvent
 from markdown_it import MarkdownIt
 
 from claw.channel.base import InboundHandler, InboundMessage
+from claw.channel.pksigning import PkSigning
+from claw.channel.sas_compat import (
+    apply_legacy_mac_compat,
+    fix_accept_commitment,
+    prefer_mac_v2,
+)
 from claw.config import MatrixAccountConfig
 
 log = logging.getLogger("claw.channel.matrix")
@@ -252,6 +257,11 @@ class MatrixChannel:
                 self.user_id, event.type, event.sender,
             )
             return
+        # SAS wire trace. In-room verification is rare and notoriously hard to
+        # debug after the fact (the events are E2E-encrypted, so they can't be
+        # read back off the room timeline), so log both directions verbatim.
+        log.info("[%s] SAS <<< recv %s from %s: %s",
+                 self.user_id, event.type, event.sender, _json.dumps(content, sort_keys=True))
         try:
             if event.type == "m.key.verification.start":
                 await self._inroom_sas_start(room, content, event.sender)
@@ -291,13 +301,23 @@ class MatrixChannel:
             "event_id": request_event_id,
             "rel_type": "m.reference",
         }
+        log.info("[%s] SAS >>> send %s: %s",
+                 self.user_id, event_type, _json.dumps(c, sort_keys=True))
         try:
-            await self._client.room_send(
+            resp = await self._client.room_send(
                 room_id=room_id,
                 message_type=event_type,
                 content=c,
                 ignore_unverified_devices=True,
             )
+            # A failed send here is silent otherwise: nio returns an error
+            # response rather than raising, and the peer just sees us stall.
+            if type(resp).__name__.endswith("Error"):
+                log.error("[%s] SAS send %s REJECTED by server: %r",
+                          self.user_id, event_type, resp)
+            else:
+                log.info("[%s] SAS >>> send %s ok (event_id=%s)", self.user_id,
+                         event_type, getattr(resp, "event_id", "?"))
         except Exception:
             log.exception("[%s] room_send for %s failed", self.user_id, event_type)
 
@@ -355,13 +375,26 @@ class MatrixChannel:
         self._inroom_sas[request_event_id] = (sas, room.room_id)
 
         accept_msg = sas.accept_verification()
+        accept_content = dict(accept_msg.content)
+
+        # Two nio defects have to be corrected before this goes on the wire,
+        # or the peer can never complete the verification. See sas_compat.py.
+        #   - nio hex-encodes the commitment; the spec wants unpadded base64,
+        #     so the peer's check against our ephemeral key always fails.
+        #   - nio pins the legacy MAC method while computing corrected-base64
+        #     MACs. Prefer v2 when offered (the spec forbids v1 in that case),
+        #     which makes nio's own computation right by construction.
+        fix_accept_commitment(sas, content, accept_content)
+        prefer_mac_v2(sas, content.get("message_authentication_codes", []),
+                      accept_content)
+
         log.info(
             "[%s] SAS accept -> %s (txn %s)",
             self.user_id, sender, request_event_id,
         )
         await self._send_inroom_sas_event(
             room.room_id, "m.key.verification.accept",
-            accept_msg.content, request_event_id,
+            accept_content, request_event_id,
         )
 
     async def _inroom_sas_key(self, content: dict, sender: str) -> None:
@@ -404,6 +437,14 @@ class MatrixChannel:
         sas, room_id = self._inroom_sas[request_event_id]
         if sas.canceled:
             return
+
+        # matrix-nio 0.26 negotiates the legacy `hkdf-hmac-sha256` method but
+        # computes MACs with vodozemac's corrected base64, so both the MAC it
+        # sends and its check of the peer's MAC are wrong on the wire. Fix the
+        # encoding before either happens — this call covers receive_mac_event
+        # below, sas.get_mac(), and the master-key extension. A no-op once v2
+        # has been negotiated, which is the normal case. See sas_compat.py.
+        apply_legacy_mac_compat(sas)
 
         # Feed the incoming MAC into the Sas state machine.
         mac_event = KeyVerificationMac(
@@ -479,17 +520,26 @@ class MatrixChannel:
         master_pubkey = master.public_key
         master_kid = f"ed25519:{master_pubkey}"
 
-        # Mirror Sas.get_mac's info string + MAC method selection.
+        # Mirror Sas.get_mac's info string + MAC calculation.
         info = (
             "MATRIX_KEY_VERIFICATION_MAC"
             f"{sas.own_user}{sas.own_device}"
             f"{sas.other_olm_device.user_id}{sas.other_olm_device.id}"
             f"{sas.transaction_id}"
         )
-        if sas.chosen_mac_method == sas._mac_normal:
-            calc = sas.calculate_mac
-        else:
-            calc = sas.calculate_mac_long_kdf
+        # matrix-nio 0.26 moved the MAC primitive: its Sas no longer subclasses
+        # olm.Sas (it wraps a vodozemac.EstablishedSas), so the inherited
+        # `sas.calculate_mac` is gone and `get_mac` now reaches through
+        # `sas.established_sas.calculate_mac`. 0.26 also dropped the legacy
+        # `hmac-sha256` method entirely (`_mac_v1 == [_mac_normal]`, and
+        # `chosen_mac_method` is set unconditionally), so the old
+        # calculate_mac_long_kdf branch has no remaining case to serve.
+        #
+        # `established_sas` has been wrapped by apply_legacy_mac_compat() in
+        # _inroom_sas_mac, so this yields the libolm-compatible encoding that
+        # the negotiated `hkdf-hmac-sha256` requires — matching the device-key
+        # MAC nio computed just above, which went through the same wrapper.
+        calc = sas.established_sas.calculate_mac
 
         new_content = dict(original_content)
         new_mac = dict(new_content.get("mac", {}))

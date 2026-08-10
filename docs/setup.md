@@ -70,35 +70,31 @@ Used by every agent's Matrix channel. One bot user per agent.
 
 - Python ≥ 3.12.
 - Install: `pip install -e .` from the clawsome repo root.
-- The dependency that typically dominates install time is
-  `matrix-nio[e2e]`, which pulls in `python-olm`, which builds `libolm`
-  from source on platforms without wheels.
+- E2E encryption comes from `matrix-nio[e2e]`, pinned `>=0.26,<0.27`.
 
-### macOS install
+### The `[e2e]` extra is not optional
 
-`python-olm` has no macOS wheels at time of writing, and the bundled
-libolm needs adjustments for current cmake + Apple Clang:
+`nio/crypto/__init__.py` gates every crypto export on the E2E backend
+being importable. Installing plain `matrix-nio` does **not** fail — it
+leaves `ENCRYPTION_ENABLED = False`, drops `nio.crypto.Sas`, and claw's
+Matrix channel fails to import. **Encryption turns off silently rather
+than loudly**, so always install the extra, and check after any upgrade:
 
-1. `brew install libolm` — provides the system libolm headers.
-2. Set `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the install env so the
-   bundled cmake config accepts current cmake.
-3. The bundled `libolm/include/olm/list.hh` may need a const-qualifier
-   fix to compile under current Apple Clang. If `pip install` fails
-   inside the python-olm build, check the python-olm and libolm GitHub
-   issue trackers — the exact patch tracks upstream.
-
-A typical incantation:
-
-```bash
-brew install libolm
-CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install -e .
+```python
+import nio.crypto; assert nio.crypto.ENCRYPTION_ENABLED
 ```
 
-### Linux install
+### No source build required
 
-Install the libolm development package via your distro
-(`apt install libolm-dev`, `dnf install libolm-devel`, etc.), then
-`pip install -e .`. No additional patching usually required.
+matrix-nio 0.26 replaced the libolm/`python-olm` backend with
+**vodozemac**, which publishes native wheels — including macOS arm64.
+`pip install -e .` is all that is needed on macOS and Linux alike; the
+old dance of installing libolm headers, overriding the cmake policy
+version, and patching a const-qualifier in `list.hh` is gone.
+
+If you are upgrading an existing deployment across that boundary, read
+the store-migration warning in `docs/operations.md` first — it is
+one-way, and merely *opening* a store performs it.
 
 ## Workspace prep
 

@@ -49,6 +49,19 @@ DEFAULT_TIMEOUT_S = 1800.0
 # the original path.
 TOOL_RESULT_THRESHOLD_CHARS = 8192
 
+# summarize() generation settings. See the method docstring for why the
+# Modelfile defaults (presence_penalty 1.5, temperature 1.0) are wrong for
+# summarization.
+#
+# num_predict must clear the largest word budget compaction.py can ask for —
+# currently _MID_RECAP_WORDS_MAX (1500 words ≈ 2000 tokens) — with room to
+# spare, or the recap is truncated mid-sentence right at the size where it
+# matters most. With think=False there is no reasoning trace competing for
+# the budget. Raise this if either ceiling in compaction.py goes up.
+SUMMARY_PRESENCE_PENALTY = 0.0
+SUMMARY_TEMPERATURE = 0.3
+SUMMARY_NUM_PREDICT = 4096
+
 # Same idea on the *tool-call* side: tools like write_file / append_file
 # can carry multi-KB content in their argument JSON. We keep full args in
 # the in-loop ``messages`` list (so the model can chain on its own
@@ -192,6 +205,32 @@ _EMPTY_REPLY_RECOVERY_NOTE = (
     "summary of what you did or the answer to their question."
 )
 
+# Terminal fallback for the same case when recovery has already been spent
+# this run_turn (it is one-shot, so a SECOND empty lands here). There is no
+# legitimate way to reach it: no tool_calls and no text means the model
+# neither spoke nor acted.
+#
+# Deliberately not an exception. run_turn's first return value is the
+# transcript rows, and agent.py's `except Exception` handler returns BEFORE
+# appending them — raising would discard the whole turn's record, so the
+# tool calls would have run with nothing to show they ever did. Same
+# sentinel-string convention as the tool-loop ceiling and the code-fence
+# discard.
+#
+# The wording must not invite the USER to re-ask: by this point the tools
+# have already run and their side effects are real (files written, edits
+# applied). Only the closing summary was lost, so "try again" would push
+# them into duplicating completed work.
+#
+# It must not claim nothing was retried either — the one-shot recovery
+# retry above is exactly how this line is reached. The internal retry and
+# re-running the user's request are different things, and only the second
+# is unnecessary, so the text speaks to that one.
+_EMPTY_REPLY_FALLBACK = (
+    "[claw: the work above completed, but I finished without writing a "
+    "reply. Nothing needs re-running — ask me to summarize it.]"
+)
+
 
 def _label_prefix(label: str, verbose_suffix: str = "") -> str:
     """Format the caller-supplied label as a log prefix. Empty string when
@@ -319,6 +358,13 @@ class OllamaClient:
         the user can actually see. The truncated partial only ever lives
         in the in-loop ``messages``, never in ``new_messages`` (transcript).
 
+        Recovery is one-shot per ``run_turn``. A SECOND empty (no
+        tool_calls, no text) has nothing left to try and is returned as
+        ``_EMPTY_REPLY_FALLBACK`` rather than ``""`` — an empty string
+        reaches the user as silence, which is indistinguishable from
+        being ignored. The sentinel is substituted before the assistant
+        record is built, so the transcript row matches what was sent.
+
         ``label`` is a caller-supplied prefix prepended to every
         ``claw.ollama`` log line emitted from this call. Always shown.
         Format convention: ``<agent_id>:<kind>[:<peer_or_task>]`` —
@@ -373,9 +419,24 @@ class OllamaClient:
 
         prefix = _label_prefix(label, verbose_suffix)
 
-        for turn_idx in range(effective_max_tool_turns):
+        async def chat_with_parse_recovery(turn_idx: int) -> dict[str, Any]:
+            """``chat_once`` with a single guarded re-prompt on a 5xx.
+
+            A 5xx from ``/api/chat`` is almost always Ollama failing to parse
+            the model's raw tool-call output (malformed XML, e.g. a
+            ``<function>`` closed by ``</parameter>``). Inject a one-shot
+            recovery note and retry once. ``parse_retry_used`` is shared
+            across EVERY ``chat_once`` in this ``run_turn`` — the top-of-loop
+            call AND the empty-reply/length recovery-branch call — so a parser
+            500 that lands on a recovery retry gets the same guarded re-prompt
+            instead of propagating and killing the whole turn (the
+            stacked-recovery gap fixed 2026-07-25: previously only the
+            top-of-loop call was wrapped, so a malformed tool call emitted
+            during empty-reply recovery crashed run_turn).
+            """
+            nonlocal parse_retry_used
             try:
-                response = await self.chat_once(
+                return await self.chat_once(
                     model=model, messages=messages, tools=tool_specs, options=options,
                     label=label,
                 )
@@ -387,12 +448,14 @@ class OllamaClient:
                         prefix, turn_idx,
                     )
                     messages.append({"role": "system", "content": _PARSE_RECOVERY_NOTE})
-                    response = await self.chat_once(
+                    return await self.chat_once(
                         model=model, messages=messages, tools=tool_specs, options=options,
                         label=label,
                     )
-                else:
-                    raise
+                raise
+
+        for turn_idx in range(effective_max_tool_turns):
+            response = await chat_with_parse_recovery(turn_idx)
             assistant_msg = response.get("message", {}) or {}
             content = assistant_msg.get("content", "") or ""
             final_thinking = assistant_msg.get("thinking", "") or ""
@@ -467,10 +530,7 @@ class OllamaClient:
                         "role": "system",
                         "content": _EMPTY_REPLY_RECOVERY_NOTE,
                     })
-                response = await self.chat_once(
-                    model=model, messages=messages, tools=tool_specs, options=options,
-                    label=label,
-                )
+                response = await chat_with_parse_recovery(turn_idx)
                 assistant_msg = response.get("message", {}) or {}
                 content = assistant_msg.get("content", "") or ""
                 # Recovery replaced content — reassign thinking from the SAME
@@ -480,6 +540,28 @@ class OllamaClient:
                 if on_thinking and final_thinking.strip():
                     await on_thinking(final_thinking.strip())
                 tool_calls = assistant_msg.get("tool_calls") or []
+                # Likewise done_reason: it is read below by the terminal
+                # empty-reply guard's log line, and the retry's reason is
+                # the one that describes how this turn actually ended.
+                done_reason = response.get("done_reason")
+
+            # Terminal empty-reply guard. Recovery above is one-shot, so a
+            # second empty in the same run_turn arrives here with nothing
+            # left to try. Returning `content` unchanged would hand agent.py
+            # an empty string, and it only sends on a truthy reply — so the
+            # turn ends in silence and the user cannot distinguish it from
+            # being ignored. Substitute the sentinel BEFORE assistant_record
+            # is built so the persisted row carries it too: an empty
+            # assistant row is a degenerate example that stays in the
+            # transcript for the rest of the session, and the row should
+            # match what the user was actually shown.
+            if not tool_calls and not content.strip():
+                log.warning(
+                    "%sturn %d: empty reply with no tool_calls and recovery "
+                    "already used (done_reason=%s); substituting fallback text",
+                    prefix, turn_idx, done_reason,
+                )
+                content = _EMPTY_REPLY_FALLBACK
 
             assistant_record: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
@@ -568,16 +650,52 @@ class OllamaClient:
         instruction: str,
         transcript_text: str,
     ) -> str:
-        """One non-tool, non-streaming summary call (used by compaction)."""
-        resp = await self._client.post("/api/chat", json={
+        """One non-tool, non-streaming summary call (used by compaction).
+
+        ``think=False``. Every chat model in the stack is a Qwen3 hybrid, and
+        this call discards the reasoning trace entirely — it returns
+        ``message.content`` only, never ``message.thinking``. Measured on a
+        166-row transcript: 25.3 s / 1553 eval tokens with thinking on,
+        against 5.4 s / 306 with it off. 88% of the generation was produced
+        and thrown away, and the idle recap runs on the **boot path**, where
+        that latency blocks startup.
+
+        Explicit ``options`` because the Modelfile's defaults are tuned for
+        chat, not summarization. ``presence_penalty`` is the important one:
+        it ships at 1.5 and penalizes every token already emitted, while a
+        faithful recap has to repeat the same filenames, paths and terms
+        throughout. ``temperature`` is dropped for the same reason — a
+        summary wants fidelity to its input, not variety.
+        """
+        body: dict[str, Any] = {
             "model": model,
             "messages": [{
                 "role": "user",
                 "content": f"{instruction}\n\n--- transcript ---\n{transcript_text}",
             }],
             "stream": False,
-        })
-        resp.raise_for_status()
+            "think": False,
+            "options": {
+                "presence_penalty": SUMMARY_PRESENCE_PENALTY,
+                "temperature": SUMMARY_TEMPERATURE,
+                "num_predict": SUMMARY_NUM_PREDICT,
+            },
+        }
+        try:
+            resp = await self._client.post("/api/chat", json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            # `think` is rejected by models with no thinking mode. Every model
+            # we ship is a hybrid, so this is a guard for a future
+            # compaction_model, not a path we expect to take: retry without it
+            # rather than let compaction silently stop producing recaps
+            # (maybe_idle_recap swallows the exception and returns None).
+            log.warning(
+                "summarize: %s rejected think=False; retrying without it", model,
+            )
+            body.pop("think")
+            resp = await self._client.post("/api/chat", json=body)
+            resp.raise_for_status()
         return (resp.json().get("message", {}).get("content") or "").strip()
 
 

@@ -48,6 +48,7 @@ from claw.commands import (
     usage,
 )
 from claw.compaction import (
+    compaction_preview,
     maybe_idle_recap,
     run_mid_session_compact_async,
     will_compact,
@@ -494,10 +495,17 @@ class Agent:
 
     def _build_system_prompt(
         self,
-        retrieval_block: str,
         recap_block: str | None = None,
         modality: str | None = None,
     ) -> str:
+        """The stable half of the prompt: workspace files, skill catalog, and
+        any steering hints.
+
+        Everything here changes rarely — at most once per idle recap — which
+        is what makes the KV prefix cache useful. Per-turn volatile content
+        (retrieved memory) deliberately does NOT live here; see
+        ``_retrieval_row``.
+        """
         parts: list[str] = []
         ws = self._workspace_system_block()
         if ws:
@@ -521,9 +529,49 @@ class Agent:
             parts.append(voice_hint)
         if recap_block:
             parts.append(recap_block)
-        if retrieval_block:
-            parts.append(f"<retrieved_memory>\n{retrieval_block}\n</retrieved_memory>")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _retrieval_row(retrieval_block: str) -> dict | None:
+        """The per-turn retrieved-memory block, as a history row rather than a
+        system-prompt section. None when retrieval came back empty.
+
+        This block is re-ranked against every user message, so its content
+        changes whenever the topic shifts. Attention is causal, so the KV cache
+        is a *prefix* cache: changing a token invalidates every token after it.
+        While this sat at the end of the system prompt — i.e. immediately
+        BEFORE the whole transcript — each change invalidated the entire
+        conversation and forced a full re-prefill. Observed on 2026-08-08: the
+        cache restore point collapsed from ~75k to 3551 and prompt eval went
+        from 720 ms to 353 s on a 70k-token prompt.
+
+        Emitting it near the tail instead confines that invalidation to the
+        last turn's worth of tokens. It is NOT persisted to the transcript —
+        it's ephemeral per-turn context, and persisting it would accumulate
+        stale retrievals forever.
+        """
+        if not retrieval_block:
+            return None
+        return {
+            "role": "user",
+            "content": (
+                f"<retrieved_memory>\n{retrieval_block}\n</retrieved_memory>"
+            ),
+        }
+
+    @classmethod
+    def _with_retrieval(cls, history: list[dict], retrieval_block: str) -> list[dict]:
+        """``history`` with the retrieval row spliced in just before the final
+        (current) user message, so the user's own text stays last.
+
+        Returns the list unchanged when there's nothing to retrieve.
+        """
+        row = cls._retrieval_row(retrieval_block)
+        if row is None:
+            return history
+        if not history:
+            return [row]
+        return [*history[:-1], row, history[-1]]
 
     def _voice_modality_hint(self, modality: str | None) -> str:
         """The configured voice-modality system note, or "" when the turn
@@ -602,8 +650,10 @@ class Agent:
             log.exception("[%s] subagent memory retrieve failed", self.id)
             retrieval_block = ""
 
-        history = [{"role": "user", "content": prompt}]
-        system = self._build_system_prompt(retrieval_block)
+        history = self._with_retrieval(
+            [{"role": "user", "content": prompt}], retrieval_block,
+        )
+        system = self._build_system_prompt()
         try:
             sid = f"subagent-{self.id}"
             # Label as <parent_id>:subagent:<task_id> when both are known
@@ -931,8 +981,12 @@ class Agent:
             # is already built and the swap serializes behind this turn's
             # session lock regardless. Deferring removes the contention.
         system = self._build_system_prompt(
-            retrieval_block, recap_block, modality=msgs[0].modality
+            recap_block, modality=msgs[0].modality
         )
+        # Retrieved memory rides at the tail of the history, not in `system` —
+        # see _retrieval_row for why. Spliced into the in-memory prompt only;
+        # the persisted transcript keeps the user's message verbatim.
+        history = self._with_retrieval(history, retrieval_block)
 
         # Per-conversation reasoning-trace mode (set by %thinking).
         # "full" => stream every loop iteration's reasoning live via the
@@ -1032,6 +1086,21 @@ class Agent:
             pre_block = thinking_emitted or turn_id in self._system_emitted_turns
             send_body = _THINKING_ANSWER_SEP + answer if pre_block else answer
             await channel.send(peer_id, send_body)
+        else:
+            # Backstop. run_turn substitutes a sentinel for every
+            # never-legitimate exit, so reaching this means a path returned
+            # empty text that nothing else accounted for. Silence is the one
+            # outcome the user cannot interpret — it reads as "ignored" —
+            # so say something rather than only logging NO REPLY SENT below.
+            log.warning(
+                "[%s] empty reply reached the send site; run_turn should "
+                "have substituted a fallback", self.id,
+            )
+            await channel.send(
+                peer_id,
+                "[claw: I finished this turn without producing a reply. "
+                "Check /var/log/claw.log for this turn.]",
+            )
 
         # A stateless cron turn leaves no transcript of its own, so mirror the
         # trigger + delivered reply into the peer's human-facing session — the
@@ -1077,10 +1146,17 @@ class Agent:
         # is underway (matrix only — a voice channel would read it aloud).
         if not stateless:
             rows_now = self.transcripts.load(sid)
-            # System-prompt overhead (workspace + skills + retrieved memory),
-            # counted the same way %context does so the trigger and the report
-            # agree. `system` here is the real prompt built for this turn.
-            overhead_tokens = estimate_tokens([{"content": system}])
+            # Non-transcript overhead: the system block PLUS the retrieved
+            # memory row. Retrieval now rides in the history rather than in
+            # `system` (see _retrieval_row), and it is never persisted — so it
+            # appears in neither `system` nor `rows_now` and has to be added
+            # back explicitly, or the trigger silently undercounts the real
+            # prompt by the size of the retrieval block.
+            overhead_rows = [{"content": system}]
+            retrieval_row = self._retrieval_row(retrieval_block)
+            if retrieval_row is not None:
+                overhead_rows.append(retrieval_row)
+            overhead_tokens = estimate_tokens(overhead_rows)
             started = self._spawn_bg_compaction_if_needed(
                 sid, rows_now, overhead_tokens=overhead_tokens
             )
@@ -1504,36 +1580,59 @@ class Agent:
         if await self._reject_extra_args("context", msg, cmd):
             return
         rows = self.transcripts.load(sid)
-        # The pending idle-recap summary (if a recap was installed at boot or
-        # last turn). Read the cache directly — do NOT call _idle_recap_for,
-        # which could trigger an LLM summarize. None when nothing's pending.
+        # The idle-recap summary in force for this session (installed at boot
+        # or on the last turn, and re-injected into every turn's system prompt
+        # until the session is cleared or rotated — it is read, never popped).
+        # Read the cache directly — do NOT call _idle_recap_for, which could
+        # trigger an LLM summarize. None when no recap is installed.
         recap = self._idle_recap_blocks.get(sid)
-        # Reproduce exactly what the next turn's system prompt will be, minus
-        # the per-message memory-retrieval block (unknowable until the user
-        # types). _build_system_prompt is sync + side-effect-free.
-        system = self._build_system_prompt("", recap)
+        # Reproduce exactly what the next turn's system prompt will be.
+        # _build_system_prompt is sync + side-effect-free. The retrieval block
+        # is no longer part of it at all (it rides in the history now), so this
+        # is the whole system prompt rather than an approximation of it.
+        system = self._build_system_prompt(recap)
         sys_toks = estimate_tokens([{"content": system}])
         hist_toks = estimate_tokens(rows)
         start_toks = sys_toks + hist_toks
         thr = self.cfg.compaction.mid_session_token_threshold
-        # Auto-compaction counts the real prompt — system-prompt overhead
-        # (workspace + skills + retrieved memory) PLUS transcript rows — so
-        # report the % against that combined figure, not transcript-only.
-        # (This estimate omits the per-message memory-retrieval block, which
-        # is unknowable until the user types, so the live trigger fires a
-        # touch earlier than shown.)
+        # Auto-compaction counts the real prompt — non-transcript overhead
+        # PLUS transcript rows — so report the % against that combined figure,
+        # not transcript-only. (This estimate omits the per-turn retrieval
+        # block, which is unknowable until the user types, so the live trigger
+        # fires a touch earlier than shown.)
         pct = round(100 * start_toks / thr) if thr else 0
         recap_note = (
-            f", incl. ~{estimate_tokens([{'content': recap}]):,} pending recap"
+            f", incl. ~{estimate_tokens([{'content': recap}]):,} recap"
             if recap else ""
         )
+        # Report the OPERATION, not just the budget. The trigger above counts
+        # overhead and compares against mid_session_token_threshold; the split
+        # counts transcript rows only and compares against reserve_tokens. Two
+        # different quantities — so a prompt sitting well below the trigger can
+        # still have nothing to compact, which reads as a silent no-op unless
+        # the floor is stated outright.
+        reserve = self.cfg.compaction.reserve_tokens
+        would_older, would_newer = compaction_preview(self.cfg, rows)
+        if would_older:
+            compact_note = (
+                f"%compact now would summarize ~{would_older:,} and keep "
+                f"~{would_newer:,} verbatim (reserve {reserve:,})."
+            )
+        else:
+            compact_note = (
+                f"%compact now would do nothing — nothing older is worth "
+                f"summarizing (transcript ~{hist_toks:,} against a "
+                f"{reserve:,} reserve). Either it fits inside the reserve, "
+                f"or the slice past it is too small to be worth replacing "
+                f"with a recap."
+            )
         await self._cmd_reply(
             msg.peer_id,
             f"Context: next turn starts at ~{start_toks:,} tokens — system "
             f"~{sys_toks:,}{recap_note} + {len(rows)} transcript rows "
             f"~{hist_toks:,}, before your message / memory retrieval / tool "
             f"schema. Auto-compaction triggers on the full prompt at "
-            f"{thr:,} (~{pct}% there).",
+            f"{thr:,} (~{pct}% there). {compact_note}",
         )
 
     async def _cmd_stop(

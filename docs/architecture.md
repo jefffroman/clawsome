@@ -135,7 +135,7 @@ except the read-only `%subagents` listing.
 
 | Command | Action |
 |---|---|
-| `%context` | Report the next turn's starting token floor (system prompt + pending recap + transcript rows) vs. the compaction threshold. Read-only. |
+| `%context` | Report the next turn's starting token floor (system prompt + recap + transcript rows) vs. the compaction threshold. Read-only. |
 | `%compact` | If a forced compaction would actually swap (transcript exceeds the reserve/keep window), run a pre-compact memory_flush then force-compact; else no-op *without* flushing. |
 | `%clear` | Final memory_flush, then archive the transcript + reset per-session state (same machinery as the daily rotate). |
 | `%stop [<task_id>] [--soft]` | Cancel the in-flight turn + its entire spawned cascade, suppress those subagents' completion delivery, and SIGKILL their bash trees. `<task_id>` instead cancels just that subagent + its descendant subtree (parent/siblings untouched). `--soft` skips only the bash kill. |

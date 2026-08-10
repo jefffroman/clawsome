@@ -31,7 +31,24 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "matrix-nio[e2e]>=0.25,<0.27",
+    # The `[e2e]` extra is NOT optional: `nio/crypto/__init__.py` gates every
+    # crypto export on the backend package being importable, so a bare
+    # `matrix-nio` install leaves ENCRYPTION_ENABLED = False and drops
+    # `nio.crypto.Sas` — encryption silently turns OFF rather than failing
+    # loudly, and `channel/matrix.py` fails to import.
+    #
+    # Floor is >=0.26: that release swapped the E2E backend from libolm to
+    # vodozemac, which ships a native cp314 macOS arm64 wheel and so retires
+    # the patched python-olm sdist build the claw role used to run. Verified
+    # on 2026-08-07 before moving: an existing `.matrix-store/` loads natively
+    # under vodozemac with no re-bootstrap (identical device fingerprint, all
+    # Olm and inbound-group sessions intact), and 0.26 still exposes no
+    # cross-signing surface, so `channel/matrix_crosssigning.py` stays.
+    "matrix-nio[e2e]>=0.26,<0.27",
+    # Ed25519 for cross-signing (claw/channel/pksigning.py). vodozemac has no
+    # seed-driven signing primitive, so this replaces the `olm.PkSigning` that
+    # matrix-nio used to pull in transitively.
+    "cryptography>=42",
     "httpx>=0.27",
     "PyYAML>=6.0",
     "apscheduler>=3.10",

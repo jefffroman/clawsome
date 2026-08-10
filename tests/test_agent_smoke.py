@@ -349,7 +349,7 @@ def test_voice_hint_injected_for_voice_modality(
 ):
     agent = _voice_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
                          fake_channel, transcripts)
-    sysprompt = agent._build_system_prompt("", None, modality="voice")
+    sysprompt = agent._build_system_prompt(None, modality="voice")
     assert _HINT_MARKER in sysprompt
 
 
@@ -359,9 +359,9 @@ def test_voice_hint_absent_for_text_modality(
     agent = _voice_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
                          fake_channel, transcripts)
     # Same agent, non-voice modality -> the hint must not leak in.
-    assert _HINT_MARKER not in agent._build_system_prompt("", None, modality="text")
+    assert _HINT_MARKER not in agent._build_system_prompt(None, modality="text")
     # Default modality (None) is also non-voice.
-    assert _HINT_MARKER not in agent._build_system_prompt("", None)
+    assert _HINT_MARKER not in agent._build_system_prompt(None)
 
 
 def test_voice_hint_disabled_by_empty_config(
@@ -371,7 +371,7 @@ def test_voice_hint_disabled_by_empty_config(
     agent = _voice_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
                          fake_channel, transcripts,
                          voice=VoiceServiceConfig(modality_hint=""))
-    assert _HINT_MARKER not in agent._build_system_prompt("", None, modality="voice")
+    assert _HINT_MARKER not in agent._build_system_prompt(None, modality="voice")
 
 
 # --- language steering (all modalities) ------------------------------------
@@ -386,7 +386,7 @@ def test_language_injected_for_all_modalities(
                          fake_channel, transcripts, language="English (en_US)")
     for modality in ("voice", "text", None):
         assert "Always reply in English (en_US)." in \
-            agent._build_system_prompt("", None, modality=modality)
+            agent._build_system_prompt(None, modality=modality)
 
 
 def test_language_absent_when_unset(
@@ -395,4 +395,4 @@ def test_language_absent_when_unset(
     # Default (no language configured) -> no steering line.
     agent = _voice_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
                          fake_channel, transcripts)
-    assert "Always reply in" not in agent._build_system_prompt("", None, modality="text")
+    assert "Always reply in" not in agent._build_system_prompt(None, modality="text")

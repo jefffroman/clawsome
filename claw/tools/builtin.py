@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from claw.runctx import current_task_id, current_turn_id
+from claw.tools.spool import bound_result
 from claw.tools.base import Tool
 
 log = logging.getLogger("claw.tools.bash")
@@ -180,7 +181,12 @@ async def _run_bash(workspace_dir: Path, args: dict[str, Any]) -> str:
     if err:
         body.append(f"[stderr]\n{err.rstrip()}")
     body.append(f"[exit_code] {rc}")
-    return "\n".join(body)
+    # Bounded at write time — a verbose command would otherwise sit in the
+    # transcript for the rest of the session. bound_result keeps a tail, so
+    # the [exit_code] line above survives truncation.
+    return bound_result(
+        "\n".join(body), workspace_dir=workspace_dir, tool="bash",
+    )
 
 
 async def _run_read_file(workspace_dir: Path, args: dict[str, Any]) -> str:

@@ -360,6 +360,43 @@ Add `password_file`, then either restart (it'll bootstrap automatically)
 or set `force_cross_signing_replace: true` for one boot to force a
 replace.
 
+### SAS verification stalls on "waiting for other user", then cancels
+
+The peer sends its key, nothing visibly happens for ~30 s, and it
+cancels with `m.key_mismatch` — having never sent a MAC. Despite the
+cancel code, this is **not** a MAC problem: the verification never got
+that far.
+
+matrix-nio builds the SAS commitment with `sha256(...).hexdigest()`,
+but the spec requires the hash as **unpadded base64** (43 characters,
+not 64 hex). The peer stores the commitment and checks it when our
+ephemeral key arrives, so a hex string can never match. claw re-encodes
+it in `claw/channel/sas_compat.py`; the fix is a no-op if a future
+matrix-nio emits base64 itself.
+
+The same module handles a second nio defect: `chosen_mac_method` is
+pinned to legacy `hkdf-hmac-sha256` while MACs are computed with the
+*corrected* base64. claw prefers `hkdf-hmac-sha256.v2` when the peer
+offers it (the spec forbids v1 in that case), and falls back to forcing
+libolm's encoding for v1-only peers.
+
+Because these events are E2E-encrypted, a failed exchange **cannot** be
+reconstructed from the room timeline. claw logs every SAS event in both
+directions — grep the log for `SAS <<<` / `SAS >>>` and read the actual
+`accept` content before theorising.
+
+### Upgrading matrix-nio across the vodozemac boundary
+
+nio 0.26 replaced libolm with vodozemac. An existing store migrates
+automatically and losslessly — same device fingerprint, sessions intact
+— but the migration is **one-way, and merely opening a store performs
+it**. A 0.26 process that only *reads* a store rewrites its pickles;
+0.25 then fails on it with `OlmAccountError: BAD_ACCOUNT_KEY`.
+
+Back up each `.matrix-store/` before upgrading, and never point a
+different-version interpreter at a live store to "just check" — verify
+on copies.
+
 ### Bot missing from invited room
 
 Check `auto_join: always` is set. With `"never"`, invites must be

@@ -1,6 +1,6 @@
 """One-shot cross-signing bootstrap for matrix-nio bots.
 
-matrix-nio 0.25 has no client-side cross-signing surface — bots that don't
+matrix-nio has no client-side cross-signing surface — bots that don't
 publish a master signing key show up as "user verification unavailable" in
 Element X (and as red-exclamation messages in Element Web). matrix-js-sdk
 auto-bootstraps these on first run; we have to do it ourselves.
@@ -16,8 +16,11 @@ user, ``ensure_cross_signing`` returns ``False`` and skips. Seeds are
 persisted at ``seed_store_path`` (mode 0600) so a homeserver re-bootstrap
 reuses the same keys.
 
-Olm/Curve25519/Ed25519 primitives come from ``python-olm`` (already
-installed via ``matrix-nio[e2e]``).
+Ed25519 signing comes from :mod:`claw.channel.pksigning`, which replaced
+``olm.PkSigning`` when matrix-nio 0.26 swapped its E2E backend from libolm to
+vodozemac (vodozemac exposes no seed-driven signing primitive). It is
+bit-compatible with libolm, so seeds written before the swap keep deriving
+the same keys.
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from olm import PkSigning
+
+from claw.channel.pksigning import PkSigning
 
 log = logging.getLogger("claw.channel.matrix_crosssigning")
 
