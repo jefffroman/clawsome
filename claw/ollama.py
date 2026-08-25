@@ -280,6 +280,7 @@ class OllamaClient:
         tools: list[dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
         label: str = "",
+        think: bool | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
@@ -290,7 +291,23 @@ class OllamaClient:
             body["tools"] = tools
         if options:
             body["options"] = options
+        # ``think`` is omitted unless a caller asks, so the default stays the
+        # model's own (thinking on) for every conversational and curation
+        # turn. Only a caller that DISCARDS the trace should pass False.
+        if think is not None:
+            body["think"] = think
         resp = await self._client.post("/api/chat", json=body)
+        if resp.status_code == 400 and "think" in body:
+            # Same guard summarize() carries: a model with no thinking mode
+            # rejects the field outright. Every model we ship is a Qwen3
+            # hybrid, so this is protection for a future swap, not a path we
+            # expect to take.
+            log.warning(
+                "%s%s rejected think=%s; retrying without it",
+                _label_prefix(label), model, body["think"],
+            )
+            body.pop("think")
+            resp = await self._client.post("/api/chat", json=body)
         if resp.status_code >= 500:
             # 5xx from /api/chat is usually a tool-call parser failure
             # against the model's raw output (qwen3coder.go / qwen35.go
@@ -324,6 +341,8 @@ class OllamaClient:
         num_predict: int | None = None,
         max_tool_turns: int | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        drain_inbox: Callable[[], list[dict[str, Any]]] | None = None,
+        think: bool | None = None,
     ) -> tuple[list[dict[str, Any]], str, str]:
         """Drive ``/api/chat`` until the model stops requesting tools.
 
@@ -338,6 +357,12 @@ class OllamaClient:
         ceiling). It is ephemeral — captured for optional out-of-band display
         only; it is **never** placed in ``new_messages`` and never persisted
         to the transcript.
+
+        ``drain_inbox``, when given, is called once per tool turn and returns
+        OpenAI-flat rows to append before the next model call — the mechanism
+        by which a subagent completion reaches the turn that spawned it rather
+        than the one after it. It must be synchronous and must not await, so
+        the pop-and-mutate of the caller's queue stays atomic under asyncio.
 
         ``sid`` and ``workspace_dir`` are used to spool oversized tool
         results into ``<workspace>/.tool-results/<sid>/<call_id>.txt``: the
@@ -438,7 +463,7 @@ class OllamaClient:
             try:
                 return await self.chat_once(
                     model=model, messages=messages, tools=tool_specs, options=options,
-                    label=label,
+                    label=label, think=think,
                 )
             except httpx.HTTPStatusError as e:
                 if 500 <= e.response.status_code < 600 and not parse_retry_used:
@@ -450,11 +475,36 @@ class OllamaClient:
                     messages.append({"role": "system", "content": _PARSE_RECOVERY_NOTE})
                     return await self.chat_once(
                         model=model, messages=messages, tools=tool_specs, options=options,
-                        label=label,
+                        label=label, think=think,
                     )
                 raise
 
         for turn_idx in range(effective_max_tool_turns):
+            # Mid-turn inbox, drained before the model picks its next action.
+            #
+            # Without this the tool loop is a closed system: it can only learn
+            # what was true when the turn started, plus its own tool results.
+            # A subagent that finishes here has nowhere to report — its
+            # completion sits in the agent's pending queue behind the session
+            # lock this very turn is holding, and is not seen until the turn
+            # ends. On a 50-tool-turn chain that is an hour late, by which
+            # point the agent has usually redone or abandoned the work.
+            #
+            # Injected at the TAIL, so the KV prefix built by every preceding
+            # row survives (same rule as retrieved memory). Injected at the TOP
+            # of the iteration, so it lands after the previous iteration's tool
+            # results are all appended — never between a tool_call and its
+            # result, which would break tool atomicity and the compaction
+            # cut-point invariant.
+            if drain_inbox is not None:
+                injected = drain_inbox()
+                if injected:
+                    messages.extend(injected)
+                    new_messages.extend(injected)
+                    log.info(
+                        "%sturn %d: injected %d inbound row(s) mid-turn",
+                        prefix, turn_idx, len(injected),
+                    )
             response = await chat_with_parse_recovery(turn_idx)
             assistant_msg = response.get("message", {}) or {}
             content = assistant_msg.get("content", "") or ""

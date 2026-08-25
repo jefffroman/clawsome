@@ -97,6 +97,12 @@ class SubagentsConfig:
     max_children_per_agent: int
     default_model: str
     personas: dict[str, PersonaConfig]
+    # Ceiling on one spawned task's whole life, including any time it spends
+    # waiting on its own children. A subagent's session is scratch and is only
+    # reachable through its handle, so a task that never finishes would pin
+    # both until the gateway restarts; this bounds that. Generous by design —
+    # a researcher persona legitimately runs for many minutes.
+    task_timeout_seconds: int = 3600
 
 
 @dataclass(frozen=True)
@@ -123,9 +129,12 @@ class CompactionConfig:
 @dataclass(frozen=True)
 class MemoryFlushConfig:
     enabled: bool = True
-    # Periodic flush triggers from the maintenance loop (paired with reindex)
-    # whenever a session's transcript has grown by this many tokens since its
-    # last periodic flush. Lets long-running sessions capture durable info
+    # The growth gate: a flush fires at turn-end whenever a session's
+    # transcript has grown by this many tokens since its last flush. Evaluated
+    # alongside the compaction gate in one place (Agent.
+    # _spawn_bg_maintenance_if_needed) rather than on a timer — a timer could
+    # not see anything extra (growth only comes from turns) and firing on one
+    # risks starting GPU work alongside a live reply. Lets long-running sessions capture durable info
     # regularly instead of waiting for compaction to be imminent. With a
     # 96K compaction trigger, 4K of growth ≈ 4% — a comfortable cadence.
     periodic_growth_threshold: int = 4000
@@ -503,6 +512,9 @@ def _parse(d: dict[str, Any]) -> Config:
             max_concurrent=d["subagents"]["max_concurrent"],
             max_children_per_agent=d["subagents"]["max_children_per_agent"],
             default_model=d["subagents"]["default_model"],
+            task_timeout_seconds=d["subagents"].get(
+                "task_timeout_seconds", 3600,
+            ),
             personas={
                 name.lower(): _parse_persona(spec)
                 for name, spec in d["subagents"]["personas"].items()

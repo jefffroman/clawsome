@@ -40,6 +40,11 @@ class InboundMessage:
     sender_id: str = ""
     modality: str = "text"
     session_key: str = ""
+    # True only for the synthetic completion a finished subagent fires
+    # back at its spawner. The agent may inject these into a RUNNING
+    # turn (see Agent._process_batch); every other inbound waits for the
+    # drainer and becomes its own conversational turn.
+    is_subagent_completion: bool = False
 
     def __post_init__(self) -> None:
         # Default the session key to the legacy per-(channel, peer) form so

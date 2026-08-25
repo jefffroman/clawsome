@@ -32,16 +32,31 @@ role label, spawn budget, optional `can_spawn` allowlist — declared once
 under `subagents.personas:` in `claw.yaml` and shared across every agent
 in the deployment. A *subagent* is a transient `Agent` fork instantiated
 from a persona by the `subagent_spawn` tool (`persona` + `prompt` + a
-required short `task_name` label): one-shot, no transcript
-persistence, no compaction, sharing the parent's workspace, memory
-index, and tool registry (minus the `subagent_*` family and `cron_*`).
-Spawns are **async**: the fork's `run_one_shot(prompt)` runs as a
-detached `asyncio.Task` held by the spawner registry, and the
-`subagent_spawn` tool returns immediately with a `task_id` — freeing
-the parent's drainer to handle other inbound while the child works.
-On completion (success, failure, or cancellation) the spawner fires a
-synthetic `InboundMessage` whose `(channel, peer_id)` match the
-original spawn site, so the result arrives as the parent's next turn.
+required short `task_name` label), sharing the parent's workspace,
+memory index, and tool registry (minus the `subagent_*` family and
+`cron_*`). It runs no compaction and no memory flush, and its transcript
+is **scratch**: real, so the subagent's context survives between its own
+turns, but written under `transcripts/subagent/` where none of the
+participant-session machinery walks it, scoped to the life of its
+handle, and purged at boot.
+
+Spawns are **async**: the fork's `run_task(prompt)` runs as a detached
+`asyncio.Task` held by the spawner registry, and `subagent_spawn`
+returns immediately with a `task_id` — freeing the parent's drainer to
+handle other inbound while the child works.
+
+An agent's replies go to a **sink** (`claw/sink.py`), and that is the
+only thing distinguishing the two kinds: a participant's `ChannelSink`
+writes to a transport, a subagent's `ParentSink` spools the full text
+and delivers a compact summary into its spawner's inbox. Because a
+subagent has an inbox of its own, a task it spawned reports back to it
+the same way — depth is not a special case.
+
+A report is marked `is_subagent_completion`, which lets the spawner pick
+it up **mid-turn**, between its own tool calls, rather than only after
+its current turn ends. One spawn may therefore report more than once: a
+subagent woken by its own child can report again, and an interim report
+says so rather than claiming to be finished.
 That completion is deliberately compact: the child's full output is
 spooled to a workspace file (`<workspace>/.tool-results/<sid>/`, reaped
 with the other tool-result scratch) and the message carries the

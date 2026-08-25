@@ -134,6 +134,9 @@ async def run_memory_flush(
     asked to append to; ``None`` falls back to UTC. Caller typically
     passes ``cfg.tz``.
 
+    Runs with ``think=False``: the flush turn's prose is discarded, so a
+    reasoning trace is pure waste here (7x measured — see the call site).
+
     The flush runs with a self-contained system prompt (no workspace
     extra_paths) and is expected to be passed a narrowed ``tools`` dict
     (just ``append_file``) so the model can't drift into bash/read_file
@@ -153,6 +156,47 @@ async def run_memory_flush(
             workspace_dir=workspace_dir,
             label=f"{agent_id}:flush:{reason}:{peer_label}",
             verbose_suffix=sid,
+            # Bound the turn. Both were already run_turn parameters; this call
+            # simply never passed them, so a flush inherited the widest
+            # possible settings: max_tool_turns fell back to the client-wide
+            # value (50, for a turn with ONE tool), and num_predict was never
+            # sent at all — run_turn only builds `options` when the parameter
+            # is given, so Ollama applied its own unlimited default rather
+            # than the configured 8192.
+            #
+            # num_predict is a CEILING, not an allocation — unused headroom
+            # costs nothing — so the only job here is catching a runaway, and
+            # being tight buys nothing while risking real harm. A flush's
+            # output is almost entirely the append_file tool-call ARGUMENTS,
+            # so hitting the cap truncates the memory content mid-JSON: a
+            # malformed call and a wasted recovery retry, on the one turn
+            # whose output IS the product. Matches SUMMARY_NUM_PREDICT, set
+            # at 4096 on the same model for the same reason ("or the recap is
+            # truncated mid-sentence right at the size where it matters
+            # most"). Measured need is ~200 eval tokens, so this is ~20x —
+            # deliberately, and free.
+            #
+            # 6 tool turns is 8x tighter than the client-wide 50 while still
+            # allowing several appends plus a closing turn. Both are backstops
+            # against a confused flush eating its whole turn_timeout_s, not
+            # limits a healthy one should approach.
+            num_predict=4096,
+            max_tool_turns=6,
+            # A flush discards the model's prose entirely — the append_file
+            # side effect is the whole product — so a reasoning trace is
+            # produced and thrown away, exactly as it was on summarize().
+            # Measured 2026-08-24 on qwen3.6:35b-a3b with a real 25-row flush
+            # prompt, n=3: median 19.0s / 1162 eval tokens with thinking on
+            # against 2.7s / 181 with it off, a 7x difference, and the range
+            # tightens from 10.7-31.8s to 2.5-3.1s — which matters as much on
+            # a path carrying a turn_timeout_s deadline. The append_file call
+            # was emitted in every run of both arms, so suppressing the trace
+            # does not cost the tool call.
+            #
+            # NOT a blanket setting: think stays at the model default for
+            # conversational turns (where %thinking surfaces it) and for the
+            # curator (whose judgement calls need it).
+            think=False,
         )
     except Exception:
         log.exception("[%s] memory flush turn failed (reason=%s)", sid, reason)

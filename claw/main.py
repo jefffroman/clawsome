@@ -25,6 +25,7 @@ import asyncio
 import logging
 import signal
 import sys
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -40,7 +41,7 @@ from claw.memory_curate import curate_all_agents
 from claw.ollama import OllamaClient
 from claw.skills import build_agent_registry
 from claw.tools.subagent import SubagentSpawner
-from claw.transcript import TranscriptStore
+from claw.transcript import TranscriptStore, purge_scratch_sessions
 from claw.triggers.initial_prompt import maybe_dispatch_initial_prompt
 from claw.triggers.scheduler import JobRunner
 
@@ -85,6 +86,11 @@ async def _serve(cfg: Config) -> int:
 
         tools, skill_catalog = build_agent_registry(cfg, ac.workspace)
         transcripts = TranscriptStore(ac.workspace / "transcripts")
+        # Subagent sessions are scratch and are reachable only through a live
+        # handle. Handles do not survive a restart, so anything left here is
+        # unreachable by construction — purge it rather than leak it, and so a
+        # post-restart spawn can never inherit a dead task's context.
+        purge_scratch_sessions(transcripts.dir / "subagent", ac.id)
         channel = MatrixChannel(ac.matrix)
         channels.append(channel)
 
@@ -255,28 +261,20 @@ async def _maintenance_loop(
     indexes: list[MemoryIndex],
     interval_s: int = 300,
 ) -> None:
-    """Periodic maintenance: trigger memory_flush per active session that
-    has grown enough since its last flush, gather, then reindex so the
-    new memory file content gets picked up in the same tick.
+    """Periodic reindex, so memory written since the last tick is retrievable.
+
+    This loop used to ALSO drive memory flushes. It no longer does: a flush is
+    GPU work, the timer fired blind to turn state, and a tick landing mid-turn
+    put a second /api/chat alongside a live reply. Both gates now live at
+    turn-end (Agent._spawn_bg_maintenance_if_needed), which sees every growth
+    event a timer could — transcript growth only comes from turns — and cannot
+    contend by construction.
 
     Runs forever until cancelled.
     """
     while True:
         try:
             await asyncio.sleep(interval_s)
-
-            flush_tasks: list[asyncio.Task] = []
-            for agent in agents:
-                try:
-                    flush_tasks.extend(agent.periodic_flush_pass())
-                except Exception:
-                    log.exception("[%s] periodic_flush_pass raised", agent.id)
-            if flush_tasks:
-                log.info(
-                    "maintenance: %d periodic flush task(s) running",
-                    len(flush_tasks),
-                )
-                await asyncio.gather(*flush_tasks, return_exceptions=True)
 
             for index in indexes:
                 try:

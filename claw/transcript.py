@@ -13,6 +13,7 @@ Strip ``ts`` via ``as_message()`` before sending back to Ollama.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -22,6 +23,9 @@ from typing import Any
 
 
 _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+log = logging.getLogger("claw.transcript")
 
 
 def sid_for_key(session_key: str) -> str:
@@ -48,6 +52,35 @@ def _flush_state_path(transcripts_dir: Path, sid: str) -> Path:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def purge_scratch_sessions(scratch_dir: Path, agent_id: str = "") -> int:
+    """Delete every subagent scratch session under ``scratch_dir``.
+
+    Subagent sessions are reachable only through a live handle, and handles do
+    not survive a gateway restart — so at boot everything here is unreachable
+    by construction. Purging is what stops a post-restart spawn inheriting a
+    dead task's context, and what stops the directory growing without bound.
+
+    Returns the number removed. Non-.jsonl entries are left alone.
+    """
+    if not scratch_dir.is_dir():
+        return 0
+    removed = 0
+    for entry in scratch_dir.iterdir():
+        if entry.suffix != ".jsonl":
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+        except OSError:
+            log.exception("[%s] could not purge %s", agent_id, entry)
+    if removed:
+        log.info(
+            "[%s] purged %d orphaned subagent session(s) from %s",
+            agent_id, removed, scratch_dir,
+        )
+    return removed
 
 
 class TranscriptStore:

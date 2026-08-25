@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from claw.config import SubagentsConfig
+from claw.sink import ParentSink, completion_body
 from claw.tools.subagent import (
     _RESULT_PREVIEW_CHARS,
     ChildTask,
@@ -105,9 +106,7 @@ def test_completion_is_compact_and_spooled(tmp_path):
     parent = _RecordingParent(tmp_path)
     spawner = _spawner()
     ct = _child("matrix__room")
-    ct.result_path = _spool_result(ct, parent.agent_cfg.workspace)
-
-    asyncio.run(spawner._deliver_completion(parent, ct))
+    asyncio.run(ParentSink(parent, ct).reply(ct.result))
 
     assert len(parent.received) == 1
     body = parent.received[0].text
@@ -127,16 +126,27 @@ def test_completion_is_compact_and_spooled(tmp_path):
     assert "PROMPT-SENTINEL" in spooled
 
 
-def test_completion_falls_back_to_inline_when_spool_missing(tmp_path):
-    parent = _RecordingParent(tmp_path)
-    spawner = _spawner()
+def test_completion_falls_back_to_inline_when_spool_missing():
+    """Spooling failed (disk hiccup): the report inlines a BOUNDED preview
+    rather than losing the result or reintroducing the full-body bloat.
+
+    Asserts on completion_body directly. Driving it through ParentSink would
+    spool successfully into tmp_path and silently exercise the other branch,
+    leaving this case untested while still passing.
+    """
     ct = _child("matrix__room", result="short answer", result_path=None)
-
-    asyncio.run(spawner._deliver_completion(parent, ct))
-
-    body = parent.received[0].text
+    body = completion_body(ct)
     assert "short answer" in body
     assert "Convert homepage HTML" in body
+    assert "Result:" in body and "saved to:" not in body
+
+
+def test_inline_fallback_is_still_bounded():
+    """The fallback must not become a hole the full result escapes through."""
+    ct = _child("matrix__room", result_path=None)  # result is 40k chars
+    body = completion_body(ct)
+    assert "z" * 1000 not in body
+    assert "more chars in the file" in body
 
 
 def test_task_name_required(tmp_path):

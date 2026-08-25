@@ -8,11 +8,12 @@ job is one-shot.
 
 **Async semantics.** ``subagent_spawn`` returns immediately with a
 ``task_id``. The child runs as a detached ``asyncio.Task`` held by
-the ``SubagentSpawner`` registry. On completion, the spawner fires a
-synthetic ``InboundMessage(channel=<origin>, peer_id=<origin>,
-sender_name="subagent:<persona>:<task_id>")`` into the parent's
-drainer — the parent's next turn carries the result in context.
-``subagent_status(task_id)`` exists for explicit polling.
+the ``SubagentSpawner`` registry. Its report goes out through a
+``claw.sink.ParentSink``, which spools the full text and delivers a
+compact summary into the spawner's inbox as a synthetic
+``InboundMessage(..., is_subagent_completion=True)``. That flag lets
+the spawner pick it up mid-turn, between its own tool calls, rather
+than only after its current turn ends.
 
 The completion the parent sees is deliberately compact: the caller-
 supplied ``task_name`` (so it knows which task finished) plus a short
@@ -47,15 +48,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claw.channel.base import InboundMessage
 from claw.config import SubagentsConfig
+# Re-exported: the completion formatting + spool helpers moved to
+# claw.sink (ParentSink owns them now). Kept importable here because
+# this is their historical home and the spool contract is documented
+# against it.
+from claw.sink import (  # noqa: F401
+    _RESULT_PREVIEW_CHARS,
+    _format_elapsed,
+    _result_preview,
+    _spool_contents,
+    _spool_result,
+    _task_slug,
+    ParentSink,
+)
 from claw.runctx import current_sid, current_task_id, current_turn_id
 from claw.tools.base import Tool
 
@@ -71,13 +82,6 @@ ABSOLUTE_MAX_CHAIN_DEPTH = 5
 # Soft cap on registry size. When exceeded, oldest completed/failed
 # entries are evicted; running entries are never evicted.
 _MAX_REGISTRY_SIZE = 100
-
-# A subagent's full result is spooled to a workspace file; only this many
-# leading chars are inlined into the completion the parent receives. Keeps a
-# large result (e.g. a whole HTML file) out of the parent's persisted
-# transcript — the parent read_file's the spooled path for the full output.
-_RESULT_PREVIEW_CHARS = 200
-
 
 @dataclass
 class ChildTask:
@@ -95,6 +99,13 @@ class ChildTask:
     status: str = "running"  # running | completed | failed | cancelled
     completed_at: datetime | None = None
     result: str | None = None
+    # Every report this task has sent its spawner. A subagent woken by its
+    # own child can report again, so one spawn is not necessarily one
+    # result; ``result`` stays the latest so status/list keep their shape.
+    emissions: list[str] = field(default_factory=list)
+    # The report being assembled for delivery; separate from ``result``,
+    # which the sink sets once the text is spooled.
+    pending_emission: str = ""
     # Short caller-supplied label, echoed back in the completion so the parent
     # can match a result to its request without the prompt being echoed
     # verbatim. The subagent itself never sees it.
@@ -123,76 +134,6 @@ def _allocate_task_id(persona: str, taken: set[str]) -> str:
         tid = f"{persona}-{secrets.token_hex(4)}"
         if tid not in taken:
             return tid
-
-
-def _format_elapsed(seconds: float) -> str:
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    m = s // 60
-    if m < 60:
-        return f"{m}m{s % 60}s"
-    h = m // 60
-    return f"{h}h{m % 60}m"
-
-
-def _task_slug(name: str, maxlen: int = 40) -> str:
-    """Filesystem-safe slug from a task_name, for the spool filename."""
-    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
-    return slug[:maxlen].strip("-") or "task"
-
-
-def _result_preview(result: str) -> str:
-    if len(result) <= _RESULT_PREVIEW_CHARS:
-        return result
-    more = len(result) - _RESULT_PREVIEW_CHARS
-    return f"{result[:_RESULT_PREVIEW_CHARS]}… (+{more:,} more chars in the file)"
-
-
-def _spool_contents(ct: "ChildTask") -> str:
-    """The full spool payload: a task header, the ORIGINAL PROMPT, then the
-    RESULT.
-
-    The prompt is included here because the spool is the **only** place it's
-    kept on disk — the parent's persisted transcript stubs the spawn-call args
-    once they pass 200 chars (``_truncate_persisted_tool_call_args``), the
-    spawn log line records only metadata, and the in-memory registry is lost on
-    restart / evicted after ~100 tasks. So the ref'd file is the sole durable
-    (for the ~24h scratch lifetime) record of what the subagent was asked.
-    The completion preview stays response-only — it reads ``ct.result``, not
-    this payload.
-    """
-    return (
-        f"=== SUBAGENT TASK {ct.task_name!r}  "
-        f"(persona={ct.persona}, task_id={ct.id}, status={ct.status}) ===\n\n"
-        f"--- PROMPT ---\n{ct.prompt}\n\n"
-        f"--- RESULT ---\n{ct.result or ''}\n"
-    )
-
-
-def _spool_result(ct: "ChildTask", workspace_dir: Path) -> str | None:
-    """Write the prompt + ``ct.result`` to a transient spool file under
-    ``<workspace>/.tool-results/<origin_sid>/`` and return its
-    workspace-relative path. Reuses the same scratch tree as large tool
-    results, so ``Agent.sweep_spool_tree`` (run after each nightly rotate)
-    reaps it on the same >24h grace. Returns None if there is nothing to
-    spool or the write fails — the caller then falls back to a bounded
-    inline result rather than losing it.
-    """
-    if ct.result is None:
-        return None
-    try:
-        spool_dir = workspace_dir / ".tool-results" / ct.origin_session_key
-        spool_dir.mkdir(parents=True, exist_ok=True)
-        path = spool_dir / f"{_task_slug(ct.task_name)}-{ct.id}.txt"
-        path.write_text(_spool_contents(ct))
-        return str(path.relative_to(workspace_dir))
-    except OSError:
-        log.exception(
-            "[%s] failed to spool subagent result for task_id=%s",
-            ct.parent_id, ct.id,
-        )
-        return None
 
 
 class SubagentSpawner:
@@ -286,211 +227,133 @@ class SubagentSpawner:
         return (
             f"started: task_id={task_id} persona={persona_key} "
             "(running in background). This tool returned a task id "
-            "immediately; you'll get a prompt when the task completes. "
-            f"(subagent_status with task_id={task_id} is available for "
-            "polling.)"
+            "immediately. You do not need to collect the result: it will be "
+            "delivered to you automatically as a message in this "
+            "conversation when the child finishes, including partway through "
+            "this turn between your tool calls. Do not sleep, poll, or do "
+            "the work yourself while waiting — carry on with other work, or "
+            "end your turn if there is nothing else to do. "
+            f"(subagent_status with task_id={task_id} only reports whether "
+            "it is still alive; you do not need it to get the result.)"
         )
 
-    async def _run_subagent(self, parent: "Agent", ct: ChildTask) -> None:
-        """Detached worker: holds the global semaphore, runs the child's
-        single-turn inference, stores the result on the ChildTask, and
-        fires the synthetic completion message.
+    def has_outstanding_children(self, task_id: str) -> bool:
+        """Whether anything this task spawned is still running — i.e. whether
+        it can still be woken by a report."""
+        return any(
+            t.parent_task_id == task_id and t.status == "running"
+            for t in self.tasks.values()
+        )
+
+    async def _emit(self, child: "Agent", ct: ChildTask) -> None:
+        """Send one report to the spawner.
+
+        Terminal unless this task's own children are still running, in which
+        case it may yet be woken and report again."""
+        ct.status = (
+            "reporting" if self.has_outstanding_children(ct.id) else "completed"
+        )
+        await child.sink.reply(ct.pending_emission)
+        ct.emissions.append(ct.pending_emission)
+
+    async def _drive(self, child: "Agent", ct: ChildTask) -> None:
+        """Run the task, then keep the subagent alive for as long as its own
+        children could still report to it.
+
+        This loop is the reason a subagent needs a session at all. Its context
+        persists between turns, so a child's report resumes the conversation
+        that asked for it rather than arriving at an agent with no history.
         """
+        ct.pending_emission = await child.run_task(ct.prompt)
+        log.info(
+            "[%s] subagent task_id=%s persona=%s completed in %s (%d chars)",
+            child.parent_id, ct.id, ct.persona,
+            _format_elapsed((_now() - ct.started_at).total_seconds()),
+            len(ct.pending_emission or ""),
+        )
+        await self._emit(child, ct)
+        while self.has_outstanding_children(ct.id):
+            # Bounded by the outer task timeout, which covers the whole life.
+            if not await child.wait_for_inbound(self.cfg.task_timeout_seconds):
+                break
+            ct.pending_emission = await child.run_task()
+            log.info(
+                "[%s] subagent task_id=%s resumed on a child report (%d chars)",
+                child.parent_id, ct.id, len(ct.pending_emission or ""),
+            )
+            await self._emit(child, ct)
+
+    async def _run_subagent(self, parent: "Agent", ct: ChildTask) -> None:
+        """Detached worker: holds the global semaphore, runs the child to
+        completion, and reaps its scratch session afterwards."""
         # Tag this subagent's context so its bash (and any deeper spawn it
         # makes) is attributable to ct.id; a grandchild's own _run_subagent
         # overrides this for its subtree. Reset in the outer finally.
         tok_task = current_task_id.set(ct.id)
+        child: "Agent | None" = None
         try:
             try:
                 async with self.semaphore:
                     child = parent.fork(ct.persona, task_id=ct.id)
-                    result_text = await child.run_one_shot(ct.prompt)
-                    ct.status = "completed"
-                    ct.result = result_text
+                    child.attach_sink(ParentSink(parent, ct))
+                    await asyncio.wait_for(
+                        self._drive(child, ct),
+                        timeout=self.cfg.task_timeout_seconds,
+                    )
             except asyncio.CancelledError:
                 log.info(
                     "[%s] subagent task_id=%s persona=%s cancelled",
                     parent.id, ct.id, ct.persona,
                 )
                 ct.status = "cancelled"
-                ct.result = "(cancelled)"
+                await self._emit_terminal(parent, ct, "(cancelled)")
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning(
+                    "[%s] subagent task_id=%s persona=%s hit "
+                    "task_timeout_seconds=%d", parent.id, ct.id, ct.persona,
+                    self.cfg.task_timeout_seconds,
+                )
+                ct.status = "failed"
+                await self._emit_terminal(
+                    parent, ct,
+                    f"error: subagent timed out after "
+                    f"{self.cfg.task_timeout_seconds}s",
+                )
             except Exception as e:
                 log.exception(
                     "[%s] subagent task_id=%s persona=%s raised",
                     parent.id, ct.id, ct.persona,
                 )
                 ct.status = "failed"
-                ct.result = f"error: subagent failed: {e}"
-            ct.completed_at = _now()
-            ct.result_path = _spool_result(ct, parent.agent_cfg.workspace)
-            if ct.suppress_delivery:
-                # Whole-turn %stop killed this cascade: do NOT inbound a
-                # completion, or the stopped session would be resurrected
-                # by its own zombie. Status is set; %subagents still shows.
-                log.info(
-                    "[%s] subagent task_id=%s completion suppressed "
-                    "(session stopped)", parent.id, ct.id,
+                await self._emit_terminal(
+                    parent, ct, f"error: subagent failed: {e}",
                 )
-            else:
-                # Deliver outside the semaphore for all exit modes
-                # (completed/failed/cancelled) — uniform notification
-                # shape regardless of how the run ended.
-                try:
-                    await self._deliver_completion(parent, ct)
-                except asyncio.CancelledError:
-                    # Loop is shutting down (gateway restart). Status is
-                    # already set on ct; subagent_status will still report.
-                    pass
             self._gc_registry()
         finally:
+            if child is not None:
+                # The handle is dead, so nothing can reach this session again.
+                # Reaping here is what makes a later spawn of the same persona
+                # start clean instead of inheriting this one's context.
+                child.discard_scratch_session()
             current_task_id.reset(tok_task)
             self.children_by_parent[parent.id] = max(
                 0, self.children_by_parent.get(parent.id, 1) - 1,
             )
 
-    async def _deliver_completion(self, parent: "Agent", ct: ChildTask) -> None:
-        """Fire a synthetic InboundMessage on the origin session. Channel
-        + peer_id match the original session so the parent's transcript
-        carries the completion in the same conversational thread.
-        """
-        elapsed = ""
-        if ct.completed_at is not None:
-            elapsed = f" elapsed={_format_elapsed((ct.completed_at - ct.started_at).total_seconds())}"
-        header = (
-            f"Subagent task {ct.task_name!r} finished. "
-            f"task_id={ct.id} persona={ct.persona} status={ct.status}{elapsed}"
-        )
-        preview = _result_preview(ct.result or "(no output)")
-        if ct.result_path is not None:
-            body_lines = [
-                header,
-                "",
-                f"Full prompt + result saved to: {ct.result_path}",
-                "(Transient scratch — reaped ~24h after the next session "
-                "rotate. read_file / bash that path for the full prompt and "
-                "output; copy it elsewhere to keep it.)",
-                "",
-                f"Preview (first {_RESULT_PREVIEW_CHARS} chars):",
-                preview,
-            ]
-        else:
-            # Spool unavailable — inline a bounded preview rather than the
-            # full result, so a disk hiccup can't reintroduce the bloat.
-            body_lines = [header, "", "Result:", preview]
-        msg = InboundMessage(
-            peer_id=ct.origin_peer_id,
-            sender_name=f"subagent:{ct.persona}:{ct.id}",
-            text="\n".join(body_lines),
-            channel=ct.origin_channel,
-            # Re-enter the spawning turn's session explicitly — channel+peer_id
-            # alone can't rebuild a shared key like voice's "home".
-            session_key=ct.origin_session_key,
-            # peer_label derivation in agent._derive_peer_label uses
-            # sender_id when present; setting the task_id here gives the
-            # parent's resulting run_turn label a useful tag like
-            # ``[agent-1:main:persona-3-a1b2c3d4]`` instead of the
-            # ``subagent:persona-3:persona-3-a1b2c3d4`` sender_name fallback.
-            sender_id=ct.id,
-        )
+    async def _emit_terminal(
+        self, parent: "Agent", ct: ChildTask, text: str,
+    ) -> None:
+        """Report an abnormal exit. Separate from _emit because the child may
+        not exist yet (a fork that raised), so the sink is built from the
+        spawner directly."""
         try:
-            await parent.handle_inbound(msg)
-        except Exception:
-            log.exception(
-                "[%s] subagent completion delivery raised for task_id=%s",
-                parent.id, ct.id,
-            )
-
-    def _gc_registry(self) -> None:
-        """Evict oldest completed/failed entries when the registry grows
-        past the soft cap. Running entries are never evicted.
-        """
-        if len(self.tasks) <= _MAX_REGISTRY_SIZE:
-            return
-        completed = [
-            ct for ct in self.tasks.values()
-            if ct.status != "running" and ct.completed_at is not None
-        ]
-        completed.sort(key=lambda c: c.completed_at)  # type: ignore[arg-type,return-value]
-        excess = len(self.tasks) - _MAX_REGISTRY_SIZE
-        for ct in completed[:excess]:
-            self.tasks.pop(ct.id, None)
-
-    # --- operator %stop support -----------------------------------------
-
-    def running_for_session(self, sid: str) -> list["ChildTask"]:
-        """Running subagents whose origin session is ``sid``, newest first.
-        Session-scoped (every turn's children) — for %subagents discovery.
-        """
-        out = [
-            ct for ct in self.tasks.values()
-            if ct.status == "running"
-            and ct.origin_session_key == sid
-        ]
-        out.sort(key=lambda c: c.started_at, reverse=True)
-        return out
-
-    def cancel_turn(self, turn_id: str, *, suppress: bool) -> list[str]:
-        """Cancel every running subagent whose ``spawn_turn_id == turn_id``
-        — i.e. the entire cascade rooted at one turn, at any depth (the
-        turn id is inherited transitively). ``suppress`` sets
-        ``suppress_delivery`` first so a stopped session is not resurrected
-        by these children's completions. Returns the cancelled task ids.
-        """
-        if not turn_id:
-            return []
-        hit: list[str] = []
-        for ct in list(self.tasks.values()):
-            if ct.status != "running" or ct.spawn_turn_id != turn_id:
-                continue
-            ct.suppress_delivery = suppress
-            if ct.aio_task is not None and not ct.aio_task.done():
-                ct.aio_task.cancel()
-            hit.append(ct.id)
-        return hit
-
-    def cancel_subtree(self, task_id: str) -> list[str]:
-        """Cancel ``task_id`` and its transitive descendants (children via
-        ``parent_task_id``). The target keeps normal completion delivery
-        (the session is alive and should learn it was killed, same as the
-        model-facing subagent_stop); collateral descendants are suppressed
-        so they don't spam the session. Returns the cancelled task ids.
-        """
-        target = self.tasks.get(task_id)
-        if target is None:
-            return []
-        # BFS the parent_task_id forest from the target.
-        subtree = {task_id}
-        frontier = [task_id]
-        while frontier:
-            parent = frontier.pop()
-            for ct in self.tasks.values():
-                if ct.parent_task_id == parent and ct.id not in subtree:
-                    subtree.add(ct.id)
-                    frontier.append(ct.id)
-        hit: list[str] = []
-        for tid in subtree:
-            ct = self.tasks.get(tid)
-            if ct is None or ct.status != "running":
-                continue
-            ct.suppress_delivery = tid != task_id  # deliver only the target
-            if ct.aio_task is not None and not ct.aio_task.done():
-                ct.aio_task.cancel()
-            hit.append(tid)
-        return hit
-
-    def format_running(self, cts: list["ChildTask"]) -> str:
-        if not cts:
-            return "No subagents running for this session."
-        lines = [f"{len(cts)} subagent(s) running:"]
-        for ct in cts:
-            elapsed = _format_elapsed((_now() - ct.started_at).total_seconds())
-            lines.append(
-                f"  {ct.id}  task_name={ct.task_name!r}  "
-                f"persona={ct.persona}  elapsed={elapsed}"
-            )
-        return "\n".join(lines)
-
-    # --- status (read-only) ---------------------------------------------
+            ct.pending_emission = text
+            await ParentSink(parent, ct).reply(text)
+            ct.emissions.append(text)
+        except asyncio.CancelledError:
+            # Loop is shutting down (gateway restart). Status is already set
+            # on ct; subagent_status will still report.
+            pass
 
     def format_status(self, ct: ChildTask) -> str:
         if ct.status == "running":
@@ -548,10 +411,9 @@ def build_subagent_spawn_tool(
             )
         # Capture the parent's currently-active inbound so the eventual
         # completion message lands in the same session. _active_inbound
-        # is set by _process_batch; outside a turn (e.g. run_one_shot in
-        # a subagent) there's no active inbound — and in that case the
-        # caller wouldn't have subagent_spawn in their tool registry
-        # anyway (forks strip it). Defensive guard keeps the contract clean.
+        # is set by _process_batch for a participant and by run_task for a
+        # subagent, so a spawn from either has one. Defensive guard keeps the
+        # contract clean for any caller outside a turn entirely.
         origin = parent._active_inbound
         if origin is None:
             return "error: subagent_spawn called outside an active session"
@@ -565,9 +427,14 @@ def build_subagent_spawn_tool(
             "Spawn a subagent persona for a one-shot task. The child runs "
             "asynchronously against its persona's configured model and "
             "shares your workspace, tools, and memory. Persona is "
-            "case-insensitive. This tool returns a task id immediately; "
-            "you'll get a prompt when the task completes. (subagent_status "
-            "is available for polling.)\n\n"
+            "case-insensitive. This tool returns a task id immediately.\n\n"
+            "YOU DO NOT NEED TO DO ANYTHING TO COLLECT THE RESULT. It is "
+            "delivered to you automatically, as a message in this "
+            "conversation, as soon as the child finishes — including partway "
+            "through the turn you are in, in between your own tool calls. "
+            "Never sleep, poll, re-run the task yourself, or read files "
+            "hoping the child has written them: just carry on with other "
+            "work, or end your turn if there is nothing else to do.\n\n"
             "Keep both sides' context small: pass file PATHS in your prompt, "
             "not pasted file contents — the subagent shares your workspace "
             "and can read_file them itself. Its output comes back as a short "
@@ -639,8 +506,10 @@ def build_subagent_status_tool(parent: "Agent", spawner: SubagentSpawner) -> Too
         description=(
             "Look up the status of a previously-spawned subagent by "
             "task_id. Returns running + elapsed time, or completed/failed/"
-            "cancelled status with the full result body. Use this to poll "
-            "without waiting for the auto-prompt."
+            "cancelled status with the full result body.\n\n"
+            "You do NOT need this to receive a result — completions arrive on "
+            "their own. Use it only to check whether a long-running child is "
+            "still alive, never as a way to wait for one."
         ),
         input_schema={
             "type": "object",

@@ -20,9 +20,11 @@ flush + summarize against that snapshot, then takes the per-session lock
 and atomically swaps in a recap turn for the snapshot's older portion —
 preserving any user/assistant turns that arrived during the work.
 
-A separate ``periodic_flush_pass`` is invoked from the maintenance loop
-(paired with reindex) to flush sessions that have grown by
-``memory_flush.periodic_growth_threshold`` tokens since the last flush.
+Both background gates — compaction and memory-flush growth — are evaluated
+at ONE point, ``_spawn_bg_maintenance_if_needed``, at turn-end. Transcript
+growth only ever comes from a turn appending rows, so a turn-boundary check
+catches every growth event; a timer cannot see anything extra, and firing on
+one risks starting GPU work alongside a live reply.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from claw.config import AgentConfig, Config
 from claw.memory import MemoryIndex
 from claw.memory_flush import run_memory_flush
 from claw.ollama import OllamaClient
+from claw.sink import ChannelSink, Sink
 from claw.tools.base import Tool
 from claw.tools.subagent import (
     SubagentSpawner,
@@ -259,6 +262,11 @@ class Agent:
 
         # Per-session state.
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Where this agent's replies go. None => a ChannelSink built per
+        # turn from the inbound's channel + peer. A forked subagent sets a
+        # ParentSink here instead, which is the only difference between
+        # the two kinds of agent on the reply path.
+        self._sink_override: Sink | None = None
         # Pending inbound messages per session. Messages that arrive while a
         # turn is in flight queue here and get coalesced into the next
         # batch (one combined user turn -> one run_turn -> one reply).
@@ -383,6 +391,26 @@ class Agent:
         if self.agent_cfg.max_tool_turns is not None:
             return self.agent_cfg.max_tool_turns
         return self.cfg.ollama.max_tool_turns
+
+    @property
+    def scratch_sid(self) -> str:
+        """This subagent's session id. Keyed by task_id, not agent id: two
+        concurrent spawns of the same persona from the same parent share an
+        agent id and would otherwise collide in one transcript."""
+        return f"subagent-{self.spawn_task_id or self.id}"
+
+    def attach_sink(self, sink: Sink) -> None:
+        """Make this agent a subagent: its replies go to ``sink`` instead of a
+        channel, and it stops being eligible for a conversational drainer."""
+        self._sink_override = sink
+
+    @property
+    def sink(self) -> Sink | None:
+        """Where this agent's replies go, when it is not a participant."""
+        return self._sink_override
+
+    def _sink_for(self, channel: Channel, peer_id: str) -> Sink:
+        return self._sink_override or ChannelSink(channel, peer_id)
 
     def _session_lock(self, sid: str) -> asyncio.Lock:
         return self._session_locks.setdefault(sid, asyncio.Lock())
@@ -627,7 +655,16 @@ class Agent:
             ollama=self.ollama,
             memory=self.memory,
             tools=base_tools,
-            transcripts=self.transcripts,
+            # Scratch store: <workspace>/transcripts/subagent/. A subagent's
+            # context is real (it survives between its own turns, so a child
+            # can wake it) but must never sit in the participant's transcript
+            # dir — every walker there filters on *.jsonl, so a subdirectory
+            # is skipped by rotation, boot recap and the flush pass alike.
+            # A fork of a fork reuses the same store rather than nesting.
+            transcripts=(
+                self.transcripts if self.depth > 0
+                else TranscriptStore(self.transcripts.dir / "subagent")
+            ),
             channel=self.channel,
             skill_catalog=self.skill_catalog,
             spawner=self.spawner,
@@ -638,50 +675,104 @@ class Agent:
             spawn_task_id=task_id,
         )
 
-    async def run_one_shot(self, prompt: str) -> str:
-        """Single-turn run for subagents. No persistence, no compaction."""
-        try:
-            retrieval_block = await self.memory.retrieve_markdown(
-                prompt,
-                top_n=self.cfg.memory_retrieval.top_n,
-                compact=self.cfg.memory_retrieval.compact,
-            )
-        except Exception:
-            log.exception("[%s] subagent memory retrieve failed", self.id)
-            retrieval_block = ""
+    async def run_task(self, prompt: str | None = None) -> str:
+        """One turn of a subagent, against its own scratch session.
 
-        history = self._with_retrieval(
-            [{"role": "user", "content": prompt}], retrieval_block,
-        )
-        system = self._build_system_prompt()
+        Replaces ``run_one_shot``. The difference that matters is that the turn
+        is backed by a real transcript and an inbox, so this agent can be woken
+        by its own children and resume with its context intact. ``run_one_shot``
+        discarded ``new_messages``, which is why a subagent that spawned a child
+        had nowhere for the result to land: it was a callable, and the delivery
+        mechanism needs a participant.
+
+        Called with ``prompt`` for the opening turn and without it for a resume,
+        where the queued child report is the only new input.
+
+        Still deliberately unlike ``_process_batch``: no idle recap, no
+        compaction, no memory flush, no envelope wrap. Those are participant
+        concerns, and the opening prompt must stay byte-identical to what
+        subagents have always been given.
+        """
+        sid = self.scratch_sid
+        # Ambient sid for this subagent's own work, so its bash/web_search
+        # spools land under subagent-<task_id>/ (which sweep_spool_tree already
+        # documents) instead of the human's session dir, and so any grandchild
+        # it spawns keys its completion to THIS session rather than the
+        # participant's.
+        tok_sid = current_sid.set(sid)
+        # subagent_spawn reads this to address its child's completion back here.
+        self._active_inbound = ("subagent", self.spawn_task_id or self.id)
         try:
-            sid = f"subagent-{self.id}"
-            # Label as <parent_id>:subagent:<task_id> when both are known
-            # (i.e. when this Agent was created via fork from a spawner);
-            # falls back to bare ``subagent:<sid>`` for any direct
-            # run_one_shot caller that bypassed fork.
+            if prompt is not None:
+                self.transcripts.append(sid, {"role": "user", "content": prompt})
+            # Reports that landed while this subagent was idle between turns.
+            # (Ones arriving mid-turn are picked up by drain_inbox below.)
+            for row in self._take_subagent_completions(sid):
+                self.transcripts.append(sid, row)
+
+            rows = self.transcripts.load(sid)
+            try:
+                retrieval_block = await self.memory.retrieve_markdown(
+                    prompt or (rows[-1].get("content") if rows else "") or "",
+                    top_n=self.cfg.memory_retrieval.top_n,
+                    compact=self.cfg.memory_retrieval.compact,
+                )
+            except Exception:
+                log.exception("[%s] subagent memory retrieve failed", self.id)
+                retrieval_block = ""
+            history = self._with_retrieval(
+                [as_message(r) for r in rows], retrieval_block,
+            )
+            system = self._build_system_prompt()
+
             if self.parent_id and self.spawn_task_id:
                 label = f"{self.parent_id}:subagent:{self.spawn_task_id}"
             else:
                 label = f"subagent:{sid}"
-            _new_messages, final_text, _ = await self.ollama.run_turn(
+            new_messages, final_text, _ = await self.ollama.run_turn(
                 model=self.agent_cfg.primary_model,
                 history=history,
                 system=system,
                 tools=self.tools,
-                # Subagent one-shots discard new_messages, but the model
-                # still sees full tool results in-loop and the spool side
-                # effect is bounded (one shot, <max_tool_turns calls).
                 sid=sid,
                 workspace_dir=self.agent_cfg.workspace,
                 label=label,
                 num_predict=self.num_predict,
                 max_tool_turns=self.max_tool_turns,
+                drain_inbox=lambda: self._take_subagent_completions(sid),
             )
+            for m in new_messages:
+                self.transcripts.append(sid, m)
+            return final_text or ""
         except Exception:
             log.exception("[%s] subagent run_turn failed", self.id)
             return f"error: subagent {self.id} run_turn failed"
-        return final_text or ""
+        finally:
+            current_sid.reset(tok_sid)
+
+    def discard_scratch_session(self) -> None:
+        """Reap this subagent's session. Its handle is gone, so nothing can
+        reach it again; a later spawn of the same persona must start clean
+        rather than inherit this one's context."""
+        sid = self.scratch_sid
+        self._pending_inbound.pop(sid, None)
+        self._has_pending.pop(sid, None)
+        self._session_locks.pop(sid, None)
+        try:
+            (self.transcripts.dir / f"{sid}.jsonl").unlink(missing_ok=True)
+        except OSError:
+            log.exception("[%s] failed to reap scratch session %s", self.id, sid)
+
+    async def wait_for_inbound(self, timeout: float) -> bool:
+        """Block until something lands in this subagent's inbox. False on
+        timeout."""
+        ev = self._has_pending.setdefault(self.scratch_sid, asyncio.Event())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            return False
+        ev.clear()
+        return True
 
     # --- boot recap -----------------------------------------------------
 
@@ -776,6 +867,14 @@ class Agent:
             "[%s] mirrored cron reply into primary session %s (from %s)",
             self.id, target_sid, own_sid,
         )
+        # Upholds the invariant on _spawn_bg_maintenance_if_needed: this is the
+        # only path that appends to a transcript the running turn does not own,
+        # so the mirrored-into session would otherwise never have its gates
+        # evaluated. Safe here — a cron turn has already replied by this point,
+        # so nothing is generating.
+        self._spawn_bg_maintenance_if_needed(
+            target_sid, self.transcripts.load(target_sid),
+        )
 
     async def handle_inbound(self, msg: InboundMessage) -> None:
         """Enqueue the message and signal the per-session drainer. Returns
@@ -816,6 +915,16 @@ class Agent:
                 return  # not enqueued, not transcribed, not sent to the LLM
 
         self._pending_inbound.setdefault(sid, []).append(msg)
+        # A subagent drives its own turns from _run_subagent and has no
+        # channel to reply on, so it must NEVER start a conversational
+        # drainer. Without this guard a grandchild's completion would spin one
+        # up on a fork: it would take the FORK's session lock (a different
+        # object from the participant's, so no mutual exclusion), run a full
+        # turn against the human's transcript, and post to the room. The queue
+        # is still filled above — run_task drains it between and within turns.
+        if self._sink_override is not None:
+            self._has_pending.setdefault(sid, asyncio.Event()).set()
+            return
         # Lazy-create the drainer for this session on first inbound.
         if sid not in self._drainer_tasks or self._drainer_tasks[sid].done():
             self._drainer_tasks[sid] = asyncio.create_task(
@@ -837,12 +946,13 @@ class Agent:
         turn's typing + reply go back to the box, not to matrix.
         """
         channel = self._channel_for(channel_name)
+        sink = self._sink_for(channel, peer_id)
         has_pending = self._has_pending.setdefault(sid, asyncio.Event())
         while True:
             try:
                 await has_pending.wait()
                 async with self._session_lock(sid):
-                    async with channel.typing(peer_id):
+                    async with sink.typing():
                         while True:
                             batch = self._pending_inbound.pop(sid, [])
                             if not batch:
@@ -859,7 +969,9 @@ class Agent:
                             turn_id = f"{sid}#{secrets.token_hex(4)}"
                             self._inflight_turn[sid] = turn_id
                             try:
-                                await self._process_batch(sid, batch, turn_id, channel)
+                                await self._process_batch(
+                                    sid, batch, turn_id, channel, sink,
+                                )
                             finally:
                                 self._inflight_turn.pop(sid, None)
                                 self._system_emitted_turns.discard(turn_id)
@@ -868,9 +980,64 @@ class Agent:
             except Exception:
                 log.exception("[%s] drainer iteration raised; continuing", self.id)
 
+    def _take_subagent_completions(self, sid: str) -> list[dict]:
+        """Take any subagent completions queued for ``sid``, as user rows.
+
+        Called once per tool turn (via ``run_turn``'s ``drain_inbox`` hook) so
+        a child that finishes mid-turn reports into the turn that spawned it,
+        rather than waiting for that turn to release the session lock. Before
+        this existed, the tool loop was a closed system and a completion could
+        only be seen by the NEXT conversational turn — on a long chain, an hour
+        late and usually useless.
+
+        ONLY subagent completions are taken. A message from a person stays
+        queued for the drainer and becomes its own conversational turn:
+        mid-turn injection is for work this agent itself started and may be
+        waiting on, not for interrupting it with new instructions.
+
+        Synchronous by contract — it reads and mutates ``_pending_inbound``
+        with no await in between, so the drainer (parked on this session's lock
+        for the duration of the turn) cannot interleave with it.
+        """
+        queued = self._pending_inbound.get(sid)
+        if not queued:
+            return []
+        taken = [m for m in queued if m.is_subagent_completion]
+        if not taken:
+            return []
+        remaining = [m for m in queued if not m.is_subagent_completion]
+        if remaining:
+            self._pending_inbound[sid] = remaining
+        else:
+            self._pending_inbound.pop(sid, None)
+        rows: list[dict] = []
+        for m in taken:
+            now = datetime.now(timezone.utc)
+            body = f"{m.sender_name}: {m.text}" if m.sender_name else m.text
+            # Same envelope a post-turn delivery would have carried, so an
+            # injected completion is indistinguishable in the transcript from
+            # one that arrived at a turn boundary.
+            rows.append({
+                "role": "user",
+                "content": format_inbound_envelope(
+                    channel=m.channel,
+                    sender=m.sender_name or None,
+                    body=body,
+                    ts=now,
+                    prev_ts=self._last_inbound_at.get(sid),
+                    tz_name=self.cfg.tz,
+                ),
+            })
+            self._last_inbound_at[sid] = now
+        log.info(
+            "[%s] %d subagent completion(s) delivered mid-turn on %s",
+            self.id, len(taken), sid,
+        )
+        return rows
+
     async def _process_batch(
         self, sid: str, msgs: list[InboundMessage], turn_id: str = "",
-        channel: Channel | None = None,
+        channel: Channel | None = None, sink: Sink | None = None,
     ) -> None:
         """Process a batch of one or more inbound messages as a single turn.
 
@@ -883,6 +1050,8 @@ class Agent:
         # resolve from the batch as a fallback for any direct call).
         if channel is None:
             channel = self._channel_for(msgs[0].channel)
+        if sink is None:
+            sink = self._sink_for(channel, msgs[0].peer_id)
 
         # Cron turns are stateless: each scheduled fire is an independent event,
         # so it loads no prior history and writes no transcript of its own.
@@ -1013,10 +1182,10 @@ class Agent:
             # ollama fires this on .strip() truthiness; apply the stronger
             # visible-content gate here so "full" suppresses body-less
             # (zero-width/format-only) traces exactly like "final" does.
-            if not _has_visible_content(trace):
+            if not sink.shows_asides or not _has_visible_content(trace):
                 return
             thinking_emitted = True
-            await channel.send(peer_id, _as_thinking_blockquote(trace))
+            await sink.aside(_as_thinking_blockquote(trace))
 
         # Make the session id AND this turn's id ambient for the whole
         # turn so the bash tool tags spawned process groups with both, and
@@ -1041,10 +1210,11 @@ class Agent:
                     num_predict=self.num_predict,
                     max_tool_turns=self.max_tool_turns,
                     on_thinking=_emit_thinking if thinking_mode == "full" else None,
+                    drain_inbox=lambda: self._take_subagent_completions(sid),
                 )
             except Exception:
                 log.exception("[%s] ollama.run_turn failed", self.id)
-                await channel.send(peer_id, "Sorry — I hit an error. Could you try again?")
+                await sink.reply("Sorry — I hit an error. Could you try again?")
                 return
         finally:
             current_turn_id.reset(tok_turn)
@@ -1063,11 +1233,13 @@ class Agent:
         # post-send here would duplicate the last block. None => no-op.
         # _has_visible_content (not .strip()) so a body-less trace never
         # renders as a header-only block.
-        if thinking_mode == "final" and _has_visible_content(final_thinking):
+        if (
+            sink.shows_asides
+            and thinking_mode == "final"
+            and _has_visible_content(final_thinking)
+        ):
             thinking_emitted = True
-            await channel.send(
-                peer_id, _as_thinking_blockquote(final_thinking.strip())
-            )
+            await sink.aside(_as_thinking_blockquote(final_thinking.strip()))
         answer = final_text.strip()
         replied = bool(answer)
         if replied:
@@ -1085,7 +1257,7 @@ class Agent:
             # transcript (final_text alone is what was appended above).
             pre_block = thinking_emitted or turn_id in self._system_emitted_turns
             send_body = _THINKING_ANSWER_SEP + answer if pre_block else answer
-            await channel.send(peer_id, send_body)
+            await sink.reply(send_body)
         else:
             # Backstop. run_turn substitutes a sentinel for every
             # never-legitimate exit, so reaching this means a path returned
@@ -1096,10 +1268,9 @@ class Agent:
                 "[%s] empty reply reached the send site; run_turn should "
                 "have substituted a fallback", self.id,
             )
-            await channel.send(
-                peer_id,
+            await sink.reply(
                 "[claw: I finished this turn without producing a reply. "
-                "Check /var/log/claw.log for this turn.]",
+                "Check /var/log/claw.log for this turn.]"
             )
 
         # A stateless cron turn leaves no transcript of its own, so mirror the
@@ -1157,17 +1328,19 @@ class Agent:
             if retrieval_row is not None:
                 overhead_rows.append(retrieval_row)
             overhead_tokens = estimate_tokens(overhead_rows)
-            started = self._spawn_bg_compaction_if_needed(
+            started = self._spawn_bg_maintenance_if_needed(
                 sid, rows_now, overhead_tokens=overhead_tokens
             )
-            if started and msgs[0].channel == "matrix":
-                await channel.send(
-                    peer_id,
+            # Only compaction is announced. A growth flush is routine, costs
+            # the user nothing, and does not shorten their context — a notice
+            # for it would be noise.
+            if started == "compact" and msgs[0].channel == "matrix":
+                await sink.aside(
                     _as_system_blockquote(
                         "Auto-compaction in progress — condensing the earlier "
                         "part of this conversation to free up context. Running "
                         "in the background."
-                    ),
+                    )
                 )
 
     async def _idle_recap_for(self, sid: str) -> str | None:
@@ -1194,37 +1367,78 @@ class Agent:
 
     # --- background flush + compaction ---------------------------------
 
-    def _spawn_bg_compaction_if_needed(
+    def _spawn_bg_maintenance_if_needed(
         self,
         sid: str,
         rows_snapshot: list[dict],
         *,
         overhead_tokens: int = 0,
-    ) -> bool:
-        """If the compaction predicate trips and no task is currently in
-        flight for this session, spawn a single background task that runs
-        flush then compaction on the compaction model. Returns True if a
-        task was spawned.
+    ) -> str:
+        """Evaluate BOTH background gates for this session and spawn at most
+        one task. Returns "compact", "flush", or "" (nothing spawned).
+
+        Two thresholds, one decision point:
+
+        - compaction (~mid_session_token_threshold): the prompt is getting
+          big; flush first, then summarise the older slice away.
+        - growth (memory_flush.periodic_growth_threshold, ~24x smaller): the
+          session has accumulated enough new material to be worth persisting,
+          long before anything is at risk of being compacted away.
+
+        These used to live in different places — compaction here, growth in a
+        300s maintenance timer (``periodic_flush_pass``). That timer fired
+        blind to turn state, which is how a flush came to run concurrently
+        with a live reply and contend with it for the GPU: exactly the failure
+        d352b0e moved THIS path to turn-end to prevent, reintroduced through
+        the other door. It is safe to retire the timer because transcript
+        growth only ever comes from a turn appending rows, so a check at
+        turn-end catches every growth event by construction.
+
+        INVARIANT: anything that appends to a transcript outside the turn that
+        owns it must call this for the affected sid, at its own turn-end. The
+        only such path today is ``_mirror_synthetic_reply``.
 
         ``overhead_tokens`` is the estimated size of the non-transcript part
         of the prompt (system block + retrieved memory); it's added to the
-        transcript-token estimate so the trigger reflects the real prompt.
+        transcript-token estimate so the compaction trigger reflects the real
+        prompt. It does not apply to the growth gate, which measures how much
+        new *transcript* there is to remember.
         """
         existing = self._bg_compaction.get(sid)
         if existing is not None and not existing.done():
-            return False
+            return ""
 
-        if not will_mid_session_compact(
+        if will_mid_session_compact(
             self.cfg, rows_snapshot, overhead_tokens=overhead_tokens
         ):
-            return False
+            task = asyncio.create_task(
+                self._run_bg_compaction(
+                    sid, rows_snapshot, overhead_tokens=overhead_tokens,
+                ),
+                name=f"bg-compact-{self.id}-{sid}",
+            )
+            self._bg_compaction[sid] = task
+            return "compact"
 
+        if not self.cfg.memory_flush.enabled or not rows_snapshot:
+            return ""
+        grown = (
+            estimate_tokens(rows_snapshot)
+            - self._last_periodic_flush_tokens.get(sid, 0)
+        )
+        if grown < self.cfg.memory_flush.periodic_growth_threshold:
+            return ""
         task = asyncio.create_task(
-            self._run_bg_compaction(sid, rows_snapshot, overhead_tokens=overhead_tokens),
-            name=f"bg-compact-{self.id}-{sid}",
+            self._run_flush_guarded(
+                sid=sid,
+                full_rows=list(rows_snapshot),
+                reason="periodic-growth",
+                mode="bg",
+            ),
+            name=f"growth-flush-{self.id}-{sid}",
         )
         self._bg_compaction[sid] = task
-        return True
+        return "flush"
 
     async def _run_bg_compaction(
         self,
@@ -1264,54 +1478,6 @@ class Agent:
             # fresh task. Other code paths only check `.done()` so the task
             # remaining in the dict transiently isn't a correctness problem.
             self._bg_compaction.pop(sid, None)
-
-    # --- periodic flush (called from maintenance loop) ------------------
-
-    def periodic_flush_pass(self) -> list[asyncio.Task]:
-        """Walk active session transcripts; spawn a background flush per
-        session whose token count has grown by
-        ``memory_flush.periodic_growth_threshold`` since the last flush.
-
-        Returns the list of spawned tasks so the caller (maintenance loop)
-        can ``asyncio.gather`` them before reindex if it wants the fresh
-        memory file content captured in the same tick.
-        """
-        tasks: list[asyncio.Task] = []
-        if not self.cfg.memory_flush.enabled:
-            return tasks
-        td = self.transcripts.dir
-        if not td.is_dir():
-            return tasks
-        delta_threshold = self.cfg.memory_flush.periodic_growth_threshold
-        for entry in os.listdir(td):
-            if not entry.endswith(".jsonl"):
-                continue
-            if is_archived_transcript(entry):
-                continue
-            sid = entry[: -len(".jsonl")]
-            existing = self._bg_compaction.get(sid)
-            if existing is not None and not existing.done():
-                # A pre-compact bg task is already running for this session;
-                # the periodic flush would duplicate work.
-                continue
-            rows = self.transcripts.load(sid)
-            if not rows:
-                continue
-            current_tokens = estimate_tokens(rows)
-            last = self._last_periodic_flush_tokens.get(sid, 0)
-            if current_tokens - last < delta_threshold:
-                continue
-            task = asyncio.create_task(
-                self._run_flush_guarded(
-                    sid=sid,
-                    full_rows=list(rows),
-                    reason="periodic-growth",
-                    mode="bg",
-                ),
-                name=f"periodic-flush-{self.id}-{sid}",
-            )
-            tasks.append(task)
-        return tasks
 
     # --- in-band admin commands ----------------------------------------
 
