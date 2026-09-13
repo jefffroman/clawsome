@@ -62,6 +62,8 @@ from claw.memory_flush import run_memory_flush
 from claw.ollama import OllamaClient
 from claw.sink import ChannelSink, Sink
 from claw.tools.base import Tool
+from claw.tools.bluetooth import build_bluetooth_tools
+from claw.tools.music import build_music_tools
 from claw.tools.subagent import (
     SubagentSpawner,
     build_subagent_list_tool,
@@ -365,6 +367,29 @@ class Agent:
             self.tools["cron_add"] = build_cron_add_tool(self.id, job_runner, cfg.cron.default_deliver_to, cfg.tz)
             self.tools["cron_list"] = build_cron_list_tool(job_runner)
             self.tools["cron_remove"] = build_cron_remove_tool(job_runner)
+        # bluetooth_* is gated twice: exposed_to (who) and verbs (what), each
+        # answering a different question — see BluetoothConfig. Same depth==0
+        # rule as cron: the family is stripped on spawn so a subagent cannot
+        # reach the radio its parent was trusted with.
+        if (
+            depth == 0
+            and cfg.bluetooth.enabled
+            and self.id in cfg.bluetooth.exposed_to
+        ):
+            self.tools.update(
+                build_bluetooth_tools(
+                    cfg.bluetooth.binary,
+                    cfg.bluetooth.verbs,
+                    cfg.bluetooth.max_scan_seconds,
+                    cfg.bluetooth.timeout_s,
+                )
+            )
+        # music_* follows the same shape: config-gated, top-level only, stripped
+        # on spawn. Its blueutil path is borrowed from the bluetooth block so a
+        # deployment declares that binary once — the music tools need it to wake
+        # a speaker whether or not any agent is trusted with the radio itself.
+        if depth == 0 and cfg.music.enabled and self.id in cfg.music.exposed_to:
+            self.tools.update(build_music_tools(cfg.music, cfg.bluetooth.binary, self.id, cfg.tz))
 
     @property
     def id(self) -> str:
@@ -641,7 +666,10 @@ class Agent:
         )
         base_tools = {
             k: v for k, v in self.tools.items()
-            if k != "subagent_spawn" and not k.startswith("cron_")
+            if k != "subagent_spawn"
+            and not k.startswith("cron_")
+            and not k.startswith("bluetooth_")
+            and not k.startswith("music_")
         }
         # Child's spawn budget = min(parent_remaining - 1, persona's own ceiling).
         # Both constraints must hold; whichever is tighter wins. Floored at 0.
@@ -928,13 +956,13 @@ class Agent:
         # Lazy-create the drainer for this session on first inbound.
         if sid not in self._drainer_tasks or self._drainer_tasks[sid].done():
             self._drainer_tasks[sid] = asyncio.create_task(
-                self._drain(sid, msg.peer_id, msg.channel),
+                self._drain(sid, msg.channel),
                 name=f"drain-{self.id}-{sid}",
             )
         # Wake the drainer.
         self._has_pending.setdefault(sid, asyncio.Event()).set()
 
-    async def _drain(self, sid: str, peer_id: str, channel_name: str) -> None:
+    async def _drain(self, sid: str, channel_name: str) -> None:
         """Long-lived per-session drainer. Waits on the wake event,
         acquires the session lock, drains the pending queue (coalescing
         whatever's in it into a single combined turn), then sleeps again.
@@ -944,23 +972,36 @@ class Agent:
         ``channel_name`` is the inbound's channel (fixed per session, since the
         session key encodes it); it selects the outbound channel so a voice
         turn's typing + reply go back to the box, not to matrix.
+
+        The reply SINK is resolved per batch, NOT once for the drainer. A
+        drainer is long-lived and outlives every turn it runs, while a voice
+        ``peer_id`` is per-REQUEST (``http:<uuid4>``) rather than per-session
+        like a matrix room. Binding the sink once therefore addressed every
+        reply after the first to the first request's already-popped future,
+        which ``HttpReplyChannel.send`` drops at debug level: the turn ran
+        normally, the transcript was correct, and the caller waited out its
+        full 300 s timeout. Only the first voice turn of each claw process
+        worked, and a restart "fixed" it by rebuilding the drainer.
         """
         channel = self._channel_for(channel_name)
-        sink = self._sink_for(channel, peer_id)
         has_pending = self._has_pending.setdefault(sid, asyncio.Event())
         while True:
             try:
                 await has_pending.wait()
                 async with self._session_lock(sid):
-                    async with sink.typing():
-                        while True:
-                            batch = self._pending_inbound.pop(sid, [])
-                            if not batch:
-                                # Queue empty — clear the wake-event and
-                                # break out of the inner loop. Outer loop
-                                # will await has_pending again.
-                                has_pending.clear()
-                                break
+                    while True:
+                        batch = self._pending_inbound.pop(sid, [])
+                        if not batch:
+                            # Queue empty — clear the wake-event and
+                            # break out of the inner loop. Outer loop
+                            # will await has_pending again.
+                            has_pending.clear()
+                            break
+                        # This batch's own reply route. For matrix every
+                        # message in a session carries the same room peer_id,
+                        # so this is identical to the old behaviour there.
+                        sink = self._sink_for(channel, batch[0].peer_id)
+                        async with sink.typing():
                             if len(batch) > 1:
                                 log.info(
                                     "[%s] coalescing %d inbound messages into one turn",
@@ -1573,8 +1614,22 @@ class Agent:
     async def _cmd_clear(
         self, sid: str, msg: InboundMessage, cmd: ParsedCommand,
     ) -> None:
-        if await self._reject_extra_args("clear", msg, cmd):
-            return
+        # An optional target, because voice turns share the literal "home"
+        # session and cannot issue commands themselves (the control plane is
+        # matrix-only, and "%clear" would not survive STT anyway). Without
+        # this there is no path from anywhere to the voice transcript short of
+        # waiting for the nightly rotate or archiving the file by hand.
+        target = cmd.args.strip()
+        if target:
+            known = self.active_sids()
+            if target not in known:
+                await self._cmd_reply(
+                    msg.peer_id,
+                    f"Unknown session {target!r}. Active: "
+                    + (", ".join(known) if known else "(none)"),
+                )
+                return
+            sid = target
         rows_before = len(self.transcripts.load(sid))
         if rows_before == 0:
             await self._cmd_reply(
@@ -1593,8 +1648,8 @@ class Agent:
         if archived:
             await self._cmd_reply(
                 msg.peer_id,
-                f"Session cleared — {rows_before} rows archived, memory "
-                f"flushed. Starting fresh.",
+                f"Session {sid!r} cleared — {rows_before} rows archived, "
+                f"memory flushed. Starting fresh.",
             )
         else:
             await self._cmd_reply(
@@ -2083,6 +2138,23 @@ class Agent:
         except OSError:
             log.exception("[%s] failed to walk spool tree %s", self.id, root)
 
+    def active_sids(self) -> list[str]:
+        """Every live (non-archived) session id for this agent, sorted.
+
+        One enumeration shared by the nightly rotate and by ``%clear
+        <session>``'s validation, so the set a user can name is exactly the
+        set that rotates — a name accepted by one and unknown to the other
+        would be a confusing way to lose a transcript.
+        """
+        td = self.transcripts.dir
+        if not td.is_dir():
+            return []
+        return [
+            entry[: -len(".jsonl")]
+            for entry in sorted(os.listdir(td))
+            if entry.endswith(".jsonl") and not is_archived_transcript(entry)
+        ]
+
     async def clear_all_sessions(
         self,
         *,
@@ -2098,16 +2170,8 @@ class Agent:
 
         Returns the number of sessions archived.
         """
-        td = self.transcripts.dir
-        if not td.is_dir():
-            return 0
         rotated = 0
-        for entry in sorted(os.listdir(td)):
-            if not entry.endswith(".jsonl"):
-                continue
-            if is_archived_transcript(entry):
-                continue
-            sid = entry[: -len(".jsonl")]
+        for sid in self.active_sids():
             try:
                 if await self.clear_session(sid, run_final_flush=run_final_flush):
                     rotated += 1

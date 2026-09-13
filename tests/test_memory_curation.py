@@ -365,7 +365,7 @@ def _logger_with_capture():
 def test_record_action_requires_all_fields():
     import asyncio
     lg, records = _logger_with_capture()
-    tool = mc.build_record_action_tool(lg, "quint", dry_run=False)
+    tool = mc.build_record_action_tool(lg, "agent-1", dry_run=False)
     out = asyncio.run(tool.run({"action": "archive", "target": "f#s"}))  # no reason
     assert out.startswith("error:")
     assert records == []  # nothing logged when the call is malformed
@@ -374,7 +374,7 @@ def test_record_action_requires_all_fields():
 def test_record_action_logs_valid_decision():
     import asyncio
     lg, records = _logger_with_capture()
-    tool = mc.build_record_action_tool(lg, "quint", dry_run=False)
+    tool = mc.build_record_action_tool(lg, "agent-1", dry_run=False)
     out = asyncio.run(tool.run({
         "action": "Archive",  # case-insensitive
         "target": "memory/2026-05-13.md#Daily Log (m-1a2b3c4d)",
@@ -392,15 +392,15 @@ def test_record_action_logs_valid_decision():
 def test_record_action_dry_run_prefixes_but_still_logs():
     import asyncio
     lg, records = _logger_with_capture()
-    tool = mc.build_record_action_tool(lg, "quint", dry_run=True)
+    tool = mc.build_record_action_tool(lg, "agent-1", dry_run=True)
     asyncio.run(tool.run({"action": "dedup", "target": "f#s (m-x)", "reason": "dup of m-y"}))
-    assert records and records[0].startswith("[quint] DRY-RUN ACTION DEDUP")
+    assert records and records[0].startswith("[agent-1] DRY-RUN ACTION DEDUP")
 
 
 def test_record_action_unknown_label_still_recorded_but_flagged():
     import asyncio
     lg, records = _logger_with_capture()
-    tool = mc.build_record_action_tool(lg, "quint", dry_run=False)
+    tool = mc.build_record_action_tool(lg, "agent-1", dry_run=False)
     out = asyncio.run(tool.run({"action": "delete", "target": "f#s", "reason": "why"}))
     assert "not one of" in out          # nudged back toward the valid set
     assert len(records) == 1             # but the decision is not lost
@@ -422,12 +422,12 @@ def test_curator_tools_adds_record_action_and_gates_dryrun_wrap():
 
     # Live pass: mutating tool passes through unwrapped (really executes),
     # record_action is present.
-    live = mc._curator_tools(tools, lg, "quint", dry_run=False)
+    live = mc._curator_tools(tools, lg, "agent-1", dry_run=False)
     assert "record_action" in live
     assert asyncio.run(live["write_file"].run({"path": "x", "content": "y"})) == "did it"
 
     # Dry run: mutating tool is stubbed (does NOT execute), read tool is not.
-    dry = mc._curator_tools(tools, lg, "quint", dry_run=True)
+    dry = mc._curator_tools(tools, lg, "agent-1", dry_run=True)
     assert asyncio.run(dry["write_file"].run({"path": "x", "content": "y"})).startswith("[dry-run]")
     assert asyncio.run(dry["read_file"].run({"path": "x"})) == "did it"
 

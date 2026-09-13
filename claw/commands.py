@@ -27,7 +27,7 @@ KNOWN: tuple[str, ...] = (
 # per-command error path and the global one-liner below.
 COMMAND_USAGE: dict[str, str] = {
     "compact": "",
-    "clear": "",
+    "clear": "[<session>]",
     "context": "",
     "subagents": "",
     "stop": "[<task_id>] [--soft]",
@@ -78,7 +78,8 @@ def usage(prefix: str) -> str:
     """One-line usage string, echoed back to authorized senders who type a
     bare prefix or an unknown command word."""
     return (
-        f"commands: {prefix}compact, {prefix}clear, {prefix}context, "
+        f"commands: {prefix}compact, {prefix}clear [<session>], "
+        f"{prefix}context, "
         f"{prefix}stop [<task_id>] [--soft], {prefix}subagents, "
         f"{prefix}verbose <on|off>, {prefix}thinking <on|off|full>"
     )

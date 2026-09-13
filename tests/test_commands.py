@@ -49,17 +49,23 @@ def test_known_and_command_usage_single_source():
 
 def test_usage_one_liner_exact():
     assert usage("%") == (
-        "commands: %compact, %clear, %context, "
+        "commands: %compact, %clear [<session>], %context, "
         "%stop [<task_id>] [--soft], %subagents, "
         "%verbose <on|off>, %thinking <on|off|full>"
     )
 
 
 def test_command_usage_no_arg_command():
-    assert command_usage("clear", "%") == "%clear takes no arguments"
-    assert command_usage("clear", "%", "extra") == (
-        "unexpected argument 'extra' — %clear takes no arguments"
+    assert command_usage("compact", "%") == "%compact takes no arguments"
+    assert command_usage("compact", "%", "extra") == (
+        "unexpected argument 'extra' — %compact takes no arguments"
     )
+
+
+def test_clear_takes_an_optional_session():
+    """%clear grew a target so the voice session — which shares the literal
+    "home" sid and cannot issue commands itself — is reachable at all."""
+    assert command_usage("clear", "%") == "usage: %clear [<session>]"
 
 
 def test_command_usage_arg_command():

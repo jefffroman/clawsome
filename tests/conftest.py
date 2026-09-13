@@ -15,6 +15,7 @@ import pytest
 
 from claw.config import (
     AgentConfig,
+    BluetoothConfig,
     CommandsConfig,
     CompactionConfig,
     Config,
@@ -24,6 +25,7 @@ from claw.config import (
     MemoryCurationConfig,
     MemoryFlushConfig,
     MemoryRetrievalConfig,
+    MusicConfig,
     OllamaConfig,
     SearxngConfig,
     SubagentsConfig,
@@ -207,6 +209,8 @@ def make_cfg(make_agent_cfg):
             memory_retrieval=MemoryRetrievalConfig(),
             searxng=SearxngConfig(base_url="http://searx.invalid"),
             cron=CronConfig(enabled=False, jobs_file=tmp_path / "jobs.json"),
+            bluetooth=BluetoothConfig(),
+            music=MusicConfig(),
             subagents=SubagentsConfig(
                 max_concurrent=1,
                 max_children_per_agent=1,

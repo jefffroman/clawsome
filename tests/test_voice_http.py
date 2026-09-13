@@ -29,8 +29,8 @@ def _device(agent: str = "agent-1") -> DeviceConfig:
         name="Box One",
         agent=agent,
         endpoints=(
-            EndpointConfig(id="voice", type="voice", name="Living Room"),
-            EndpointConfig(id="motion", type="event", name="Living Room Motion"),
+            EndpointConfig(id="voice", type="voice", name="Room A"),
+            EndpointConfig(id="motion", type="event", name="Room A Motion"),
         ),
     )
 
@@ -135,7 +135,7 @@ async def test_turn_message_fields_and_modality_derivation():
     assert msg.channel == "voice"
     assert msg.session_key == "home"
     assert msg.sender_id == "box-1/voice"
-    assert msg.sender_name == "Living Room"
+    assert msg.sender_name == "Room A"
     # Modality is derived from the endpoint's type, not asserted by the caller.
     assert msg.modality == "voice"
     assert msg.peer_id.startswith("http:")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,10 +13,11 @@ class OllamaConfig:
     default_compaction_model: str
     # Per-inbound tool-use loop ceiling. The model can request tools, get
     # results back, and repeat — this caps the round-trips before claw
-    # forces a stub final reply. 30 is comfortable for cron-driven research
-    # tasks (web_search × N + reads + write_file + summarize); raise per
-    # deployment if needed.
-    max_tool_turns: int = 30
+    # forces a stub final reply. 50 covers cron-driven research (web_search × N
+    # + reads + write_file + summarize) with headroom; the ceiling is felt as a
+    # turn that stops mid-investigation and answers with what it has, which is
+    # quiet, so err high. Raise per deployment if needed.
+    max_tool_turns: int = 50
     # Per-/api/chat-call generation cap (Ollama options.num_predict). When
     # the model hits this, claw inspects the partial: dangerous truncation
     # (unclosed code fence) → discard partial + return structured error;
@@ -68,6 +69,264 @@ class CronConfig:
     # or blindly re-fired. Applied to `at` jobs only — recurring `cron` jobs
     # keep APScheduler's default to avoid a downtime burst.
     misfire_grace_time: int = 3600
+
+
+@dataclass(frozen=True)
+class BluetoothConfig:
+    """Agent-facing control of the host's Bluetooth radio (macOS, via blueutil).
+
+    Absent block = disabled, so a deployment that never thought about Bluetooth
+    gets no tools. Two gates, answering different questions: ``exposed_to`` says
+    *who* may drive the radio, ``verbs`` says *what* may be done to it. They are
+    independent because the risky part is the verb, not the caller — pairing a
+    speaker and forgetting a mouse are not the same act, and one agent usually
+    wants the first without the second.
+
+    ``verbs`` defaults to the observing pair. Anything that mutates radio state
+    is opt-in per deployment: on a headless machine there is no GUI to undo a
+    controller power-off or a stray unpair with.
+    """
+    enabled: bool = False
+    binary: Path = Path("/opt/homebrew/bin/blueutil")
+    exposed_to: tuple[str, ...] = ()
+    verbs: tuple[str, ...] = ("list", "scan")
+    # An inquiry occupies the radio for its whole duration, so an unbounded
+    # value lets a single tool call wedge every other Bluetooth consumer.
+    # Classic BR/EDR inquiry works in 1.28s slots and wants ~10.24s to find a
+    # device reliably; a cap below that makes scanning quietly unreliable.
+    max_scan_seconds: int = 20
+    # Wall-clock ceiling on one blueutil invocation. Its own internal waits are
+    # ~10s (power, connect), so this is a backstop against a wedged radio, not
+    # a tuning knob.
+    timeout_s: float = 90.0
+
+
+@dataclass(frozen=True)
+class MusicOutput:
+    """One named speaker the agent can address by id.
+
+    The agent says ``room-a``; it never handles a CoreAudio device string,
+    a MAC, or a filesystem path. That is not only ergonomics — a raw device
+    string on a model-composed command line is a quoting hazard, and a MAC is a
+    thing a model will cheerfully invent.
+
+    ``bluetooth_address`` being **absent** means a wired or built-in output with
+    no connect step. It is never null-for-none: an output that is reachable
+    unconditionally and one that must be woken are different kinds of thing, and
+    the difference is whether the key is there.
+    """
+    id: str
+    name: str
+    mpv_device: str
+    # Diagnostics and the SwitchAudioSource default-output dance. Never matched
+    # against; mpv_device is the identity.
+    coreaudio_name: str = ""
+    bluetooth_address: str | None = None
+    default: bool = False
+
+
+@dataclass(frozen=True)
+class DjConfig:
+    """Speech between the songs: what the DJ sounds like, and how loud.
+
+    Rendered by the **Piper CLI**, not by wyoming-piper. That is the whole
+    reason these settings can exist at all: ``length_scale`` is a daemon CLI
+    flag, so a streaming voice path has one global rate shared by every device,
+    and a per-device rate would need a second piper daemon on its own port. A
+    file render goes nowhere near the daemon, so every knob below is
+    an argument to a subprocess and independent of how an agent sounds when it
+    answers out loud.
+
+    Independent on purpose: a later change to the desktop voice should not drag
+    the DJ along with it, and vice versa.
+    """
+    enabled: bool = False
+    # The Piper CLI and the voice it speaks in. Point both at an existing Piper
+    # install — typically the same one a voice stack already uses, declared once
+    # in the deployment so the two cannot drift.
+    piper_binary: Path = Path("/opt/homebrew/var/claw/voice/venv/bin/piper")
+    voice_model: Path = Path(
+        "/opt/homebrew/var/claw/voice/models/piper/en_US-joe-medium.onnx"
+    )
+    # Regenerable cache, so the runtime dir with the socket — NOT ~claw/.claw,
+    # where library.db lives because it cannot be rebuilt from the files.
+    render_dir: Path = Path("/opt/homebrew/var/claw/music/dj")
+
+    # -- synthesis (piper flags) --
+    # Phoneme duration: 1.0 native, <1 faster. The daemon's global --length-scale
+    # does not apply here.
+    length_scale: float = 1.0
+    # Silence Piper leaves after each sentence, in seconds.
+    sentence_silence: float = 0.3
+
+    # -- loudness --
+    # Soft-clip drive (ffmpeg asoftclip=type=tanh:param=N), the same curve as
+    # the voice-gateway's loudness.apply_drive. 1.0 = off — and off means the
+    # filter is left out of the chain entirely, because asoftclip at param=1.0
+    # is not a passthrough (measured: -0.4 LU, peaks 2.4 dB down).
+    #
+    # **Timbre only — it never moves the level.** A saturated link is measured
+    # against the same text rendered flat and the difference is cut back off,
+    # so the voice sits against the music exactly where it does with this off
+    # (within 0.2 LU, measured on the same render). A taste setting, found by ear: small values
+    # add density and presence; push it and aspirations and sibilance start
+    # to grit on a real speaker, well before anything clips.
+    drive: float = 1.0
+    # Where a link sits against the music, in LUFS, measured on the finished
+    # clip. None = the flat Piper render's own level (~-20 LUFS), untouched. A
+    # louder render is cut to it; a quieter one is raised toward it only as far
+    # as max_true_peak_dbfs allows — the music's rule, with no limiter. Also
+    # evens out Piper's line-to-line spread (~3 LU). Set, it pins the level,
+    # so drive stays timbre only without being cut back to flat first.
+    target_lufs: float | None = None
+    # Ceiling on the rendered clip's true peak, in dBFS. This is the one
+    # loudness assertion worth making automatically, because it is on the axis
+    # that matters and it is entirely in our gift: much of a real collection
+    # already clips, but there is no reason to ship a clipped clip. Raising the
+    # drive without checking this is how you would.
+    max_true_peak_dbfs: float = -1.0
+    # Silence padded onto each end. Breathing room around the cut into music —
+    # NOT ducking, which was considered and rejected. 0 disables.
+    pad_ms: int = 250
+    # Clips are resampled to match the library so the gapless path does not have
+    # to reopen the audio device between an entry and a track, which on the
+    # Bluetooth link is audible. Piper renders 22050 mono; the collection is
+    # overwhelmingly 44100 stereo.
+    sample_rate: int = 44100
+    channels: int = 2
+
+    # -- housekeeping --
+    # A run sheet longer than this is a mistake, not a set: cost scales with
+    # speech seconds, and a model that wants twenty links has misread the room.
+    max_links: int = 12
+    # How long an abandoned session's clips survive. Matches the tool-results
+    # spool sweep, for the same reason: a queue that got replaced leaves its
+    # clips behind and nothing else will ever come for them.
+    keep_hours: float = 24.0
+
+
+@dataclass(frozen=True)
+class LoudnessConfig:
+    """How playback level is set — and every number that depends on the collection.
+
+    Three measurements, each answering one question. **Integrated LUFS** is how
+    loud a track *sounds*: a LUFS gap between two records is a level difference
+    a listener hears. **True peak** is headroom — how much gain a track can take
+    before it clips — and says nothing about how loud it sounds. LRA is dynamics.
+    In a collection spanning the loudness war the first two come apart: nearly
+    every track peaks near full scale, and the loud ones are loud *by
+    compression*. So a loudness gap is free to close downward and mostly cannot
+    be closed upward without a limiter, which would change the music rather
+    than its level.
+
+    That is the policy. Aim at the collection's **mode**, so a typical record
+    plays exactly as it does at unity; cut what is louder; boost what is quieter
+    only as far as its own true peak allows. Everything here is a property of a
+    particular collection, so it lives in config — the music CLI's ``stats``
+    reports the measured mode next to the configured target, which is how you
+    re-derive ``target_lufs`` as the collection grows.
+    """
+    # Off = every entry plays at unity, which is also what a collection nobody
+    # has measured gets.
+    normalize: bool = False
+    # Where gain aims: the collection's MODE, not its mean or a broadcast
+    # standard. At the mode the typical record is untouched, so turning this on
+    # does not make the room quieter. -18 is the ReplayGain 2.0 reference, and
+    # only a placeholder until the collection has been measured.
+    target_lufs: float = -18.0
+    # Boost stops where the track's true peak would reach this. It is a ceiling
+    # on OUR boost only — a master that already peaks above it is left as it
+    # is. 0.0 rather than the textbook -1.0 (the lossy-codec margin): where
+    # most of a collection already peaks above 0 at unity, -1 protects the
+    # boosted tracks alone, which would then be the cleanest ones playing,
+    # while roughly halving how many tracks get any boost at all.
+    boost_ceiling_dbtp: float = 0.0
+    # A track nobody has measured is assumed to be this loud, so the failure
+    # mode of an un-ingested file is "cut too far" rather than "far too loud
+    # in a room". Put it near the collection's loud end. Never boosted either:
+    # there is no peak to bound the boost by.
+    assumed_lufs: float = -8.0
+    # Album furniture — codas, segues, spoken intros: a track this far below its
+    # own record's mean and no longer than furniture_max_s. Dropped from a
+    # shuffle, always kept in album order, and never lifted on its own. Both are
+    # calibrated against what the collection's interstitials measure.
+    furniture_below_album_lu: float = 8.0
+    furniture_max_s: float = 120.0
+
+
+@dataclass(frozen=True)
+class CandidatesConfig:
+    """``music_candidates`` — the set-builder's pool, and what it leaves out.
+
+    Unlike ``music_search`` this filters on purpose, so every exclusion is
+    config and every one is counted in the tool's reply. Both lists below are
+    properties of a household and a collection, not of the code.
+    """
+    # A track queued this recently is left out of a pool. Beyond the window
+    # nothing is excluded, but never-queued and least-recently-queued tracks
+    # are still offered first.
+    fresh_hours: float = 24.0
+    # Genres that are not music for a set — spoken word, comedy. Matched whole
+    # and case-insensitively, so "Speech" does not also remove "Speeches of
+    # Malcolm X" filed as Hip-Hop.
+    exclude_genres: tuple[str, ...] = ()
+    # Minutes of candidates offered per minute asked for: room to choose by
+    # taste rather than a list to accept.
+    pool_factor: float = 2.0
+    # What "a set" means when no length is given.
+    default_minutes: float = 60.0
+    # Hard ceiling on a pool, so a long request cannot flood the prompt.
+    max_tracks: int = 60
+
+
+@dataclass(frozen=True)
+class MusicConfig:
+    """Local music playback through a long-lived mpv held open on an IPC socket.
+
+    Absent block = disabled, so a deployment with no speakers gets no tools.
+    Gated by ``exposed_to`` the same way cron and bluetooth are: playback is a
+    thing that happens in a room someone is sitting in, so who may do it is
+    per-deployment policy rather than a property of the code.
+
+    There is deliberately **no per-output volume**. Loudness is set once,
+    downstream, on the amplifier: a standing attenuation in software happens
+    *before* a lossy encoder, so the amp then raises music and codec noise
+    together. Per-track normalisation (see :class:`LoudnessConfig`) is not
+    that — it brings a loud record down to where the typical one already
+    enters the encoder, and never boosts anything past its own true peak.
+    """
+    enabled: bool = False
+    exposed_to: tuple[str, ...] = ()
+    library_root: Path = Path("/Users/Shared/media/audio")
+    mpv_binary: Path = Path("/opt/homebrew/bin/mpv")
+    mpv_socket: Path = Path("/opt/homebrew/var/claw/music/mpv.sock")
+    # The catalogue: measured loudness plus the curation nobody can derive from
+    # an MP3. Deliberately NOT under the runtime dir with the socket — this is
+    # the one part of the music stack that cannot be rebuilt from the files, so
+    # it belongs wherever the deployment's backup already reaches.
+    db_path: Path = Path("/opt/homebrew/var/claw/music/library.db")
+    # Used only to read and restore the machine-wide default output around a
+    # Bluetooth connect (see claw.music.ensure_output). Playback itself never
+    # touches the default; mpv is told its device directly.
+    switchaudio_binary: Path = Path("/opt/homebrew/bin/SwitchAudioSource")
+    # How long to wait for a Bluetooth output to come back after asking for it,
+    # measured from the connect to the device appearing in mpv's device list.
+    # Past this the tool refuses and says why; it never falls back to another
+    # speaker, because audio arriving from the wrong room is worse than silence.
+    connect_timeout_s: float = 15.0
+    loudness: LoudnessConfig = field(default_factory=LoudnessConfig)
+    candidates: CandidatesConfig = field(default_factory=CandidatesConfig)
+    outputs: tuple[MusicOutput, ...] = ()
+    # Absent block = no DJ tool, the same way an absent music block means no
+    # music tools at all.
+    dj: DjConfig = field(default_factory=DjConfig)
+
+    def by_id(self, output_id: str) -> "MusicOutput | None":
+        return next((o for o in self.outputs if o.id == output_id), None)
+
+    @property
+    def default_output(self) -> "MusicOutput | None":
+        return next((o for o in self.outputs if o.default), None)
 
 
 @dataclass(frozen=True)
@@ -354,6 +613,8 @@ class Config:
     memory_retrieval: MemoryRetrievalConfig
     searxng: SearxngConfig
     cron: CronConfig
+    bluetooth: BluetoothConfig
+    music: MusicConfig
     subagents: SubagentsConfig
     compaction: CompactionConfig
     memory_flush: MemoryFlushConfig
@@ -392,6 +653,7 @@ def load(path: Path | str) -> Config:
     cfg = _parse(raw)
     _validate_can_spawn(cfg)
     _validate_voice(cfg)
+    _validate_music(cfg)
     return cfg
 
 
@@ -508,6 +770,8 @@ def _parse(d: dict[str, Any]) -> Config:
             exposed_to=tuple(d["cron"].get("exposed_to", ())),
             default_deliver_to=d["cron"].get("default_deliver_to"),
         ),
+        bluetooth=_parse_bluetooth(d.get("bluetooth")),
+        music=_parse_music(d.get("music")),
         subagents=SubagentsConfig(
             max_concurrent=d["subagents"]["max_concurrent"],
             max_children_per_agent=d["subagents"]["max_children_per_agent"],
@@ -532,6 +796,222 @@ def _parse(d: dict[str, Any]) -> Config:
         http_api=_parse_http_api(d.get("http_api")),
         devices=_parse_devices(d.get("devices")),
     )
+
+
+def _parse_bluetooth(d: dict[str, Any] | None) -> BluetoothConfig:
+    """Parse the optional ``bluetooth:`` block.
+
+    Verbs are validated against the tool module's own list rather than a copy
+    kept here, so a typo in claw.yaml fails the load instead of silently
+    dropping a capability the operator believed they had granted.
+    """
+    if not d:
+        return BluetoothConfig()
+    from claw.tools.bluetooth import ALL_VERBS
+
+    verbs = tuple(d.get("verbs", BluetoothConfig.verbs))
+    if unknown := [v for v in verbs if v not in ALL_VERBS]:
+        raise ValueError(
+            f"bluetooth.verbs: unknown verb(s) {unknown}; known: {list(ALL_VERBS)}"
+        )
+    return BluetoothConfig(
+        enabled=bool(d.get("enabled", False)),
+        binary=Path(d.get("binary", BluetoothConfig.binary)),
+        exposed_to=tuple(d.get("exposed_to", ())),
+        verbs=verbs,
+        max_scan_seconds=int(d.get("max_scan_seconds", BluetoothConfig.max_scan_seconds)),
+        timeout_s=float(d.get("timeout_s", BluetoothConfig.timeout_s)),
+    )
+
+
+def _parse_music(d: dict[str, Any] | None) -> MusicConfig:
+    """Parse the optional ``music:`` block.
+
+    Both halves splat strictly, so an unknown or misspelled key raises rather
+    than being dropped. That matters more here than usual: this config is
+    rendered from a single ansible variable into two files, and a key that is
+    silently ignored on one side is exactly how the two drift apart.
+    """
+    if not d:
+        return MusicConfig()
+    scalars = {k: v for k, v in d.items()
+               if k not in ("outputs", "dj", "loudness", "candidates")}
+    for key in ("library_root", "mpv_binary", "mpv_socket", "switchaudio_binary", "db_path"):
+        if key in scalars:
+            scalars[key] = Path(scalars[key])
+    if "exposed_to" in scalars:
+        scalars["exposed_to"] = tuple(scalars["exposed_to"])
+    if "connect_timeout_s" in scalars:
+        scalars["connect_timeout_s"] = float(scalars["connect_timeout_s"])
+    if "enabled" in scalars:
+        scalars["enabled"] = bool(scalars["enabled"])
+    return MusicConfig(
+        outputs=tuple(MusicOutput(**o) for o in d.get("outputs", ())),
+        dj=_parse_dj(d.get("dj")),
+        loudness=_parse_loudness(d.get("loudness")),
+        candidates=_parse_candidates(d.get("candidates")),
+        **scalars,
+    )
+
+
+def _parse_candidates(d: dict[str, Any] | None) -> CandidatesConfig:
+    """Parse the optional ``music.candidates:`` block. Strict, like its parent."""
+    if not d:
+        return CandidatesConfig()
+    scalars = dict(d)
+    for key in ("fresh_hours", "pool_factor", "default_minutes"):
+        if key in scalars:
+            scalars[key] = float(scalars[key])
+    if "max_tracks" in scalars:
+        scalars["max_tracks"] = int(scalars["max_tracks"])
+    if "exclude_genres" in scalars:
+        scalars["exclude_genres"] = tuple(str(g) for g in scalars["exclude_genres"] or ())
+    return CandidatesConfig(**scalars)
+
+
+def _parse_loudness(d: dict[str, Any] | None) -> LoudnessConfig:
+    """Parse the optional ``music.loudness:`` block.
+
+    Strict, like the rest of ``music:``. The keys that used to sit directly
+    under ``music:`` (``normalize``, ``target_lufs``) are rejected there rather
+    than quietly ignored, so a stale render fails the load instead of playing
+    at a level nobody chose.
+    """
+    if not d:
+        return LoudnessConfig()
+    scalars = dict(d)
+    for key in ("target_lufs", "boost_ceiling_dbtp", "assumed_lufs",
+                "furniture_below_album_lu", "furniture_max_s"):
+        if key in scalars:
+            scalars[key] = float(scalars[key])
+    if "normalize" in scalars:
+        scalars["normalize"] = bool(scalars["normalize"])
+    return LoudnessConfig(**scalars)
+
+
+def _parse_dj(d: dict[str, Any] | None) -> DjConfig:
+    """Parse the optional ``music.dj:`` block.
+
+    Splats strictly, like its parent and for the same reason: this is rendered
+    from ansible, and a key silently ignored on one side is how two renders of
+    one declaration drift apart.
+    """
+    if not d:
+        return DjConfig()
+    scalars = dict(d)
+    for key in ("piper_binary", "voice_model", "render_dir"):
+        if key in scalars:
+            scalars[key] = Path(scalars[key])
+    for key in ("length_scale", "sentence_silence", "drive",
+                "max_true_peak_dbfs", "keep_hours"):
+        if key in scalars:
+            scalars[key] = float(scalars[key])
+    if scalars.get("target_lufs") is not None:
+        scalars["target_lufs"] = float(scalars["target_lufs"])
+    for key in ("pad_ms", "sample_rate", "channels", "max_links"):
+        if key in scalars:
+            scalars[key] = int(scalars[key])
+    if "enabled" in scalars:
+        scalars["enabled"] = bool(scalars["enabled"])
+    return DjConfig(**scalars)
+
+
+def _validate_music(cfg: "Config") -> None:
+    """Reject a music block that cannot mean what it says.
+
+    Every check here is for a mistake that would otherwise surface as a puzzling
+    runtime refusal rather than as a bad config: a tool exposed to an agent that
+    does not exist is simply never built, and two outputs sharing an id makes
+    which speaker answers depend on list order.
+    """
+    if not cfg.music.enabled:
+        return
+    agent_ids = {ac.id for ac in cfg.agents}
+    if unknown := sorted(set(cfg.music.exposed_to) - agent_ids):
+        raise ValueError(
+            f"music.exposed_to references unknown agent(s): {unknown}; "
+            f"known agents: {sorted(agent_ids)}"
+        )
+    if not cfg.music.outputs:
+        raise ValueError("music.enabled is true but no outputs are configured")
+    ids = [o.id for o in cfg.music.outputs]
+    if dupes := sorted({i for i in ids if ids.count(i) > 1}):
+        raise ValueError(f"music.outputs: duplicate output id(s): {dupes}")
+    if len(defaults := [o.id for o in cfg.music.outputs if o.default]) > 1:
+        raise ValueError(
+            f"music.outputs: more than one output marked default: {sorted(defaults)}"
+        )
+    _validate_loudness(cfg.music.loudness)
+    _validate_candidates(cfg.music.candidates)
+    _validate_dj(cfg.music.dj)
+
+
+def _validate_candidates(c: CandidatesConfig) -> None:
+    if c.fresh_hours < 0:
+        raise ValueError(f"music.candidates.fresh_hours must be >= 0 (got {c.fresh_hours})")
+    if c.pool_factor < 1:
+        raise ValueError(
+            "music.candidates.pool_factor must be >= 1 — below it the pool is smaller "
+            f"than the set asked for (got {c.pool_factor})"
+        )
+    if c.default_minutes <= 0:
+        raise ValueError(f"music.candidates.default_minutes must be > 0 (got {c.default_minutes})")
+    if c.max_tracks < 1:
+        raise ValueError(f"music.candidates.max_tracks must be >= 1 (got {c.max_tracks})")
+
+
+def _validate_loudness(ld: LoudnessConfig) -> None:
+    """Reject loudness settings that would do something nobody could intend.
+
+    Checked whether or not ``normalize`` is on: the furniture thresholds apply
+    to every shuffle, and a bad target discovered only on the day someone
+    switches normalisation on is a worse time to find out.
+    """
+    if ld.boost_ceiling_dbtp > 0:
+        raise ValueError(
+            "music.loudness.boost_ceiling_dbtp must be <= 0 — above it the boost "
+            f"itself would clip (got {ld.boost_ceiling_dbtp})"
+        )
+    for key in ("target_lufs", "assumed_lufs"):
+        if (v := getattr(ld, key)) >= 0:
+            raise ValueError(f"music.loudness.{key} is in LUFS and must be < 0 (got {v})")
+    for key in ("furniture_below_album_lu", "furniture_max_s"):
+        if (v := getattr(ld, key)) <= 0:
+            raise ValueError(f"music.loudness.{key} must be > 0 (got {v})")
+
+
+def _validate_dj(dj: DjConfig) -> None:
+    """Reject DJ settings that cannot do what they say.
+
+    Deliberately does NOT check that the piper binary or the voice model exist.
+    They live in the voice venv, which is a separate role's business and may be
+    mid-install; a missing one surfaces at render time as a refusal naming the
+    path, which is clearer than refusing to boot the gateway. What is checked
+    here is the set of values that would otherwise produce audio nobody
+    intended and no error at all.
+    """
+    if not dj.enabled:
+        return
+    if dj.drive < 1.0:
+        # Below unity asoftclip attenuates. The whole point of the saturator is
+        # that a flat render sits ~8 dB under the music at an identical peak;
+        # a drive under 1.0 makes that worse while looking like a tuning.
+        raise ValueError(f"music.dj.drive must be >= 1.0 (got {dj.drive})")
+    if dj.length_scale <= 0:
+        raise ValueError(f"music.dj.length_scale must be > 0 (got {dj.length_scale})")
+    if dj.channels not in (1, 2):
+        raise ValueError(f"music.dj.channels must be 1 or 2 (got {dj.channels})")
+    if dj.sample_rate <= 0:
+        raise ValueError(f"music.dj.sample_rate must be > 0 (got {dj.sample_rate})")
+    if dj.pad_ms < 0:
+        raise ValueError(f"music.dj.pad_ms must be >= 0 (got {dj.pad_ms})")
+    if dj.max_links < 1:
+        raise ValueError(f"music.dj.max_links must be >= 1 (got {dj.max_links})")
+    if dj.max_true_peak_dbfs > 0:
+        raise ValueError(
+            "music.dj.max_true_peak_dbfs must be <= 0 — it is headroom below full "
+            f"scale, not a target (got {dj.max_true_peak_dbfs})"
+        )
 
 
 def _parse_agent(d: dict[str, Any]) -> AgentConfig:

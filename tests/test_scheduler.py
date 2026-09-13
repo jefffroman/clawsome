@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from claw.config import CronConfig
+from claw.config import BluetoothConfig, CronConfig
 from claw.triggers.scheduler import (
     JobRunner,
     _build_missed_review,
@@ -88,6 +88,7 @@ def _runner(make_cfg, tmp_path: Path, grace: int = 3600, agents=None):
     cfg = make_cfg(
         tmp_path, tz="UTC",
         cron=CronConfig(enabled=True, jobs_file=jobs_file, misfire_grace_time=grace),
+        bluetooth=BluetoothConfig(),
     )
     runner = JobRunner(cfg, agents if agents is not None else {"a": _FakeAgent()})
     return runner, jobs_file

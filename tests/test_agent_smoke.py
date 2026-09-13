@@ -9,6 +9,7 @@ PUBLIC MIRROR: neutral placeholders only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from claw.agent import Agent, _THINKING_ANSWER_SEP
@@ -396,3 +397,103 @@ def test_language_absent_when_unset(
     agent = _voice_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
                          fake_channel, transcripts)
     assert "Always reply in" not in agent._build_system_prompt(None, modality="text")
+
+
+async def test_consecutive_voice_turns_each_reach_their_own_requester(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """Every voice turn's reply goes to ITS OWN request, not the first one's.
+
+    Regression: voice pins ``session_key="home"`` so all devices
+    share a transcript, which means one long-lived drainer serves every voice
+    turn — while a voice ``peer_id`` is per-REQUEST (``http:<uuid4>``), unlike
+    a matrix room. The drainer resolved its sink once at creation, so replies
+    after the first were addressed to the first request's already-popped
+    future and dropped at debug level: the turn ran, the transcript was
+    correct, and the caller waited out its full 300 s timeout. Only the first
+    voice turn of each claw process worked.
+
+    This goes through ``handle_inbound`` rather than ``_process_batch`` on
+    purpose — the sibling tests call ``_process_batch`` directly, which is
+    exactly why they could not see this: the stale sink came from the drainer
+    they bypass.
+    """
+    agent = _make_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
+                        fake_channel, transcripts)
+    voice_channel = type(fake_channel)()
+    agent.register_channel("voice", voice_channel)
+
+    async def turn(peer_id: str, text: str, session_key: str = "home") -> bool:
+        await agent.handle_inbound(InboundMessage(
+            peer_id=peer_id,
+            sender_name="Desk Client",
+            text=text,
+            channel="voice",
+            sender_id="desk/voice",
+            # The literal that makes every device share one session — and one
+            # drainer. Without it each request is its own session and the bug
+            # cannot appear.
+            session_key=session_key,
+        ))
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if any(p == peer_id for p, _ in voice_channel.sent):
+                return True
+        return False
+
+    try:
+        assert await turn("http:req-1", "first question"), \
+            "first voice turn was never delivered"
+        assert await turn("http:req-2", "second question"), \
+            ("second voice turn's reply did not reach its own request — the "
+             "drainer bound its sink once at creation (the shared-drainer bug)")
+        assert await turn("http:req-3", "third question"), \
+            "third voice turn was never delivered"
+
+        peers = [p for p, _ in voice_channel.sent]
+        assert peers == ["http:req-1", "http:req-2", "http:req-3"], (
+            f"replies went to the wrong requests: {peers}"
+        )
+    finally:
+        for task in agent._drainer_tasks.values():
+            task.cancel()
+
+
+async def test_bug_is_independent_of_the_session_key(
+    tmp_path, make_cfg, fake_ollama, fake_memory, fake_channel, transcripts
+):
+    """Unpinning voice from the shared "home" session does NOT fix the shared-drainer bug.
+
+    The defect is that a long-lived drainer captures a per-REQUEST peer_id, so
+    it reappears for any two turns that share a session — per device once the
+    key is per device, instead of globally. Keeping this as a separate test so
+    the distinction survives: how sessions are grouped is a product decision,
+    and it is orthogonal to this bug.
+    """
+    agent = _make_agent(tmp_path, make_cfg, fake_ollama, fake_memory,
+                        fake_channel, transcripts)
+    voice_channel = type(fake_channel)()
+    agent.register_channel("voice", voice_channel)
+
+    async def turn(peer_id: str) -> bool:
+        await agent.handle_inbound(InboundMessage(
+            peer_id=peer_id, sender_name="Desk Client", text="q",
+            channel="voice", sender_id="desk/voice",
+            # Per-DEVICE, not the shared household session.
+            session_key="voice_desk",
+        ))
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if any(p == peer_id for p, _ in voice_channel.sent):
+                return True
+        return False
+
+    try:
+        assert await turn("http:req-1")
+        assert await turn("http:req-2"), (
+            "second turn on a PER-DEVICE session key still failed — which is "
+            "the point: unpinning 'home' does not address this"
+        )
+    finally:
+        for task in agent._drainer_tasks.values():
+            task.cancel()

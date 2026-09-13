@@ -11,8 +11,10 @@ ollama:
   base_url: http://127.0.0.1:11434
   default_compaction_model: qwen3.6:35b-a3b
   # Cap on tool round-trips per inbound message before claw forces a stub
-  # final reply. Cron-driven research tasks can legitimately need 15-25.
-  max_tool_turns: 30
+  # final reply. Cron-driven research tasks can legitimately need 15-25, and
+  # hitting the cap is quiet — the turn just stops and answers with what it
+  # has — so err high.
+  max_tool_turns: 50
   # Per-/api/chat-call generation cap (Ollama options.num_predict). When
   # the model hits this, claw inspects the partial: an unclosed Markdown
   # code fence triggers an immediate fail-loud return; otherwise claw
@@ -48,6 +50,92 @@ cron:
                                         # boot; more is surfaced to the owning
                                         # agent as a deliver-or-discard review.
                                         # `at` jobs only; cron keeps the default.
+
+# Bluetooth radio control (macOS only, via blueutil). Omit the whole block to
+# disable. Two gates answering different questions: `exposed_to` says who may
+# drive the radio, `verbs` says what may be done to it — an unlisted verb is
+# never built into a tool, so the model is not shown a capability it would only
+# be refused. Defaults to the observing pair (list, scan); anything that mutates
+# radio state is opt-in per deployment.
+#
+# Every call runs inside the console GUI session as a one-shot launchd job, not
+# in the gateway's own context: measured on macOS 26, a daemon-context
+# `--inquiry` returns empty with exit 0 while a session-context scan finds the
+# device immediately. Discovery and pairing are per-user operations, and the
+# daemon reports their absence as "nothing there" rather than as an error.
+# Consequence: this needs a logged-in console session on the host.
+bluetooth:
+  enabled: false
+  binary: /opt/homebrew/bin/blueutil
+  exposed_to: []                        # e.g. [agent-1]
+  verbs: [list, scan]                   # any of: list, scan, pair, unpair,
+                                        # connect, disconnect, power
+  max_scan_seconds: 20                  # classic inquiry wants ~10.24s to be
+                                        # reliable; radio is busy throughout
+  timeout_s: 90
+
+# Local music playback through a long-lived mpv held open on an IPC socket.
+# Absent block = disabled. Outputs are a NAMED list: the agent asks for an id,
+# never a CoreAudio device string, a MAC, or a path.
+music:
+  enabled: false
+  exposed_to: []                        # e.g. [agent-1]
+  library_root: /path/to/music          # Artist/Album/NN - Title.ext
+  mpv_binary: /opt/homebrew/bin/mpv
+  mpv_socket: /path/to/run/mpv.sock     # held by the mpv service, not by claw
+  # The catalogue: measured loudness, plus curated mood/energy/corrections that
+  # no re-scan can reproduce. Put it wherever your backups already reach — it is
+  # state, not cache, unlike the socket above.
+  db_path: /path/to/state/library.db
+  # Only used to restore the machine-wide default output after a Bluetooth
+  # connect steals it (macOS promotes a BT audio device to default on connect).
+  switchaudio_binary: /opt/homebrew/bin/SwitchAudioSource
+  connect_timeout_s: 15                 # wake a BT speaker, then refuse
+  # How playback level is set. Every value here is a property of YOUR
+  # collection — measure it (the music CLI's `ingest`, then `stats`).
+  # LUFS is how loud a track sounds; true peak is how much gain it can take.
+  loudness:
+    normalize: false                    # off = everything at unity
+    target_lufs: -18                    # set to your collection's MODE (stats prints it)
+    boost_ceiling_dbtp: 0               # quieter tracks boosted only up to this peak
+    assumed_lufs: -8                    # an unmeasured track: assumed loud, never boosted
+    furniture_below_album_lu: 8         # codas/segues: this far under their record...
+    furniture_max_s: 120                # ...and this short — dropped from shuffles only
+  # music_candidates: the pool a set is chosen from. It filters on purpose and
+  # counts every exclusion in its reply (music_search, by contrast, hides nothing).
+  candidates:
+    fresh_hours: 24                     # queued this recently = left out
+    exclude_genres: []                  # e.g. ["Speech"] — asking for one overrides
+    pool_factor: 2                      # minutes offered per minute asked for
+    default_minutes: 60
+    max_tracks: 60
+  # music_dj: the agent speaks between the songs. Links are rendered by the
+  # Piper CLI (not a streaming TTS daemon) to WAVs queued as playlist entries
+  # of their own, so speech never plays over music. Absent/disabled = no tool.
+  dj:
+    enabled: false
+    piper_binary: /path/to/venv/bin/piper
+    voice_model: /path/to/piper/en_US-joe-medium.onnx
+    render_dir: /path/to/run/dj           # regenerable cache; reaped by age
+    drive: 1.0                            # soft-clip timbre, level held; 1.0 = off
+    target_lufs: null                     # link level on the finished clip; null = render's own
+    max_true_peak_dbfs: -1.0              # the one loudness check made on a clip
+    max_links: 12
+  # `bluetooth_address` ABSENT means a wired/built-in output with no connect
+  # step — it is never null. At most one output may set `default: true`.
+  # There is deliberately no per-output volume: every digital stage stays at
+  # unity and loudness is set downstream, on the amplifier.
+  outputs:
+    - id: room-a
+      name: Room A
+      mpv_device: coreaudio/AA-BB-CC-DD-EE-FF:output
+      coreaudio_name: Some BT Adapter
+      bluetooth_address: aa-bb-cc-dd-ee-ff
+      default: true
+    - id: room-b
+      name: Room B
+      mpv_device: coreaudio/BuiltInSpeakerDevice
+      coreaudio_name: Built-in Speakers
 
 subagents:
   max_concurrent: 8

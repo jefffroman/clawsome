@@ -347,6 +347,61 @@ injects + ~10K retrieval headroom, you have ~120K for new turns —
 plenty. With a 64K context and 32K reserve, you have ~10K left for new
 turns, which can fill again fast.
 
+### Music tools report "the player is not running"
+
+The gateway connects to an mpv IPC socket; it never starts mpv. That process is
+the deployment's to supervise, and this message means the socket could not be
+reached — mpv is down, or `mpv_socket` in `claw.yaml` does not match the path
+mpv was actually given.
+
+Two things make this look like a permissions problem when it is not. mpv
+creates the socket `srwxr-xr-x`, and connecting to a unix socket needs **write**
+permission on it — so anything probing the socket must run as the user mpv runs
+as, not merely as a user who can read the path. And mpv silently keeps a stale
+socket file across an unclean exit, so the file existing proves nothing; the
+check that means something is a property read that comes back
+`{"error":"success"}`.
+
+### Music plays at wildly different volumes
+
+Expected, if `normalize` is off — which is the default, and usually right. Two
+records mastered thirty years apart genuinely differ in average loudness while
+peaking in the same place; that is the mastering, not a fault. Switch
+`normalize` on if the room's noise floor makes average level matter more than
+peaks.
+
+If it is on and volumes still vary, the catalogue has no measurement for those
+tracks. An unmeasured file is deliberately assumed *loud*, so it plays quiet
+rather than deafening — a whole album sounding oddly reticent is the signature.
+Run ingest and check the track count matches the library.
+
+Loudness comes from the file's measurement, not from any tag, so retagging
+changes nothing. A single mis-measured track is a fact about the file rather
+than something to override: the measured columns are not curatable by design.
+
+### A track is missing from a shuffle
+
+Album furniture — a short track far quieter than its own record — is left out
+of shuffles on purpose, and kept in album order. Play the record in sequence
+and it comes back.
+
+### Curation seems to have vanished after a re-scan
+
+A normal ingest cannot overwrite curation; the conflict clause does not name
+those columns. Two things legitimately clear it:
+
+- **`--repopulate`** on that track, which is the deliberate "restore defaults"
+  and discards curation by design.
+- **A renamed or moved file.** The catalogue is keyed on path, so a rename is a
+  delete plus a fresh insert and nothing can tell it from a swap. Do bulk
+  renames *before* investing in annotation, not after. The append-only edit log
+  survives and is keyed on the old path, so a mistaken rename is recoverable by
+  hand.
+
+Curation attached to an album or an artist is unaffected by either, since it is
+keyed on the name rather than the path — which is a further reason to put a
+fact at the highest level where it is true.
+
 ### Bot replies to DM but not to group `@`-mentions
 
 Confirm `allow_bots: mentions` (not `none`) and that the mention is a

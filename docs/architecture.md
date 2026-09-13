@@ -33,8 +33,8 @@ under `subagents.personas:` in `claw.yaml` and shared across every agent
 in the deployment. A *subagent* is a transient `Agent` fork instantiated
 from a persona by the `subagent_spawn` tool (`persona` + `prompt` + a
 required short `task_name` label), sharing the parent's workspace,
-memory index, and tool registry (minus the `subagent_*` family and
-`cron_*`). It runs no compaction and no memory flush, and its transcript
+memory index, and tool registry (minus the `subagent_*` family and the
+config-gated `cron_*`, `bluetooth_*` and `music_*` families). It runs no compaction and no memory flush, and its transcript
 is **scratch**: real, so the subagent's context survives between its own
 turns, but written under `transcripts/subagent/` where none of the
 participant-session machinery walks it, scoped to the life of its
