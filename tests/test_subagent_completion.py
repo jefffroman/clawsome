@@ -54,9 +54,9 @@ class _RecordingParent:
 
 def _child(workspace_key: str, **overrides) -> ChildTask:
     base = dict(
-        id="cristal-abcd1234",
+        id="coder-abcd1234",
         parent_id="parent-1",
-        persona="cristal",
+        persona="coder",
         prompt="PROMPT-SENTINEL should never reach the parent transcript",
         origin_channel="matrix",
         origin_peer_id="!room:x",
@@ -99,7 +99,7 @@ def test_spool_writes_prompt_and_result(tmp_path):
     assert "--- RESULT ---" in contents
     assert "Convert homepage HTML" in contents
     assert "convert-homepage-html" in rel
-    assert "cristal-abcd1234" in rel
+    assert "coder-abcd1234" in rel
 
 
 def test_completion_is_compact_and_spooled(tmp_path):
@@ -152,5 +152,5 @@ def test_inline_fallback_is_still_bounded():
 def test_task_name_required(tmp_path):
     parent = _RecordingParent(tmp_path)
     tool = build_subagent_spawn_tool(parent, _spawner(), depth=0)
-    out = asyncio.run(tool.run({"persona": "cristal", "prompt": "do a thing"}))
+    out = asyncio.run(tool.run({"persona": "coder", "prompt": "do a thing"}))
     assert "task_name is required" in out
