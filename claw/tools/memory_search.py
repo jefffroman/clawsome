@@ -26,7 +26,9 @@ def build_memory_search_tool(memory: MemoryIndex) -> Tool:
         top_n = max(1, min(int(args.get("top_n", 5)), 20))
         compact = bool(args.get("compact", True))
         try:
-            result = await memory.retrieve_markdown(query, top_n=top_n, compact=compact)
+            # An explicit search asks for breadth: the ranked top_n, without
+            # the per-turn relevance gate.
+            result = await memory.retrieve_markdown(query, top_n=top_n, compact=compact, gate=False)
         except Exception as e:
             log.exception("memory_search failed")
             return f"error: {e}"

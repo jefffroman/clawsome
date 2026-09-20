@@ -66,6 +66,33 @@ Used by every agent's Matrix channel. One bot user per agent.
 - Token minting, cross-signing bootstrap, and allowlist semantics are
   covered in detail in `docs/operations.md` *Matrix bot first-deploy*.
 
+## Optional external services
+
+### A System One decision service
+
+Backs the decision gate (fast, typed answers for simple turns — "pause the
+music" without an LLM turn) and, in future, other small internal decisions.
+**Entirely optional:** with no `systemone:` block, clawsome behaves exactly as
+without these features.
+
+- Must implement `POST <base_url>/v1/systemone` in the System One wire format
+  (typed `choice` / `noul` / `score` questions in, per-option probabilities out).
+  Clawsome ships none; run any compatible local service.
+- Default bind: `http://127.0.0.1:11502`. Pointed at by `systemone.base_url`.
+- The client sends no auth header — a local or trusted-network service, like
+  the others above.
+
+Quick check:
+
+```bash
+curl -s http://127.0.0.1:11502/v1/systemone -H 'Content-Type: application/json' \
+  -d '{"state": "hello", "questions": {"q": {"type": "noul", "instructions": "Is this a greeting?"}}}' \
+  | jq .answers
+```
+
+→ See [`docs/decisions.md`](decisions.md) for the wire format, the gate, and
+tuning.
+
 ## Python runtime
 
 - Python ≥ 3.12.
@@ -120,6 +147,8 @@ contract) is the guide for which files go where.
       `agents[*].matrix.allow_from`. Access tokens for the bots minted
       and saved to `access_token_file` paths (mode 0600). Password
       files saved (mode 0600) for cross-signing.
+- [ ] *(Optional)* A System One decision service running, if `systemone:`
+      is configured. Nothing requires one.
 - [ ] `claw.yaml` populated. Every `*_file:` and path key resolves to
       an existing path or a writable parent.
 - [ ] Each agent's `workspace` directory exists and is writable.

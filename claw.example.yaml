@@ -31,6 +31,17 @@ ollama:
 memory_retrieval:
   top_n: 5         # max chunks injected into the per-turn prompt
   compact: true    # collapse retrieval block to a single header + bullets
+  candidates: 20   # search results that get the relevance check
+  common_word_max_share: 0.10  # words in >10% of memories are ignored by keyword search
+  relevance:       # per-turn gate; see docs/operations.md "Memory retrieval"
+    threshold: 0.40   # 0 disables the gate (plain top_n slice)
+    offset: 3.30
+    distance: -3.78
+    keyword: 0.49
+    keyword_share: 0.78
+  calibration:     # drift warning: where the weights above were fitted
+    best_distance: 0.97
+    tolerance: 0.25
 
 searxng:
   base_url: http://127.0.0.1:8080
@@ -73,6 +84,58 @@ bluetooth:
   max_scan_seconds: 20                  # classic inquiry wants ~10.24s to be
                                         # reliable; radio is busy throughout
   timeout_s: 90
+
+# Optional System One decision scorer (typed decisions, no generated text):
+# POST {base_url}/v1/systemone. Omit the block to run without one — a fully
+# supported configuration. Every feature that asks the scorer anything checks
+# that it exists and, when it does not (or a call fails or times out), behaves
+# exactly as it would without that feature.
+systemone:
+  base_url: http://127.0.0.1:11502
+  timeout_s: 2.0                        # a timeout counts as "no answer"
+
+# Decision gate: the outer loop in front of the LLM. Each human turn (matrix or
+# voice, one message at a time) is first offered to the direct handlers: the
+# scorer picks one handler's description or "none", and a handler answers only
+# when picked with at least `min_confidence` (its own, if it sets one).
+# Everything else — "none", an unsure pick, a scorer that is down or slow, a
+# tool that fails — goes to the LLM exactly as without a gate (fail open). A
+# direct answer is written to the transcript like any other turn.
+#
+# A handler is declarative: one tool from the agent's own registry and FIXED
+# args (a handler picks, it never extracts from the message). Reply forms,
+# exactly one: `reply` (a string, or a list to vary at random), `reply_fn` (a
+# function from claw/gate_replies.py, with `fallback` for when it has nothing
+# to say), or `relay: true` (the tool's own words). Two shapes:
+#   text:     `expect` (the tool's exact success output) + a reply form.
+#   outcomes: for tools with a structured result — one reply form per
+#             `result` value (see the skip example below).
+# Anything not accepted — `error:`/`refused:` output, output other than
+# `expect`, an unlisted result — hands the turn to the LLM instead. Handlers
+# need the systemone block; with none, every eligible turn logs
+# `-> llm (no-handlers)` and passes through.
+# Omit the block to disable.
+gate:
+  enabled: false
+  exposed_to: []                        # e.g. [agent-1]
+  min_confidence: 0.8                   # 1 - normalised entropy of the pick
+  context_turns: 6                      # prior user/assistant messages the
+                                        # scorer sees with the new one
+  handlers: []
+  # - id: audio-pause
+  #   description: "Pause the music or other audio that is playing"
+  #   tool: music_control
+  #   args: {action: pause}
+  #   expect: paused
+  #   reply: ["Paused.", "Pausing."]
+  # - id: audio-next
+  #   description: "Skip the current song or audio track and go on to the next one"
+  #   tool: music_control
+  #   args: {action: next}
+  #   outcomes:
+  #     skipped: {reply_fn: skipping_to, fallback: ["Skipping."]}   # "Skipping to <title> by <artist>."
+  #     end_of_queue: {reply: "That was the last one."}
+  #   min_confidence: 0.85               # optional per-handler bar
 
 # Local music playback through a long-lived mpv held open on an IPC socket.
 # Absent block = disabled. Outputs are a NAMED list: the agent asks for an id,

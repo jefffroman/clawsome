@@ -181,6 +181,16 @@ for every deployment. Two families ship gated this way (`cron_*`,
   `subagent_*` and `cron_*` are stripped — otherwise a persona inherits a
   capability the deployment granted to a specific agent.
 
+### Structured results for code (`Tool.data`)
+
+A tool's `run` returns text written for the model, which may be reworded for
+the model at any time. Code that needs *fields* — a gate reply function, a
+gate handler keyed on outcomes — reads the optional `Tool.data` twin instead
+of parsing that prose. For an action tool, `data` **is** the action and `run`
+renders its text from the same single call, so an action never runs twice to
+be described twice. Details and the reply-function API: `docs/decisions.md`
+*Extending*.
+
 ### Curation must outlive what produced it
 
 A tool that builds an index over files the user owns will eventually want to
@@ -331,6 +341,100 @@ spooled results.
 
 Workspace cleanup happens at the daily session rotate (per-workspace
 sweep, drops anything >24h old).
+
+## Gate handlers
+
+A handler lets the decision gate answer a turn **without the LLM**: the scorer
+picks one of your handler descriptions (or `none`), the named tool runs with
+the arguments you wrote, and the reply you specified is sent. Roughly 180 ms
+instead of a model turn. Schema, key tables and a worked config example are in
+[Decisions](decisions.md#handlers-pick-they-never-extract); this is how to
+decide whether your idea fits and how to tell whether it worked.
+
+### First, does it fit at all?
+
+One question decides it: **is the action constant?**
+
+The scorer chooses among descriptions. It returns a choice, never text, so
+nothing can lift a value out of the message. A handler is therefore one fixed
+call, written out in config, that is the same every time it fires.
+
+| request | fits | why |
+|---|---|---|
+| "pause the music" | yes | one call, no arguments |
+| "what's playing?" | yes | one call, the reply reads the result |
+| "play something mellow" | **no** | needs a set chosen by taste |
+| "turn it down a bit" | **no** | "a bit" is a value in the message |
+| "play <a specific song>" | **no** | the title has to come out of the sentence |
+
+The last row is the tempting one, and it is worth understanding why it is a
+`no`. Every route to it moves the parsing somewhere rather than removing it —
+into a reply function, into a config placeholder, into the tool — and each
+spends something real. A reply function runs *after* the action, so it cannot
+decline: a request it resolves wrongly gets answered wrongly instead of going
+to the model. A placeholder in `args` keeps the decline but gives up the
+property that config fully describes what the gate can do, and introduces a
+failure the current design cannot have — the right kind of action with the
+wrong argument.
+
+If a request needs a value from the message, let it go to the LLM. That is not
+a gap in the gate; it is the shape of the thing.
+
+### Writing one
+
+1. **Pick a tool the agent already has.** A handler binds to the agent's own
+   registry, so the tool must already exist there — the gate adds no tools.
+2. **Write `description` as the request, not the implementation.** It is the
+   only thing the scorer reads. "Skip the current song and go on to the next
+   one" — not "calls music_control with action=next". Describe it as the
+   person would ask for it, and make it distinguishable from your other
+   handlers, because they are the alternatives it is being judged against.
+3. **Choose the shape.** `expect` (the tool's exact success text) when success
+   is binary. `outcomes` when the answer matters beyond success — a skip that
+   reports what is next versus one that hit the end of the queue — keyed on
+   the tool's structured `data` twin.
+4. **Choose the reply.** Several `reply` strings are picked between at random,
+   which keeps a frequent action from sounding like a machine. `reply_fn`
+   names a function in `claw/gate_replies.py` for a reply that has to say
+   something the config cannot know, and needs a `fallback`. `relay` sends the
+   tool's own words.
+
+### Verify it
+
+Grep `:gate:` in the log. A handled turn logs the choice and then the turn
+completing directly; anything else logs `-> llm` with the reason, and the
+reason is the diagnosis:
+
+| reason | meaning |
+|---|---|
+| `no-handlers` | none bound — look for an ERROR at startup |
+| `none` | the scorer chose the LLM, or named a handler that is not bound |
+| `low-confidence` | it picked yours but under the bar |
+| `scorer-error` | unreachable, timed out, or a bad response |
+| `ineligible` | not a single human turn (cron, batched, subagent) |
+
+A handler that never fires is usually one of two things: it was **dropped at
+startup** — binding logs an ERROR and skips a handler whose tool the agent
+lacks, whose tool has no structured `data` when `outcomes` is used, or that
+passes an argument the tool does not declare — or its description is too close
+to another one for the scorer to separate them.
+
+Tune `min_confidence` per handler rather than globally when one action
+deserves a higher bar than the rest. Anything that clears a queue, spends
+money or is otherwise hard to undo should sit well above the default.
+
+### What a handler must never do
+
+**Never let a failure produce a cheerful fixed reply.** The design is built on
+this: an `error:`/`refused:` output, an unexpected result, a timeout or a
+scorer error all decline, and the turn goes to the LLM *unchanged*, which then
+explains what went wrong. If you find yourself wanting a handler to report a
+failure, that is the model's job.
+
+**Never hide the action in the reply.** A reply function runs after the tool,
+is unable to decline, and is invisible to both the log line and any routing
+evaluation — so a tool call made there is an action nothing can see or refuse.
+Reply functions read a tool's structured `data`; they do not act.
 
 ## Channels
 

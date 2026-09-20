@@ -39,6 +39,7 @@ from claw.voice_http import HttpReplyChannel, VoiceHttpServer
 from claw.memory import MemoryIndex
 from claw.memory_curate import curate_all_agents
 from claw.ollama import OllamaClient
+from claw.systemone import SystemOneClient
 from claw.skills import build_agent_registry
 from claw.tools.subagent import SubagentSpawner
 from claw.transcript import TranscriptStore, purge_scratch_sessions
@@ -63,6 +64,13 @@ async def _serve(cfg: Config) -> int:
     log.info("starting claw gateway v%s", __version__)
 
     ollama = OllamaClient(cfg.ollama)
+    # The optional decision scorer: one client, shared by every agent and
+    # every feature that asks it anything. Absent block = no scorer, a fully
+    # supported configuration — each user falls back when this is None.
+    systemone = (
+        SystemOneClient(cfg.systemone.base_url, cfg.systemone.timeout_s)
+        if cfg.systemone is not None else None
+    )
     spawner = SubagentSpawner(cfg.subagents)
     # Shared by-reference dict the JobRunner reads at fire time. We populate
     # it as Agents are constructed below so the runner's dispatch closure
@@ -75,7 +83,7 @@ async def _serve(cfg: Config) -> int:
 
     for ac in cfg.agents:
         log.info("[%s] initializing", ac.id)
-        memory = MemoryIndex(ac.id, ac.workspace)
+        memory = MemoryIndex(ac.id, ac.workspace, cfg.memory_retrieval)
         await memory.warmup_async()
         try:
             result = await memory.reindex_if_stale()
@@ -107,6 +115,7 @@ async def _serve(cfg: Config) -> int:
             depth=0,
             job_runner=job_runner,
             remaining_spawn_budget=ac.max_spawn_depth,
+            systemone=systemone,
         )
         agents.append(agent)
         agents_by_id[ac.id] = agent
@@ -252,6 +261,11 @@ async def _serve(cfg: Config) -> int:
         await ollama.aclose()
     except Exception:
         pass
+    if systemone is not None:
+        try:
+            await systemone.aclose()
+        except Exception:
+            pass
     log.info("clean exit")
     return 0
 

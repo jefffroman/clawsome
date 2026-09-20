@@ -754,7 +754,7 @@ async def _bootstrap(config_path: str, agent_id: str, dry_run: bool) -> int:
     ac = matches[0]
 
     ollama = OllamaClient(cfg.ollama)
-    memory = MemoryIndex(ac.id, ac.workspace)
+    memory = MemoryIndex(ac.id, ac.workspace, cfg.memory_retrieval)
     await memory.warmup_async()
     await memory.reindex_if_stale()
 

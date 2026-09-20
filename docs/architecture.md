@@ -88,6 +88,14 @@ For every inbound message:
    peer serialize.
 3. **Transcript load.** JSONL at `<workspace>/transcripts/<sid>.jsonl` is
    read into `rows`.
+3a. **Decision gate** (optional; see [`docs/decisions.md`](decisions.md)).
+   For a single human message on `matrix` or `voice`, a System One decision
+   service may pick a configured direct handler — a fixed tool action — which
+   then answers instead of the LLM, writing the exchange to the transcript
+   like any turn. Every other outcome (no pick, a low-confidence pick, a
+   service failure, a tool that doesn't report success) continues to step 4
+   unchanged. The gate runs before memory retrieval, so a direct answer costs
+   none.
 4. **System prompt assembly.** Three sources concatenated:
    - **Injected files** — every path in the agent's `extra_paths` is read
      and rendered as a `## <filename>\n\n<contents>` block.
@@ -335,4 +343,6 @@ outside what `claw.yaml` declares.
 - `docs/configuration.md` — full key-by-key `claw.yaml` reference.
 - `docs/operations.md` — runbook (compaction tuning, matrix bot setup,
   troubleshooting).
+- `docs/decisions.md` — the optional System One client and the decision
+  gate: external service, config, handlers, logs, tuning.
 - `docs/extending.md` — adding a tool, skill, or channel.

@@ -9,7 +9,7 @@ for the current date.
 
 Format:
 
-    [channel sender Sun 2026-05-03 07:30 +47m] body
+    [channel sender +47m Sun 2026-05-03 07:30] body
 
 - ``channel`` is always present. ``sender`` is omitted for cron / initial-
   prompt channels (no human sender). ``+elapsed`` only appears once a
@@ -27,6 +27,7 @@ Format:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -97,3 +98,16 @@ def format_inbound_envelope(
 
     header = "[" + " ".join(parts) + "]"
     return f"{header} {body}"
+
+
+# The header format_inbound_envelope writes always ends "<Www> YYYY-MM-DD HH:MM]"
+# followed by one space; everything before that closing bracket is the
+# sanitised channel/sender/elapsed parts, which can never contain "]".
+_ENVELOPE_RE = re.compile(r"^\[[^\]]*\b[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2}\] ")
+
+
+def strip_inbound_envelope(text: str) -> str:
+    """Inverse of :func:`format_inbound_envelope` for reading history back:
+    the body without its header. Text that carries no envelope is returned
+    unchanged."""
+    return _ENVELOPE_RE.sub("", text, count=1)

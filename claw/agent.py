@@ -62,6 +62,8 @@ from claw.memory_flush import run_memory_flush
 from claw.ollama import OllamaClient
 from claw.sink import ChannelSink, Sink
 from claw.tools.base import Tool
+from claw.gate import Decision, DecisionGate, build_tool_handlers
+from claw.systemone import SystemOneClient
 from claw.tools.bluetooth import build_bluetooth_tools
 from claw.tools.music import build_music_tools
 from claw.tools.subagent import (
@@ -222,8 +224,19 @@ class Agent:
         allowed_spawn_personas: tuple[str, ...] | None = None,
         parent_id: str | None = None,
         spawn_task_id: str | None = None,
+        systemone: SystemOneClient | None = None,
+        gate: DecisionGate | None = None,
     ) -> None:
         self.cfg = cfg
+        # The optional decision scorer, shared across agents (claw/systemone.py).
+        # None = this claw runs without one, which must always work: every
+        # user of it checks for None (and treats any failed call the same
+        # way) and falls back to its no-scorer behaviour.
+        self.systemone = systemone
+        # Outer loop in front of the LLM for human turns (see claw/gate.py).
+        # Built at the end of __init__, once the tool registry its handlers
+        # bind to is complete; ``gate`` injects one directly (tests).
+        self.gate = gate
         self.agent_cfg = agent_cfg
         self.ollama = ollama
         self.memory = memory
@@ -390,6 +403,19 @@ class Agent:
         # a speaker whether or not any agent is trusted with the radio itself.
         if depth == 0 and cfg.music.enabled and self.id in cfg.music.exposed_to:
             self.tools.update(build_music_tools(cfg.music, cfg.bluetooth.binary, self.id, cfg.tz))
+
+        # Top-level agents in gate.exposed_to only; forks never get a gate. No
+        # scorer means no handlers (config validation guarantees it), so the
+        # gate is then pure pass-through and never needs one.
+        if (
+            self.gate is None and depth == 0
+            and cfg.gate.enabled and self.id in cfg.gate.exposed_to
+        ):
+            handlers = build_tool_handlers(cfg.gate.handlers, self.tools, self.id)
+            self.gate = DecisionGate(cfg.gate, systemone, handlers=handlers)
+            if handlers:
+                log.info("[%s] gate handlers: %s", self.id,
+                         ", ".join(h.id for h in handlers))
 
     @property
     def id(self) -> str:
@@ -1162,6 +1188,28 @@ class Agent:
         )
         self._last_inbound_at[sid] = now
 
+        # Decision gate: a registered direct handler may answer instead of the
+        # LLM. Before memory retrieval, so a direct answer costs no retrieval;
+        # under the session lock, so its transcript rows cannot interleave
+        # with a compaction swap. Every non-"chosen" outcome falls through to
+        # the ordinary turn below, unchanged.
+        if self.gate is not None and not stateless:
+            decision = await self.gate.decide(
+                self.id, sid, msgs, body, lambda: self.transcripts.load(sid),
+            )
+            if decision.reason != "ineligible":
+                detail = decision.reason
+                if decision.confidence is not None:
+                    detail += f", {decision.choice} @ {decision.confidence:.2f}"
+                log.info(
+                    "[%s:gate:%s] -> %s (%s)", self.id, peer_label,
+                    decision.choice if decision.handler else "llm", detail,
+                )
+            if decision.handler is not None and await self._complete_direct(
+                sid, decision, user_text, sink, turn_id, peer_label, turn_t0,
+            ):
+                return
+
         # Memory retrieval — query against the combined text.
         try:
             retrieval_block = await self.memory.retrieve_markdown(
@@ -1383,6 +1431,45 @@ class Agent:
                         "in the background."
                     )
                 )
+
+    async def _complete_direct(
+        self, sid: str, decision: Decision, user_text: str, sink: Sink,
+        turn_id: str, peer_label: str, turn_t0: float,
+    ) -> bool:
+        """Finish a turn with a direct handler's reply instead of the LLM's.
+
+        The turn must look, to everything after it, like any other: the user
+        row and the reply land in the transcript (so the next turn — LLM or
+        not — has the context), the reply goes out through the same sink (for
+        voice that is what resolves the waiting HTTP request), and the
+        background-maintenance gates are evaluated as at every turn end.
+
+        Returns False, having written nothing, if the handler raises or
+        returns no text: the turn then falls through to the LLM.
+        """
+        handler, ctx = decision.handler, decision.ctx
+        try:
+            reply = ((await handler.handle(ctx)) or "").strip()
+        except Exception:
+            log.exception("[%s] direct handler %r failed; passing to the LLM",
+                          self.id, handler.id)
+            return False
+        if not reply:
+            # A decline (the action failed, or its output was not a success)
+            # is the handler's own call and already logged by it.
+            log.info("[%s] direct handler %r declined; passing to the LLM",
+                     self.id, handler.id)
+            return False
+        self.transcripts.append(sid, {"role": "user", "content": user_text})
+        self.transcripts.append(sid, {"role": "assistant", "content": reply})
+        pre_block = turn_id in self._system_emitted_turns
+        await sink.reply(_THINKING_ANSWER_SEP + reply if pre_block else reply)
+        log.info(
+            "[%s:main:%s] turn complete (direct: %s, reply %d chars, %.1fs)",
+            self.id, peer_label, handler.id, len(reply), time.monotonic() - turn_t0,
+        )
+        self._spawn_bg_maintenance_if_needed(sid, self.transcripts.load(sid))
+        return True
 
     async def _idle_recap_for(self, sid: str) -> str | None:
         """Cached per-session idle recap. Computes once on first call,

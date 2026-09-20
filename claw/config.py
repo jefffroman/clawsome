@@ -36,9 +36,56 @@ class OllamaConfig:
 
 
 @dataclass(frozen=True)
+class RelevanceConfig:
+    """The per-turn relevance gate over retrieval candidates.
+
+    Each candidate gets ``sigmoid(offset + distance*d + keyword*log(1+kw) +
+    keyword_share*kw/kw_best)``, where ``d`` is its squared-L2 vector distance
+    to the (full) message, ``kw`` its keyword (BM25) score with the store's
+    common words excluded, and ``kw_best`` the message's best keyword score
+    over the whole store. Candidates at or above ``threshold`` are injected, in
+    search-rank order. ``threshold: 0`` disables the gate (a plain top_n slice).
+
+    The defaults were fitted on one real store (437 memories, MiniLM
+    embeddings) against graded relevance: they are a calibrated starting point,
+    not universal constants — see docs/operations.md, *Memory retrieval*, for
+    re-calibrating them on another store.
+    """
+    threshold: float = 0.40
+    offset: float = 3.30
+    distance: float = -3.78
+    keyword: float = 0.49
+    keyword_share: float = 0.78
+
+
+@dataclass(frozen=True)
+class RetrievalCalibrationConfig:
+    """Where the relevance weights were calibrated, for the drift warning.
+
+    ``best_distance`` is the median best vector distance per message when the
+    weights were fitted. Retrieval tracks the same median over recent turns and
+    logs a warning when it strays past ``tolerance`` — the store's shape has
+    moved and the weights deserve a re-check. (A stale floor constant once went
+    unnoticed for months exactly this way: topical distances fell from ~1.42 to
+    ~0.97 and every memory passed.)
+    """
+    best_distance: float = 0.97
+    tolerance: float = 0.25
+
+
+@dataclass(frozen=True)
 class MemoryRetrievalConfig:
     top_n: int = 5
     compact: bool = True
+    # Search results (fused vector + keyword ranking) that get the relevance
+    # check; up to top_n of those that pass are injected.
+    candidates: int = 20
+    # A word appearing in more than this share of the store's memories is
+    # ignored by keyword search: it matches too much to mean anything. Derived
+    # from the store itself on every reindex — no hand-written word list.
+    common_word_max_share: float = 0.10
+    relevance: RelevanceConfig = RelevanceConfig()
+    calibration: RetrievalCalibrationConfig = RetrievalCalibrationConfig()
 
 
 @dataclass(frozen=True)
@@ -99,6 +146,100 @@ class BluetoothConfig:
     # ~10s (power, connect), so this is a backstop against a wedged radio, not
     # a tuning knob.
     timeout_s: float = 90.0
+
+
+@dataclass(frozen=True)
+class SystemOneConfig:
+    """An optional System One decision scorer (typed decisions, no generated
+    text — see claw/systemone.py).
+
+    Absent block = this claw has no scorer, and that is a fully supported way
+    to run: nothing may REQUIRE one. Every feature that asks the scorer
+    anything — the gate's handlers today, internal decisions later — must
+    check that a client exists and, when it does not (or when a call fails),
+    behave exactly as it would have without the feature. One client is built
+    from this block and shared by every user.
+    """
+    base_url: str = "http://127.0.0.1:11502"
+    # Whole-request ceiling. Scorer calls sit on hot paths (the gate runs
+    # before every eligible turn), and callers treat a timeout as "no answer",
+    # so this bounds what a scorer outage can add.
+    timeout_s: float = 2.0
+
+
+@dataclass(frozen=True)
+class GateReplyConfig:
+    """How a handler answers — exactly one of:
+
+    * ``reply``: say one of these (chosen at random when there are several);
+    * ``reply_fn``: say what this named function (claw/gate_replies.py)
+      returns, or one of ``fallback`` when it returns nothing;
+    * ``relay``: say the tool's own text output.
+    """
+    reply: tuple[str, ...] = ()
+    reply_fn: str | None = None
+    fallback: tuple[str, ...] = ()
+    relay: bool = False
+
+
+@dataclass(frozen=True)
+class GateHandlerConfig:
+    """One direct handler: a turn the gate may answer without the LLM.
+
+    Declarative on purpose: ``description`` is what the scorer reads, ``tool``
+    names a tool already in the agent's own registry, ``args`` are fixed — a
+    handler picks, it never extracts from the message. Two shapes:
+
+    * **text** (``expect`` + one reply form): the tool's text output must be
+      exactly ``expect`` (or, with no ``expect``, anything not starting
+      ``error:``/``refused:``), and the handler answers with ``reply``.
+    * **outcomes**: the tool's structured result (its ``data`` twin) carries a
+      ``result``; each listed result has its own reply form. For tools whose
+      answer matters beyond success, e.g. a skip that reports what is next or
+      that the queue has ended.
+
+    Anything not accepted declines the turn, which then goes to the LLM: a
+    failure never gets a cheerful fixed reply.
+    """
+    id: str
+    description: str
+    tool: str
+    args: dict[str, Any] = field(default_factory=dict)
+    expect: str | None = None
+    reply: GateReplyConfig | None = None
+    outcomes: dict[str, GateReplyConfig] = field(default_factory=dict)
+    # Overrides the gate's min_confidence for this handler (e.g. higher for a
+    # destructive action).
+    min_confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    """The decision gate in front of every human turn.
+
+    Before a matrix or voice turn reaches the LLM, the gate may hand it to a
+    direct handler instead: the scorer picks one handler's description or
+    "none of these". Anything the scorer is not sure of, and every failure of
+    the scorer or the handler, goes to the LLM as before — the gate fails open.
+
+    With no handlers the gate never calls the scorer and needs none: every
+    eligible turn passes through unchanged, and says so in the log. Handlers
+    require a ``systemone`` block.
+
+    Absent block = disabled. ``exposed_to`` says which agents are gated.
+    """
+    enabled: bool = False
+    exposed_to: tuple[str, ...] = ()
+    # A handler runs only when the scorer picks it with at least this
+    # confidence (1 - normalised entropy), unless the handler sets its own.
+    # Below it, the LLM answers: a needless LLM turn costs seconds, a wrong
+    # handler does the wrong thing.
+    min_confidence: float = 0.8
+    # How many prior user/assistant messages (tool traffic and synthetic
+    # notes excluded) the scorer sees with the new message, so a short
+    # follow-up ("skip this one") can be read in context.
+    context_turns: int = 6
+    handlers: tuple[GateHandlerConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -645,6 +786,10 @@ class Config:
     # gateway, a box Hello) resolves to one of these → its ``agent`` answers,
     # and the matching endpoint supplies identity + modality.
     devices: tuple[DeviceConfig, ...] = ()
+    # Optional decision scorer. ``None`` = none configured; every user of it
+    # must then fall back to its no-scorer behaviour (see SystemOneConfig).
+    systemone: SystemOneConfig | None = None
+    gate: GateConfig = GateConfig()
 
 
 def load(path: Path | str) -> Config:
@@ -654,6 +799,8 @@ def load(path: Path | str) -> Config:
     _validate_can_spawn(cfg)
     _validate_voice(cfg)
     _validate_music(cfg)
+    _validate_systemone(cfg)
+    _validate_gate(cfg)
     return cfg
 
 
@@ -761,7 +908,7 @@ def _parse(d: dict[str, Any]) -> Config:
     return Config(
         verbose=d.get("verbose", False),
         ollama=OllamaConfig(**d["ollama"]),
-        memory_retrieval=MemoryRetrievalConfig(**(d.get("memory_retrieval") or {})),
+        memory_retrieval=_parse_memory_retrieval(d.get("memory_retrieval")),
         searxng=SearxngConfig(**d["searxng"]),
         cron=CronConfig(
             enabled=d["cron"]["enabled"],
@@ -795,7 +942,127 @@ def _parse(d: dict[str, Any]) -> Config:
         voice=_parse_voice_service(d.get("voice")),
         http_api=_parse_http_api(d.get("http_api")),
         devices=_parse_devices(d.get("devices")),
+        systemone=_parse_systemone(d.get("systemone")),
+        gate=_parse_gate(d.get("gate")),
     )
+
+
+def _parse_memory_retrieval(d: dict[str, Any] | None) -> MemoryRetrievalConfig:
+    """Parse ``memory_retrieval:``. Strict, nested blocks included: an unknown
+    key raises rather than silently keeping a default."""
+    if not d:
+        return MemoryRetrievalConfig()
+    scalars = {k: v for k, v in d.items() if k not in ("relevance", "calibration")}
+    for k in ("candidates", "top_n"):
+        if k in scalars:
+            scalars[k] = int(scalars[k])
+    if "common_word_max_share" in scalars:
+        scalars["common_word_max_share"] = float(scalars["common_word_max_share"])
+    rel = {k: float(v) for k, v in (d.get("relevance") or {}).items()}
+    cal = {k: float(v) for k, v in (d.get("calibration") or {}).items()}
+    cfg = MemoryRetrievalConfig(
+        relevance=RelevanceConfig(**rel), calibration=RetrievalCalibrationConfig(**cal),
+        **scalars,
+    )
+    if not 0.0 <= cfg.relevance.threshold <= 1.0:
+        raise ValueError(f"memory_retrieval.relevance.threshold must be within [0, 1], got {cfg.relevance.threshold}")
+    if not 0.0 < cfg.common_word_max_share <= 1.0:
+        raise ValueError(f"memory_retrieval.common_word_max_share must be within (0, 1], got {cfg.common_word_max_share}")
+    if cfg.candidates < cfg.top_n:
+        raise ValueError(f"memory_retrieval.candidates ({cfg.candidates}) must be >= top_n ({cfg.top_n})")
+    return cfg
+
+
+def _parse_systemone(d: dict[str, Any] | None) -> SystemOneConfig | None:
+    """Parse the optional ``systemone:`` block. Strict; absent = no scorer."""
+    if d is None:
+        return None
+    scalars = dict(d)
+    if "timeout_s" in scalars:
+        scalars["timeout_s"] = float(scalars["timeout_s"])
+    return SystemOneConfig(**scalars)
+
+
+def _parse_gate(d: dict[str, Any] | None) -> GateConfig:
+    """Parse the optional ``gate:`` block. Strict: an unknown key raises, so a
+    misspelled threshold fails the load instead of silently keeping the
+    default. Handler structure is checked here too (see _parse_gate_handler)."""
+    if not d:
+        return GateConfig()
+    scalars = {k: v for k, v in d.items() if k != "handlers"}
+    if "exposed_to" in scalars:
+        scalars["exposed_to"] = tuple(scalars["exposed_to"] or ())
+    if "enabled" in scalars:
+        scalars["enabled"] = bool(scalars["enabled"])
+    if "min_confidence" in scalars:
+        scalars["min_confidence"] = float(scalars["min_confidence"])
+    if "context_turns" in scalars:
+        scalars["context_turns"] = int(scalars["context_turns"])
+    handlers = tuple(_parse_gate_handler(h) for h in d.get("handlers") or ())
+    return GateConfig(handlers=handlers, **scalars)
+
+
+_REPLY_KEYS = ("reply", "reply_fn", "fallback", "relay")
+
+
+def _parse_reply(d: dict[str, Any], where: str, *, structured: bool) -> GateReplyConfig:
+    """One reply form, strictly: exactly one of reply / reply_fn / relay;
+    ``fallback`` only beside reply_fn. A structured outcome has no text to
+    relay, and its reply_fn needs a fallback — the action has already run, so
+    there must always be something to say."""
+    from claw.gate_replies import REPLY_FUNCTIONS
+
+    if unknown := sorted(set(d) - set(_REPLY_KEYS)):
+        raise ValueError(f"{where}: unknown key(s) {unknown}")
+
+    def texts(v: Any) -> tuple[str, ...]:
+        return (v,) if isinstance(v, str) else tuple(str(x) for x in v or ())
+
+    rc = GateReplyConfig(
+        reply=texts(d.get("reply")), reply_fn=d.get("reply_fn"),
+        fallback=texts(d.get("fallback")), relay=bool(d.get("relay", False)),
+    )
+    forms = [bool(rc.reply), rc.reply_fn is not None, rc.relay]
+    if sum(forms) != 1:
+        raise ValueError(f"{where}: needs exactly one of reply, reply_fn, relay: true")
+    if rc.fallback and rc.reply_fn is None:
+        raise ValueError(f"{where}: fallback only accompanies a reply_fn")
+    if rc.reply_fn is not None and rc.reply_fn not in REPLY_FUNCTIONS:
+        raise ValueError(
+            f"{where}: unknown reply_fn {rc.reply_fn!r}; known: {sorted(REPLY_FUNCTIONS)}"
+        )
+    if structured and rc.relay:
+        raise ValueError(f"{where}: an outcome has no text output to relay")
+    if structured and rc.reply_fn is not None and not rc.fallback:
+        raise ValueError(f"{where}: an outcome's reply_fn needs a fallback")
+    return rc
+
+
+def _parse_gate_handler(d: dict[str, Any]) -> GateHandlerConfig:
+    """One handler, strictly — either the text shape (expect + a reply form)
+    or the outcomes shape, never both."""
+    h = dict(d)
+    hid = h.get("id")
+    where = f"gate.handlers[{hid!r}]"
+    reply_part = {k: h.pop(k) for k in _REPLY_KEYS if k in h}
+    outcomes_raw = h.pop("outcomes", None)
+    if outcomes_raw is not None:
+        if reply_part or "expect" in h:
+            raise ValueError(f"{where}: outcomes replaces expect and the reply keys")
+        if not outcomes_raw:
+            raise ValueError(f"{where}: outcomes is empty")
+        h["outcomes"] = {
+            str(k): _parse_reply(dict(v or {}), f"{where}.outcomes[{k!r}]", structured=True)
+            for k, v in outcomes_raw.items()
+        }
+    else:
+        h["reply"] = _parse_reply(reply_part, where, structured=False)
+    if "min_confidence" in h and h["min_confidence"] is not None:
+        h["min_confidence"] = float(h["min_confidence"])
+        if not 0.0 <= h["min_confidence"] <= 1.0:
+            raise ValueError(f"{where}: min_confidence must be within [0, 1]")
+    h["args"] = dict(h.get("args") or {})
+    return GateHandlerConfig(**h)
 
 
 def _parse_bluetooth(d: dict[str, Any] | None) -> BluetoothConfig:
@@ -914,6 +1181,38 @@ def _parse_dj(d: dict[str, Any] | None) -> DjConfig:
     if "enabled" in scalars:
         scalars["enabled"] = bool(scalars["enabled"])
     return DjConfig(**scalars)
+
+
+def _validate_gate(cfg: "Config") -> None:
+    """An exposed_to naming no real agent would gate nobody, silently; and
+    handlers are the one part of the gate that needs a scorer."""
+    if not cfg.gate.enabled:
+        return
+    agent_ids = {ac.id for ac in cfg.agents}
+    if unknown := sorted(set(cfg.gate.exposed_to) - agent_ids):
+        raise ValueError(
+            f"gate.exposed_to references unknown agent(s): {unknown}; "
+            f"known agents: {sorted(agent_ids)}"
+        )
+    if not 0.0 <= cfg.gate.min_confidence <= 1.0:
+        raise ValueError(f"gate.min_confidence must be within [0, 1], got {cfg.gate.min_confidence}")
+    if cfg.gate.context_turns < 0:
+        raise ValueError(f"gate.context_turns must be >= 0, got {cfg.gate.context_turns}")
+    ids = [h.id for h in cfg.gate.handlers]
+    if "none" in ids:
+        raise ValueError("gate.handlers: id 'none' is reserved (it is the LLM's option)")
+    if dupes := sorted({i for i in ids if ids.count(i) > 1}):
+        raise ValueError(f"gate.handlers: duplicate id(s): {dupes}")
+    if cfg.gate.handlers and cfg.systemone is None:
+        raise ValueError(
+            "gate.handlers need a scorer: add a systemone block, or remove the "
+            "handlers (a gate with none passes every turn through)"
+        )
+
+
+def _validate_systemone(cfg: "Config") -> None:
+    if cfg.systemone is not None and cfg.systemone.timeout_s <= 0:
+        raise ValueError(f"systemone.timeout_s must be positive, got {cfg.systemone.timeout_s}")
 
 
 def _validate_music(cfg: "Config") -> None:

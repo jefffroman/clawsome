@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 
 from claw.music import (
     Hit, MpvUnavailable, Player, SearchResult, Track, _fold, album_gain_db, interleave,
-    is_furniture, is_handle, shuffled,
+    is_furniture, is_handle, render_skip, shuffled,
 )
 from claw.tools.base import Tool
 
@@ -964,14 +964,39 @@ def build_music_tools(
         return (f"{when:%Y-%m-%d %H:%M %Z} ({_ago(r['at'])})  {r['by']:<8} "
                 f"{r['scope']:<6} {what} — {change}")
 
-    async def _control(args: dict[str, Any]) -> str:
+    def _track_fields(e: Any) -> dict[str, Any] | None:
+        if isinstance(e, Track):
+            return {"title": e.title, "artist": e.artist, "album": e.album}
+        if e == "a DJ link":
+            return {"link": True}
+        return None
+
+    async def _do_control(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Perform ONE transport action; return (text for the model, fields
+        for code). Both faces of music_control come from this single call —
+        an action must never run twice to be described twice."""
         action = str(args.get("action", "")).strip().lower()
         if action not in ACTIONS:
-            return f"error: action must be one of: {', '.join(ACTIONS)}"
+            return (f"error: action must be one of: {', '.join(ACTIONS)}",
+                    {"result": "error"})
         try:
-            return await player.control(action)
+            if action == "next":
+                res = await player.skip()
+                return (render_skip(res),
+                        {"result": res["result"], "next": _track_fields(res.get("next"))})
+            text = await player.control(action)
+            return text, {"result": text}
         except MpvUnavailable:
-            return _DOWN
+            return _DOWN, {"result": "down"}
+
+    async def _control(args: dict[str, Any]) -> str:
+        return (await _do_control(args))[0]
+
+    async def _control_data(args: dict[str, Any]) -> dict[str, Any]:
+        """``result``: paused | resumed | stopped | skipped | end_of_queue |
+        idle | down | error; after a skip, ``next`` is the entry now starting
+        ({title, artist, album}, {link: True}, or None if uncatalogued)."""
+        return (await _do_control(args))[1]
 
     def _recently() -> str:
         """A compact tail of what has been queued, for building a set on.
@@ -996,13 +1021,38 @@ def build_music_tools(
             f"{r['album'] or 'loose tracks'} — {r['artist']}" for r in rows
         )
 
+    async def _status_data(_args: dict[str, Any]) -> dict[str, Any]:
+        """What is on now, as fields: ``state`` is playing | paused | idle |
+        loading | link (a spoken DJ link between songs) | down; ``title``/``artist``/
+        ``album`` are set only for a catalogued track."""
+        try:
+            st = await player.status()
+        except MpvUnavailable:
+            return {"state": "down"}
+        if not st.get("path"):
+            # idle-active explicitly False with no path: an entry is current
+            # but its file is still opening — the few milliseconds after a
+            # skip. Not "nothing is playing". Anything else is idle.
+            return {"state": "loading" if st.get("idle-active") is False else "idle"}
+        if st.get("clip"):
+            return {"state": "link"}
+        track: Track | None = st.get("track")
+        return {
+            "state": "paused" if st.get("pause") else "playing",
+            "title": track.title if track else (st.get("media-title") or None),
+            "artist": track.artist if track else None,
+            "album": track.album if track else None,
+        }
+
     async def _status(_args: dict[str, Any]) -> str:
         try:
             st = await player.status()
         except MpvUnavailable:
             return _DOWN
         recent = _recently()
-        if st.get("idle-active") or not st.get("path"):
+        if not st.get("path"):
+            if st.get("idle-active") is False:
+                return "the next entry is loading — ask again in a moment"
             return "nothing is playing" + (f". {recent}" if recent else "")
         track: Track | None = st.get("track")
         if st.get("clip"):
@@ -1283,6 +1333,7 @@ def build_music_tools(
                 "required": ["action"],
             },
             run=_control,
+            data=_control_data,
         ),
         "music_status": Tool(
             name="music_status",
@@ -1295,6 +1346,7 @@ def build_music_tools(
             ),
             input_schema={"type": "object", "properties": {}},
             run=_status,
+            data=_status_data,
         ),
         "music_outputs": Tool(
             name="music_outputs",

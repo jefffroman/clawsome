@@ -1350,3 +1350,89 @@ async def test_artist_detail_lists_their_records(playing, lib, library_root):
 async def test_a_bad_handle_to_search_is_a_bad_handle(playing):
     built, _, _ = playing
     assert (await built["music_search"].run({"query": "al:99999"})).startswith("error: no such handle")
+
+
+# --- skip reports what comes next ------------------------------------------
+
+def _queue_ipc(files, current, idle=False, sent=None):
+    """mpv faked around a queue: ``files`` in order, ``current`` the index
+    playing (None = nothing). Records every command in ``sent``."""
+    async def fake(sock, commands, timeout=10.0):
+        out = []
+        for c in commands:
+            if sent is not None:
+                sent.append(list(c))
+            if c[:2] == ["get_property", "playlist"]:
+                out.append({"error": "success", "data": [
+                    {"filename": f, "id": i + 1, **({"current": True} if i == current else {})}
+                    for i, f in enumerate(files)]})
+            elif c[:2] == ["get_property", "idle-active"]:
+                out.append({"error": "success", "data": idle})
+            else:
+                out.append({"error": "success", "data": None})
+        return out
+    return fake
+
+
+async def _album_files(built, calls):
+    await built["music_play"].run({"query": "ace of spades", "output": "room-a"})
+    return [c[1] for c in calls if c[0] == "loadfile"]
+
+
+async def test_skip_names_the_next_track_it_read_before_skipping(playing, monkeypatch):
+    built, _, calls = playing
+    files = await _album_files(built, calls)
+    sent: list = []
+    monkeypatch.setattr(music_mod, "ipc", _queue_ipc(files, current=0, sent=sent))
+    out = await built["music_control"].run({"action": "next"})
+    assert out.startswith("skipped to Motörhead — ") and "(Ace of Spades)" in out
+    assert ["playlist-next", "force"] in sent
+    # The playlist was read before the skip was sent.
+    assert sent.index(["get_property", "playlist"]) < sent.index(["playlist-next", "force"])
+
+    data = await built["music_control"].data({"action": "next"})
+    assert data["result"] == "skipped"
+    assert data["next"]["artist"] == "Motörhead" and data["next"]["album"] == "Ace of Spades"
+
+
+async def test_skipping_the_last_entry_says_the_queue_has_ended(playing, monkeypatch):
+    built, _, calls = playing
+    files = await _album_files(built, calls)
+    sent: list = []
+    monkeypatch.setattr(music_mod, "ipc", _queue_ipc(files, current=len(files) - 1, sent=sent))
+    out = await built["music_control"].run({"action": "next"})
+    assert "last entry" in out and "nothing is playing now" in out
+    assert ["playlist-next", "force"] in sent, "the skip still happens — the music stops"
+    assert (await built["music_control"].data({"action": "next"})) == {
+        "result": "end_of_queue", "next": None}
+
+
+async def test_skip_with_nothing_playing_does_nothing(playing, monkeypatch):
+    built, _, calls = playing
+    sent: list = []
+    monkeypatch.setattr(music_mod, "ipc", _queue_ipc([], current=None, idle=True, sent=sent))
+    out = await built["music_control"].run({"action": "next"})
+    assert out.startswith("nothing is playing")
+    assert ["playlist-next", "force"] not in sent
+    assert (await built["music_control"].data({"action": "next"}))["result"] == "idle"
+
+
+async def test_other_actions_report_their_word_in_both_faces(playing):
+    built, _, _ = playing
+    assert await built["music_control"].run({"action": "pause"}) == "paused"
+    assert await built["music_control"].data({"action": "resume"}) == {"result": "resumed"}
+    assert (await built["music_control"].data({"action": "fly"}))["result"] == "error"
+
+
+async def test_status_between_a_skip_and_the_file_opening_is_loading(playing, monkeypatch):
+    """mpv switches entry at once but opens the file a few ms later; that gap
+    is not "nothing is playing"."""
+    built, _, _ = playing
+
+    async def loading(sock, commands, timeout=10.0):
+        return [{"error": "success", "data": False if c[1] == "idle-active" else None}
+                for c in commands]
+
+    monkeypatch.setattr(music_mod, "ipc", loading)
+    assert (await built["music_status"].data({})) == {"state": "loading"}
+    assert "loading" in await built["music_status"].run({})

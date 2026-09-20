@@ -1040,14 +1040,48 @@ class Player:
             await ipc(self.cfg.mpv_socket, [["set_property", "pause", False]])
             return "resumed"
         if action == "next":
-            (reply,) = await ipc(self.cfg.mpv_socket, [["playlist-next", "force"]])
-            if reply.get("error") != "success":
-                return "nothing further in the queue"
-            return "skipped"
+            return render_skip(await self.skip())
         if action == "stop":
             await ipc(self.cfg.mpv_socket, [["stop"], ["playlist-clear"]])
             return "stopped"
         raise ValueError(action)
+
+    def entry(self, filename: str | None) -> "Track | str | None":
+        """A queue entry as a caller should see it: a Track, "a DJ link", or
+        None for something the catalogue does not know."""
+        if not filename:
+            return None
+        if self.is_clip(filename):
+            return "a DJ link"
+        return self.library.by_path(self.cfg.library_root, filename)
+
+    async def skip(self) -> dict[str, Any]:
+        """Skip to the next queue entry, reporting what that means.
+
+        The queue is read BEFORE skipping, so the result says what comes next
+        rather than guessing from what plays afterwards (mpv takes a moment to
+        open the next file). ``result`` is:
+
+        * ``skipped`` — ``next`` is the Track or "a DJ link" now starting, or
+          None when the catalogue does not know the file;
+        * ``end_of_queue`` — that was the last entry: the skip went through
+          and nothing is playing now. (``playlist-next force`` succeeds on the
+          last entry and stops playback; it never reports "nothing further".)
+        * ``idle`` — nothing was playing, so nothing was done.
+        """
+        playlist_r, idle_r = await ipc(
+            self.cfg.mpv_socket,
+            [["get_property", "playlist"], ["get_property", "idle-active"]],
+        )
+        playlist = _data(playlist_r) or []
+        cur = next((i for i, e in enumerate(playlist) if e.get("current")), None)
+        if _data(idle_r) or cur is None:
+            return {"result": "idle"}
+        nxt = playlist[cur + 1].get("filename") if cur + 1 < len(playlist) else None
+        await ipc(self.cfg.mpv_socket, [["playlist-next", "force"]])
+        if nxt is None:
+            return {"result": "end_of_queue"}
+        return {"result": "skipped", "next": self.entry(nxt)}
 
     async def status(self) -> dict[str, Any]:
         props = [
@@ -1059,16 +1093,7 @@ class Player:
             self.cfg.mpv_socket, [["get_property", p] for p in props]
         )
         got = {p: _data(r) for p, r in zip(props, replies)}
-        root = self.cfg.library_root
-
-        def entry(filename: str | None) -> Track | str | None:
-            """A queue entry as the caller should see it: a Track, "a DJ link",
-            or None for something the catalogue does not know."""
-            if not filename:
-                return None
-            if self.is_clip(filename):
-                return "a DJ link"
-            return self.library.by_path(root, filename)
+        entry = self.entry
 
         playlist = got.get("playlist") or []
         cur = next((i for i, e in enumerate(playlist) if e.get("current")), None)
@@ -1086,6 +1111,20 @@ class Player:
             "tail": entry(tail) if tail != nxt else None,
             "output": output,
         }
+
+
+def render_skip(res: dict[str, Any]) -> str:
+    """Player.skip()'s result as the text the model (and the CLI) reads."""
+    if res["result"] == "idle":
+        return "nothing is playing — there was nothing to skip"
+    if res["result"] == "end_of_queue":
+        return "skipped past the end of the queue — that was the last entry; nothing is playing now"
+    nxt = res.get("next")
+    if isinstance(nxt, Track):
+        return f"skipped to {nxt.full_label()}"
+    if nxt == "a DJ link":
+        return "skipped to a DJ link (the agent talking between songs)"
+    return "skipped"
 
 
 # --- set candidates ------------------------------------------------------

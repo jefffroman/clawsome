@@ -130,10 +130,34 @@ and **not** indexed (the regex anchors on a bare date). Use the slug
 form for transient reasoning notes; use the bare form for distillations
 worth retrieving.
 
-**Retrieval.** Hybrid: ChromaDB vector + BM25 + NetworkX co-occurrence
-graph, fused by Reciprocal Rank Fusion. Vector floor at distance 1.50
-(calibrated against MiniLM-L6-v2's distribution: topical hits cluster
-around 1.41–1.44, gibberish plateaus at 1.50+).
+**Retrieval.** Hybrid: ChromaDB vector + BM25, fused by Reciprocal Rank
+Fusion, plus a NetworkX co-occurrence graph section. Each turn:
+
+1. **Search.** The keyword side searches the message *without* its envelope
+   header, tokenized with punctuation stripped, and without the store's
+   **common words** — any word in more than `common_word_max_share` of the
+   memories, derived from the store at every reindex, no word list. The vector
+   side embeds the full message. The fused top `candidates` (20) go on.
+2. **Relevance gate.** Each candidate is scored from its vector distance `d`
+   and keyword score `kw`:
+   `sigmoid(offset + distance·d + keyword·log(1+kw) + keyword_share·kw/kw_best)`.
+   Those at or above `relevance.threshold` are injected, up to `top_n`, in
+   search order. A turn where nothing fits injects nothing ("No strong
+   matches").
+3. **Supersession** heads are appended (below).
+
+Why a gate and not a distance floor: vector distance is only a weak relevance
+signal (a similar-but-off-topic memory sits as close as a relevant one), so any
+floor strict enough to keep junk out also starves turns that needed memory.
+Keyword overlap on *meaningful* words is a second, largely independent signal;
+together they separate relevant from irrelevant memories about as well as an
+LLM judge did, in milliseconds. The keyword index is built once per reindex
+and kept in memory.
+
+On the store the defaults were fitted to (437 memories, MiniLM embeddings, 50
+real messages graded for relevance): 4.0 memories per turn at 60% relevant,
+against an always-5 slice at ~47%, with the same share of relevant memories
+found.
 
 **Reindex cadence.** Maintenance loop checks `sourcesHash` every 5 min
 and reindexes if changed. Source-file edits (e.g., a memory_flush
@@ -145,10 +169,46 @@ picked up within 5 min.
 renders the current head last, so a stale fact stays searchable as a
 visible timeline without outranking its replacement. See curation below.
 
-**Tuning the floor.** If retrieval is too noisy or too sparse, recompute
-distances against a known-good query against your actual corpus and
-adjust `VECTOR_DISTANCE_MAX` in `claw/memory.py`. Keep it in source —
-this is calibration, not config.
+**Tuning the gate.** The weights are calibrated to a store's shape — how
+its memories are written and chunked, its vocabulary, its size — and they
+drift as the store changes. A WARNING like `memory retrieval drift: median
+best distance … calibrated at …` means the store has moved away from where
+they were fitted. To re-calibrate:
+
+1. Take ~50 real messages from transcripts. For each, collect the ungated top
+   `candidates` (e.g. `_candidates()` with `threshold: 0`).
+2. Grade each message–memory pair 0/1/2 for relevance (by hand, or with a
+   strong model as referee — spot-check it).
+3. Fit a logistic regression of *relevant (grade ≥ 1)* on
+   `[d, log(1+kw), kw/kw_best]`, cross-validated by message so it cannot
+   memorise; set `relevance.*` to the fitted weights and choose `threshold`
+   from the precision/recall trade-off you want.
+4. Set `calibration.best_distance` to the median best vector distance per
+   message on that sample.
+
+Steps 1 and 2 are `python -m claw.evaluate collect` and `grade`; `score` then
+reports what the current code retrieves against those labels.
+
+**Keep what step 2 produces.** The grades are the expensive part and the
+reusable part: a label says whether this memory helps answer this message,
+which does not change when scoring, term selection or fusion changes. So they
+are not only for re-fitting — any later change to the retrieval path can be
+scored against them with **no model calls at all**, which is the difference
+between validating a change and asserting it. Regrading is not a cheap redo
+either: a referee is not deterministic, so fresh labels are a different
+baseline and earlier measurements stop being comparable.
+
+Tests will not catch this class of change. `relevance` is a fitted model whose
+inputs include keyword scores, so altering which words are searched moves the
+distribution its coefficients were fitted on while every test stays green —
+and the drift WARNING watches vector distance, so it does not fire either.
+
+The set holds real messages and real memory text. Keep it where backups reach,
+out of version control, and far from any public mirror.
+
+Quick adjustments without re-fitting: raise `threshold` for fewer, cleaner
+memories; lower it (or `0`) for more. The explicit `memory_search` tool is
+never gated.
 
 ## Curation (forgetory) in depth
 
@@ -330,6 +390,18 @@ Re-issue after a restart if you need it back.
 | `claw.ollama INFO [<label>] turn N: K tool_call(s) requested` | Tool round-trip. `<label>` shape: `<agent_id>:<kind>[:<peer_or_task>]` — e.g. `agent-1:main:user-1` (user-facing turn from `@user-1:example.org`), `agent-1:flush:periodic-growth:user-1` (background memory flush of that user's session), `agent-1:subagent:persona-3-a1b2c3d4` (subagent one-shot, parent's id + kind + the spawned task_id). At DEBUG verbosity an additional `:<sid>` correlation handle is appended for the matrix call sites (subagent labels stay as-is — the task_id is already a stable correlation handle). If N approaches `max_tool_turns`, the model is in a tool loop. |
 | `WARNING [<agent>] background flush timed out after Xs` | Flush exceeded `turn_timeout_s`. |
 | `claw.main INFO firing job <name>` | Cron-driven inbound being dispatched. |
+| `[<agent>:gate:<peer>] -> <handler> (chosen, <handler> @ 0.92)` | The decision gate answered directly; `turn complete (direct: <handler>, …)` follows. `-> llm (<reason>, …)` means it passed the turn on — `no-handlers`, `none`, `low-confidence` (with the score to tune against) or `scorer-error`. See `docs/decisions.md`. |
+
+### A gate handler never fires
+
+Check, in order: the boot line `[<agent>] gate handlers: …` lists it (a handler
+naming a tool the agent lacks is dropped with an `ERROR`); the turn is
+eligible (one message, `matrix`/`voice`); and the `:gate:` line's reason. A
+steady `low-confidence, <handler> @ 0.7x` means the right pick under the bar —
+tune the description or that handler's `min_confidence` against a measured set
+of utterances and near-misses (`docs/decisions.md` *Tuning*). `scorer-error`
+means the decision service is down, slow (past `systemone.timeout_s`) or
+answering in the wrong format; the turn went to the LLM, as designed.
 
 ### Flush isn't firing
 
