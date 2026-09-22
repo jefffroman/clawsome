@@ -68,7 +68,7 @@ async def _serve(cfg: Config) -> int:
     # every feature that asks it anything. Absent block = no scorer, a fully
     # supported configuration — each user falls back when this is None.
     systemone = (
-        SystemOneClient(cfg.systemone.base_url, cfg.systemone.timeout_s)
+        SystemOneClient(cfg.systemone.base_url)
         if cfg.systemone is not None else None
     )
     spawner = SubagentSpawner(cfg.subagents)
@@ -84,6 +84,10 @@ async def _serve(cfg: Config) -> int:
     for ac in cfg.agents:
         log.info("[%s] initializing", ac.id)
         memory = MemoryIndex(ac.id, ac.workspace, cfg.memory_retrieval)
+        # Smart retrieval asks the scorer about borderline candidates. None
+        # here is a supported way to run: the index falls back to the fitted
+        # formula, so no deployment is obliged to have a scorer.
+        memory.scorer = systemone
         await memory.warmup_async()
         try:
             result = await memory.reindex_if_stale()

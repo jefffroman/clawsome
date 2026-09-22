@@ -1,9 +1,7 @@
-<img src="https://raw.githubusercontent.com/jefffroman/clawsome/2026.9.20/clawsome-logo.png" alt="Clawsome" width="80" align="left">
+<img src="clawsome-logo.png" alt="Clawsome" width="80" align="left">
 
 # Clawsome
 A lean python harness for running persistent AI agents.
-
-> Clawsome is under early, active development. Expect rough edges, breaking changes, and missing features. Feedback and contributions are welcome.
 
 <br clear="left">
 
@@ -14,7 +12,7 @@ Clawsome talks to a few external services (Ollama, SearXNG, a Matrix
 homeserver) — get those running first, then `pip install -e .` and
 point claw at a populated `claw.yaml`.
 
-→ See [`docs/setup.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/setup.md) for prerequisites, install notes
+→ See [`docs/setup.md`](docs/setup.md) for prerequisites, install notes
 (including why the `matrix-nio[e2e]` extra is mandatory), and a
 first-boot checklist.
 
@@ -30,7 +28,7 @@ session rotate) run **off** the user-reply path. An optional
 (`%stop`, `%compact`, `%clear`, …) that are intercepted before the
 model and never enter the transcript.
 
-→ See [`docs/architecture.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/architecture.md) for the full mental
+→ See [`docs/architecture.md`](docs/architecture.md) for the full mental
 model, request lifecycle, and workspace file contract.
 
 Optionally, a **System One decision service** (typed choices with
@@ -39,14 +37,14 @@ command-like turns — "pause the music", "what's playing?" — with a direct to
 action in well under a second instead of a full LLM turn. Clawsome runs the
 same with or without one.
 
-→ See [`docs/decisions.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/decisions.md).
+→ See [`docs/decisions.md`](docs/decisions.md).
 
 ## Configuration
 
 `claw.yaml` is parsed once at startup; editing requires a restart. The
 shipped `claw.example.yaml` is a runnable template with inline comments.
 
-→ See [`docs/configuration.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/configuration.md) for the full key-by-key
+→ See [`docs/configuration.md`](docs/configuration.md) for the full key-by-key
 reference.
 
 ## Audio
@@ -55,7 +53,7 @@ Bluetooth and music: the host requirements that bite before either works, the
 DJ run sheet, why search and candidates have opposite contracts, output
 routing, and how playback loudness is decided.
 
-→ See [`docs/audio.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/audio.md).
+→ See [`docs/audio.md`](docs/audio.md).
 
 ## Operations
 
@@ -64,7 +62,7 @@ bot first-deploy (token + cross-signing UIA + ghost-DM avoidance), the
 admin-command runbook (`%stop`/`%compact`/`%clear`/`%subagents`/
 `%verbose`/`%thinking`), and log-based troubleshooting.
 
-→ See [`docs/operations.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/operations.md).
+→ See [`docs/operations.md`](docs/operations.md).
 
 ## Extending
 
@@ -73,7 +71,7 @@ optional `tool.py`), **built-in tools** (in-tree; universal capability),
 **gate handlers** (config-only; answer a fixed, command-like turn without the
 LLM), **channels** (in-tree; new inbound surface). Skills cover 99% of cases.
 
-→ See [`docs/extending.md`](https://github.com/jefffroman/clawsome/blob/2026.9.20/docs/extending.md).
+→ See [`docs/extending.md`](docs/extending.md).
 
 ## Deployment
 

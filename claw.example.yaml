@@ -34,14 +34,56 @@ memory_retrieval:
   candidates: 20   # search results that get the relevance check
   common_word_max_share: 0.10  # words in >10% of memories are ignored by keyword search
   relevance:       # per-turn gate; see docs/operations.md "Memory retrieval"
-    threshold: 0.40   # 0 disables the gate (plain top_n slice)
-    offset: 3.30
-    distance: -3.78
-    keyword: 0.49
-    keyword_share: 0.78
+    threshold: 0.45   # 0 disables the gate (plain top_n slice)
+    offset: 2.40
+    distance: -2.99
+    keyword: 0.64
+    keyword_share: 0.24
+    traversal: 0.0    # credit for being reached by graph expansion; 0 = none
   calibration:     # drift warning: where the weights above were fitted
-    best_distance: 0.97
+    best_distance: 0.973
     tolerance: 0.25
+  graph:           # expand the pool one hop along the knowledge graph
+    # ⚠ With the defaults below (traversal 0.0, smart_retrieval off) this is
+    # OBSERVABLY INERT: expansion runs, but a graph-reached chunk is judged on
+    # content alone and rarely clears the threshold (measured: zero injected),
+    # so true and false give the same result. It becomes live if you give
+    # `relevance.traversal` a positive WEIGHT (a log-odds coefficient, not a
+    # hop count -- the walk is always exactly one hop), or enable
+    # smart_retrieval, which always asks the scorer about graph-reached
+    # candidates. See docs/operations.md, *When the graph changes anything*.
+    enabled: true
+    seeds: 10         # how many fused candidates to expand from
+    max_expand: 20    # hard cap on chunks added per query
+  smart_retrieval: # a second opinion on the candidates near the threshold
+    # Needs a `systemone` block; enabling it without one fails at load.
+    # The relevance formula above is calibrated and free, but near its own
+    # threshold it is guessing. This asks the scorer about just that band:
+    # a rejected candidate it calls relevant is promoted in, a retrieved one
+    # it calls irrelevant is dropped. Everything surviving is injected.
+    # Measured on one store: precision 0.57 -> 0.63 and recall 0.56 -> 0.59
+    # at the same volume, for roughly a second a turn. More accurate
+    # retrieval can pay that back in turns the agent no longer spends
+    # searching for what it should already have been told.
+    enabled: false
+    promote_margin: 0.10   # how far BELOW `threshold` to look for promotions
+    review_margin: 0.30    # how far ABOVE it to keep reviewing for drops
+    promote_threshold: 0.905      # P(yes) to come in from below
+    retain_threshold: 0.107       # P(yes) to survive from above
+    graph_promote_threshold: 0.10 # graph-reached chunks score low; own bar
+    note_chars: 200        # how much of a note the scorer reads
+    context_turns: 6       # prior messages the scorer reads as context;
+                           # costs a flat ~190ms a turn, not per candidate
+    timeout_s: 5.0         # retrieval's OWN scorer deadline. It asks about
+                           # every borderline candidate in ONE batch (median
+                           # 1.4s, tail ~4.4s) and a miss costs precision, not
+                           # memory, so it can wait; the gate shares the client
+                           # but must fail open fast. At the gate's 2s the tail
+                           # was cut and every metric lost ~5 points.
+    # ⚠ note_chars and the two thresholds are ONE calibration. Clipping moves
+    # the whole score distribution, so the same thresholds cut elsewhere:
+    # between 400 and 200 characters retain_threshold had to move 0.149 ->
+    # 0.107 to hold the same operating point. Change one, re-fit the others.
 
 searxng:
   base_url: http://127.0.0.1:8080
@@ -92,7 +134,12 @@ bluetooth:
 # exactly as it would without that feature.
 systemone:
   base_url: http://127.0.0.1:11502
-  timeout_s: 2.0                        # a timeout counts as "no answer"
+  # No timeout here: each caller states its own at the call site
+  # (gate.timeout_s, memory_retrieval.smart_retrieval.timeout_s), because they
+  # sit on different paths and want different bounds. A client-level default
+  # could never be reached anyway — a per-request timeout overrides it — so it
+  # would only let the next caller inherit someone else's policy by accident,
+  # which is exactly how retrieval once ran at the gate's bound.
 
 # Decision gate: the outer loop in front of the LLM. Each human turn (matrix or
 # voice, one message at a time) is first offered to the direct handlers: the
@@ -118,6 +165,12 @@ systemone:
 gate:
   enabled: false
   exposed_to: []                        # e.g. [agent-1]
+  timeout_s: 2.0                        # the gate's OWN fail-open bound: it
+                                        # runs before every eligible turn and a
+                                        # timeout means "let the LLM answer",
+                                        # so it is a latency guarantee, not a
+                                        # transport setting. Retrieval waits
+                                        # longer, deliberately.
   min_confidence: 0.8                   # 1 - normalised entropy of the pick
   context_turns: 6                      # prior user/assistant messages the
                                         # scorer sees with the new one

@@ -282,7 +282,7 @@ class DecisionGate:
         try:
             answers = await self.client.ask(state, {_QUESTION: {
                 "type": "choice", "instructions": _INSTRUCTIONS, "criteria": criteria,
-            }})
+            }}, timeout_s=self.cfg.timeout_s)
             answer = answers[_QUESTION]
             choice, confidence = answer["choice"], float(answer["confidence"])
         except Exception as e:  # noqa: BLE001 — fail open, whatever went wrong

@@ -6,11 +6,13 @@ PUBLIC MIRROR: neutral placeholders only.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from pathlib import Path
 
 import pytest
 
-from claw.config import MemoryRetrievalConfig
+from claw.config import GraphConfig, MemoryRetrievalConfig
 from claw.memory import MemoryIndex
 
 pytestmark = pytest.mark.filterwarnings("ignore")
@@ -114,50 +116,13 @@ async def _index(ws: Path) -> MemoryIndex:
     idx = MemoryIndex("example", ws, MemoryRetrievalConfig())
     await idx.warmup_async()
     await idx.reindex_if_stale(force=True)
-    assert idx._query_graph("toner")["nodes"] > 0, "store did not index"
+    assert idx._keyword_index()["corpus"], "store did not index"
     return idx
 
 
-@pytest.mark.asyncio
-async def test_a_query_of_only_generic_words_matches_nothing(tmp_path):
-    idx = await _index(tmp_path)
-    for filler in ("thanks", "ok then", "what did you do"):
-        assert idx._query_graph(filler)["related"] == [], filler
 
 
-@pytest.mark.asyncio
-async def test_the_informative_word_wins_over_the_vague_one(tmp_path):
-    """Both "hose" and "working" are uncommon enough to survive the common-word
-    cut, so counting matched words ties them and name length breaks the tie the
-    wrong way. Weighting by IDF is what puts the asked-about thing first."""
-    idx = await _index(tmp_path)
-    top = [r["node"] for r in idx._query_graph("is the garden hose working", top_n=3)["related"]]
-    # Either the concept or the section it belongs to is a right answer; what
-    # matters is that neither "Working ..." section takes the lead.
-    assert top[0] in ("garden hose", "Garden hose replacement"), top
-    assert not top[0].lower().startswith("working"), top
 
-
-@pytest.mark.asyncio
-async def test_an_entry_node_comes_back_with_what_it_links_to(tmp_path):
-    """The leg exists for traversal, so a hit is only useful with neighbors."""
-    idx = await _index(tmp_path)
-    [hit] = [r for r in idx._query_graph("toner")["related"]
-             if r["node"] == "Printer toner"]
-    assert "toner cartridges" in hit["neighbors"]
-
-
-@pytest.mark.asyncio
-async def test_neighbors_are_not_repeated(tmp_path):
-    idx = await _index(tmp_path)
-    for hit in idx._query_graph("garden hose leaked")["related"]:
-        assert len(hit["neighbors"]) == len(set(hit["neighbors"]))
-
-
-@pytest.mark.asyncio
-async def test_a_missing_graph_file_is_not_an_error(tmp_path):
-    idx = MemoryIndex("example", tmp_path, MemoryRetrievalConfig())
-    assert idx._query_graph("anything") == {"nodes": 0, "related": []}
 
 
 # --- the per-turn block --------------------------------------------------------
@@ -250,3 +215,117 @@ def test_a_heading_outranks_a_bolded_span_of_the_same_name():
     ]
     G = MemoryIndex._build_graph(chunks)
     assert G.nodes["Toner cartridges"]["type"] == "section"
+
+
+# --- graph expansion of the candidate pool --------------------------------------
+#
+# The graph does not match the query here. It expands outward from what the two
+# ranked legs already found, which is what makes the anchor a chunk the
+# calibrated path endorsed rather than a node name that shares a word.
+
+LINKED = [
+    # "Fermentation crock" links OUT to two sections whose own text shares no
+    # vocabulary with it, which is the shape expansion exists for -- and two,
+    # so the max_expand cap has something to cut.
+    ("Fermentation crock",
+     "The cabbage needs two weeks. See also Brine ratios and Lid gasket."),
+    ("Brine ratios", "Three tablespoons per litre of water."),
+    # Deliberately shares no word with the query that finds the crock note --
+    # otherwise it ranks directly and expansion is not what reached it.
+    ("Lid gasket", "Replaced in April; the old one had perished."),
+    ("Bicycle service", "The rear derailleur was adjusted in March."),
+]
+
+
+async def _linked_index(ws: Path, cfg: MemoryRetrievalConfig | None = None) -> MemoryIndex:
+    (ws / "memory").mkdir(parents=True, exist_ok=True)
+    body = "".join(f"## {h}\n<!-- mem ts=2026-06-{i % 28 + 1:02d} -->\n{b}\n\n"
+                   for i, (h, b) in enumerate(NOTES + LINKED))
+    (ws / "memory" / "2026-06-01.md").write_text(body)
+    idx = MemoryIndex("example", ws, cfg or MemoryRetrievalConfig())
+    await idx.warmup_async()
+    await idx.reindex_if_stale(force=True)
+    return idx
+
+
+def _by_section(hits):
+    return {h["section"]: h for h in hits}
+
+
+@pytest.mark.asyncio
+async def test_expansion_reaches_a_section_only_a_link_leads_to(tmp_path):
+    idx = await _linked_index(tmp_path)
+    # Pool of 5, not 20: this store has fewer chunks than a full pool holds, so
+    # a deep pool would already contain every neighbour and expansion would
+    # have nothing left to contribute -- which is right, and untestable.
+    q = "how long does the fermentation crock take"
+    plain, _ = idx._candidates(q, 5)
+    grown, _ = idx._candidates(q, 5, expand=True)
+    assert "Brine ratios" not in _by_section(plain), "must not already be ranked in"
+    reached = _by_section(grown).get("Brine ratios")
+    assert reached is not None, "a linked section should be reachable"
+    assert reached["_traversal"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_expansion_never_repeats_a_candidate(tmp_path):
+    """The seeds are the BEST candidates, so their neighbours are very often
+    further down the same pool. Returning one twice put a duplicate id into the
+    embedding backfill, which Chroma rejects outright."""
+    idx = await _linked_index(tmp_path)
+    for q in ("fermentation crock brine", "bicycle derailleur", "coffee grinder espresso"):
+        ids = [h["id"] for h in idx._candidates(q, 20, expand=True)[0]]
+        assert len(ids) == len(set(ids)), q
+
+
+@pytest.mark.asyncio
+async def test_a_directly_ranked_candidate_carries_no_traversal_credit(tmp_path):
+    idx = await _linked_index(tmp_path)
+    hits, _ = idx._candidates("fermentation crock cabbage", 5, expand=True)
+    assert _by_section(hits)["Fermentation crock"]["_traversal"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_expansion_is_off_for_the_ungated_search(tmp_path):
+    """`memory_search` and the curator judge what the two legs ranked, not what
+    the graph reached from it."""
+    idx = await _linked_index(tmp_path)
+    q = "how long does the fermentation crock take"
+    assert all(h["_traversal"] == 0.0 for h in idx._hybrid_search(q, n=5))
+
+
+@pytest.mark.asyncio
+async def test_disabling_the_graph_removes_the_step(tmp_path):
+    cfg = MemoryRetrievalConfig(graph=GraphConfig(enabled=False))
+    idx = await _linked_index(tmp_path, cfg)
+    q = "how long does the fermentation crock take"
+    assert "Brine ratios" not in _by_section(idx._candidates(q, 5, expand=True)[0])
+
+
+@pytest.mark.asyncio
+async def test_expansion_is_capped(tmp_path):
+    cfg = MemoryRetrievalConfig(graph=GraphConfig(max_expand=1))
+    idx = await _linked_index(tmp_path, cfg)
+    hits, _ = idx._candidates("fermentation crock brine ratios", 20, expand=True)
+    assert sum(h["_traversal"] for h in hits) <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_cap_keeps_neighbours_of_the_best_candidates(tmp_path):
+    """The cap must bite by seed rank, not by id. Ids start with their source
+    filename, so truncating a sorted list quietly prefers whichever notes are
+    dated earliest."""
+    idx = await _linked_index(tmp_path)
+    # A SHALLOW pool, or there is nothing to expand into: on a store this size
+    # a pool of 20 already holds every chunk, and expansion correctly adds
+    # nothing.
+    q = "how long does the fermentation crock take"
+    wide, _ = idx._candidates(q, 3, expand=True)
+    reached = [h["id"] for h in wide if h["_traversal"] == 1.0]
+    assert len(reached) >= 2, f"fixture should reach at least two, got {reached}"
+
+    idx.retrieval = dataclasses.replace(
+        idx.retrieval, graph=GraphConfig(max_expand=1))
+    capped, _ = idx._candidates(q, 3, expand=True)
+    kept = [h["id"] for h in capped if h["_traversal"] == 1.0]
+    assert kept == reached[:1], "the cap should keep the first reached, not the alphabetical first"

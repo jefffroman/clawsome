@@ -35,11 +35,23 @@ In-process memory retrieval. The whole block is optional — omit to use default
 | `compact` | bool | `true` | Collapse the retrieval block to a single header + bullets instead of one block per chunk. Reduces token overhead. |
 | `candidates` | int | `20` | Search results (fused vector + keyword ranking) that get the relevance check. Must be ≥ `top_n`. |
 | `common_word_max_share` | float | `0.10` | A word in more than this share of the store's memories is ignored by keyword search. Derived from the store on every reindex (stores under 20 memories treat no word as common). |
-| `relevance.threshold` | float | `0.40` | Minimum relevance score (0–1) for a candidate to be injected. `0` disables the gate: a plain `top_n` slice. |
-| `relevance.offset` / `distance` / `keyword` / `keyword_share` | float | `3.30` / `-3.78` / `0.49` / `0.78` | Weights of the relevance score, `sigmoid(offset + distance·d + keyword·log(1+kw) + keyword_share·kw/kw_best)`. Calibrated defaults — see `docs/operations.md` *Memory retrieval* before changing. |
-| `calibration.best_distance` / `tolerance` | float | `0.97` / `0.25` | Where the weights were calibrated. A WARNING is logged when recent messages' median best vector distance strays further than `tolerance` from `best_distance`. |
+| `relevance.threshold` | float | `0.45` | Minimum relevance score (0–1) for a candidate to be injected. `0` disables the gate: a plain `top_n` slice. |
+| `relevance.offset` / `distance` / `keyword` / `keyword_share` / `traversal` | float | `2.40` / `-2.99` / `0.64` / `0.24` / `0.0` | Weights of the relevance score, `sigmoid(offset + distance·d + keyword·log(1+kw) + keyword_share·kw/kw_best + traversal·g)`, where `g` is 1 for a candidate the graph reached. Calibrated defaults — see `docs/operations.md` *Memory retrieval* before changing. `traversal` defaults to 0: being reachable is not by itself evidence. |
+| `calibration.best_distance` / `tolerance` | float | `0.973` / `0.25` | Where the weights were calibrated. A WARNING is logged when recent messages' median best vector distance strays further than `tolerance` from `best_distance`. |
+| `graph.enabled` | bool | `true` | Expand the candidate pool one hop along the knowledge graph. `false` removes the step. ⚠ With the defaults (`relevance.traversal: 0.0`, smart retrieval off) this knob is **observably inert** — see `docs/operations.md` *When the graph changes anything*. |
+| `graph.seeds` | int | `10` | How many of the fused candidates to expand from, best first. |
+| `graph.max_expand` | int | `20` | Hard cap on chunks added per query, whatever the graph's shape. |
+| `smart_retrieval.enabled` | bool | `false` | Ask the decision scorer about the candidates *near* `relevance.threshold`, where the formula is guessing. **Requires a `systemone` block** — enabling it without one is a load-time error, not a silent no-op. |
+| `smart_retrieval.promote_margin` / `review_margin` | float | `0.10` / `0.30` | How far below / above `threshold` the asked band reaches. Both are **relative to `threshold`**, so tuning it moves the band. |
+| `smart_retrieval.promote_threshold` / `retain_threshold` | float | `0.905` / `0.107` | P(relevant) a candidate needs to come **in** from below, and to **survive** from above. `retain_threshold` may not exceed `promote_threshold` — a retrieved candidate needing a higher score to stay than a rejected one needs to enter is not a policy anyone means to write. |
+| `smart_retrieval.graph_promote_threshold` | float | `0.10` | Own bar for graph-reached candidates, which score low across the board because their relevance is usually indirect. |
+| `smart_retrieval.note_chars` | int | `200` | How much of a note the scorer reads. ⚠ **One calibration with the two thresholds** — clipping moves the whole score distribution. Never change it alone. |
+| `smart_retrieval.context_turns` | int | `6` | Prior messages the scorer reads with the new one. |
+| `smart_retrieval.timeout_s` | float | `5.0` | Retrieval's **own** scorer deadline, independent of `gate.timeout_s`. It asks about every borderline candidate in one batched request and a miss costs precision rather than memory, so it can afford to wait; measured, a 2 s bound truncated the tail and cost ~5 points on every retrieval metric. Must be > 0. |
 
-The explicit `memory_search` tool is not gated: an agent asking for a search gets the ranked `top_n`.
+Partially overriding `relevance:` keeps the defaults for the keys you leave out, which mixes one fitted model with another. Set all of them or none.
+
+The explicit `memory_search` tool is not gated, and is not expanded either: an agent asking for a search gets what the two ranked legs found.
 
 ## `searxng:`
 
@@ -235,7 +247,14 @@ it then behaves as if the feature were off.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `base_url` | str | `http://127.0.0.1:11502` | `POST {base_url}/v1/systemone`. |
-| `timeout_s` | float | `2.0` | Whole-request ceiling; a timeout counts as "no answer". |
+
+**There is no `timeout_s` here** — each caller states its own deadline at the
+call site (`gate.timeout_s`, `memory_retrieval.smart_retrieval.timeout_s`),
+because they sit on different paths and want different bounds. A client-level
+default could never be reached anyway (a per-request timeout overrides it), so
+it would only let the next caller inherit someone else's latency policy by
+accident. A config still carrying the key **fails to load** rather than being
+quietly ignored.
 
 ## `gate:`
 
@@ -247,6 +266,7 @@ disabled.
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch. |
 | `exposed_to` | list[str] | `[]` | Agent ids that get a gate. |
+| `timeout_s` | float | `2.0` | The gate's own scorer deadline. It runs before every eligible turn and a timeout means "let the LLM answer", so this is a latency guarantee to the user rather than a transport setting. Must be > 0. |
 | `min_confidence` | float | `0.8` | Default bar a handler's pick must reach. |
 | `context_turns` | int | `6` | Prior user/assistant messages the service sees with the new one. |
 | `handlers` | list | `[]` | Declarative handlers — each one tool, fixed args, a success check and a reply form. Requires `systemone:`. |

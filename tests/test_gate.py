@@ -35,10 +35,12 @@ class FakeScorer:
 
     def __init__(self, choice=NONE, confidence=0.99, error=None):
         self.calls: list[tuple[object, dict]] = []
+        self.timeouts: list[float] = []
         self.choice, self.confidence, self.error = choice, confidence, error
 
-    async def ask(self, state, questions, model="local"):
+    async def ask(self, state, questions, model="local", *, timeout_s):
         self.calls.append((state, questions))
+        self.timeouts.append(timeout_s)
         if self.error is not None:
             raise self.error
         (qid,) = questions
@@ -339,7 +341,7 @@ def test_disabled_gate_is_not_validated(tmp_path, make_cfg):
 # --- client ------------------------------------------------------------------
 
 def _client(handler) -> SystemOneClient:
-    c = SystemOneClient("http://scorer.invalid", 1.0)
+    c = SystemOneClient("http://scorer.invalid")
     c._client = httpx.AsyncClient(base_url="http://scorer.invalid",
                                   transport=httpx.MockTransport(handler))
     return c
@@ -354,7 +356,7 @@ async def test_client_returns_answers_and_sends_the_wire_shape():
             "q": {"type": "noul", "noul": 0.9}}, "usage": {}})
 
     c = _client(handler)
-    answers = await c.ask("state", {"q": {"type": "noul", "instructions": "?"}})
+    answers = await c.ask("state", {"q": {"type": "noul", "instructions": "?"}}, timeout_s=1.0)
     assert answers == {"q": {"type": "noul", "noul": 0.9}}
     assert seen["state"] == "state" and "q" in seen["questions"]
     await c.aclose()
@@ -367,7 +369,7 @@ async def test_client_returns_answers_and_sends_the_wire_shape():
 async def test_client_raises_on_unusable_response(response):
     c = _client(lambda request: response)
     with pytest.raises(SystemOneError):
-        await c.ask("state", {"q": {"type": "noul", "instructions": "?"}})
+        await c.ask("state", {"q": {"type": "noul", "instructions": "?"}}, timeout_s=1.0)
     await c.aclose()
 
 
@@ -376,10 +378,16 @@ async def test_client_raises_on_unusable_response(response):
 def test_parse_systemone():
     assert _parse_systemone(None) is None
     assert _parse_systemone({}) == SystemOneConfig()
-    assert _parse_systemone({"base_url": "http://scorer.invalid", "timeout_s": "3"}) \
-        == SystemOneConfig(base_url="http://scorer.invalid", timeout_s=3.0)
+    assert _parse_systemone({"base_url": "http://scorer.invalid"}) \
+        == SystemOneConfig(base_url="http://scorer.invalid")
     with pytest.raises(TypeError):
         _parse_systemone({"base_uri": "x"})
+    # A deadline here is REFUSED rather than ignored. It used to live in this
+    # block and silently became whichever caller had not stated its own; a
+    # yaml still carrying it is a config that means something it no longer
+    # does, so the load must fail loudly.
+    with pytest.raises(TypeError):
+        _parse_systemone({"timeout_s": 2.0})
 
 
 def test_handlers_require_a_scorer(tmp_path, make_cfg):
@@ -706,3 +714,17 @@ async def test_declining_handler_leaves_the_turn_to_the_llm(
     assert tool.calls, "the action was attempted"
     assert len(fake_ollama.turns) == 1, "and the LLM then answered"
     assert [r["role"] for r in transcripts.load(SID)].count("user") == 1
+
+
+async def test_the_gate_asks_with_its_own_deadline(make_agent):
+    """The gate's bound comes from `gate.timeout_s`, not from the client.
+
+    It runs before every eligible turn and a timeout means "let the LLM
+    answer", so the bound is a latency guarantee to the user. Retrieval shares
+    the one client and deliberately waits longer; neither may set the other's,
+    and the client itself holds no default for either to inherit.
+    """
+    scorer = FakeScorer(choice=NONE)
+    agent = make_agent(scorer=scorer, handlers=[FakeHandler()], timeout_s=0.25)
+    await agent._process_batch(SID, [_msg("pause the music")], turn_id="t1")
+    assert scorer.timeouts == [0.25]

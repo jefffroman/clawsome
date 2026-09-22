@@ -130,21 +130,121 @@ and **not** indexed (the regex anchors on a bare date). Use the slug
 form for transient reasoning notes; use the bare form for distillations
 worth retrieving.
 
-**Retrieval.** Hybrid: ChromaDB vector + BM25, fused by Reciprocal Rank
-Fusion, plus a NetworkX co-occurrence graph section. Each turn:
+**What is indexed.** A section's **heading is indexed with its body**. The
+parser strips a `##` heading into metadata, so for a long time a heading's
+words reached neither leg and a note titled "Bluetooth pairing" could not be
+found by searching for those words. A title is the most topical line a section
+has. The stored text stays body-only, so the rendered snippet does not repeat
+the heading printed above it. A heading that *opens* a file — a `#` title, or a
+`###` before any `##` — names its chunk too, rather than leaving the chunk
+called "Intro" with the title buried in its body.
+
+**A chunk of pure annotation is a node, not a result.** A chunk whose content
+is nothing but headings and/or HTML comments — a file title, a placeholder, a
+section that only introduces its children — is marked `traversal_only`: it
+stays in the corpus and in the graph, and the walk passes *through* it to reach
+what it connects, but it is never itself a candidate. Injecting one tells the
+model a section exists and nothing about what it says, which is the same defect
+as rendering graph node names with no text.
+
+**Retrieval.** ChromaDB vector + BM25, fused by Reciprocal Rank Fusion, with
+the knowledge graph expanding the result. Each turn:
 
 1. **Search.** The keyword side searches the message *without* its envelope
    header, tokenized with punctuation stripped, and without the store's
    **common words** — any word in more than `common_word_max_share` of the
    memories, derived from the store at every reindex, no word list. The vector
    side embeds the full message. The fused top `candidates` (20) go on.
-2. **Relevance gate.** Each candidate is scored from its vector distance `d`
-   and keyword score `kw`:
-   `sigmoid(offset + distance·d + keyword·log(1+kw) + keyword_share·kw/kw_best)`.
-   Those at or above `relevance.threshold` are injected, up to `top_n`, in
-   search order. A turn where nothing fits injects nothing ("No strong
-   matches").
-3. **Supersession** heads are appended (below).
+2. **Graph expansion.** One hop out of the sections of the best `graph.seeds`
+   candidates adds up to `graph.max_expand` more, each marked `traversal`.
+   The graph does **not** match the query — see below.
+3. **Relevance gate.** Each candidate is scored from its vector distance `d`,
+   keyword score `kw`, and whether the graph reached it (`g`):
+   `sigmoid(offset + distance·d + keyword·log(1+kw) + keyword_share·kw/kw_best + traversal·g)`.
+   Those at or above `relevance.threshold` are injected, up to `top_n`, **best
+   score first**. A turn where nothing fits injects **no row at all** — not a
+   "nothing found" row, which would cost tokens to report an absence and
+   re-rank every turn. An explicit `memory_search` does say "No strong
+   matches", because someone asked.
+4. **Supersession** heads are appended (below).
+
+**Index freshness is never reported to the agent.** Source hashes differ from
+the index for the few minutes between an agent writing a memory and the next
+periodic reindex, so a freshness check fires *because* the agent just saved
+something — telling it its own memory is "stale" at the moment that memory is
+most trustworthy, and clearing itself minutes later. The agent can take no
+action on it in any case. The block carried a `**Sync:**` line, a
+`WARNING: MEMORY OUT OF SYNC` banner, and an exemption that made an
+otherwise-silent turn emit a block anyway; all three were removed. Index health
+is an operator's question, and the `periodic reindex:` log lines answer it.
+
+**Why the graph expands rather than searches.** It used to score graph node
+*names* against the query by summed IDF and render the top few with their
+neighbours. That is a second retrieval mechanism, and nothing calibrated it:
+it answered "how does compaction work" with an unrelated project section and
+two calendar entries, every hit matching `work`. Choosing a good anchor is
+only hard because the graph was choosing one by itself; expanding from
+candidates the two ranked legs already endorsed removes the problem instead of
+tuning it.
+
+Only **section** nodes nominate chunks. A concept node — a bolded phrase — has
+no chunk of its own, so the only way to give it content is to walk on to the
+sections carrying it; since a phrase like "Notes" is bolded throughout a store,
+that walk nominated a median 48 of 443 chunks per message on one store against
+1–6 for sections alone. Concepts remain as connective tissue the walk passes
+through.
+
+`relevance.traversal` defaults to **0.0**: being reachable is not by itself
+evidence, so a graph-reached candidate must stand on its content until a fit
+against graded data earns it otherwise. `graph.enabled: false` removes the
+step.
+
+**When the graph changes anything.** With the shipped defaults it does not.
+Expansion still runs and still adds candidates, but at `traversal: 0.0` a
+graph-reached chunk is judged on its content alone — and an expanded chunk is
+precisely one that neither ranked leg scored highly, so it rarely clears the
+threshold. Measured on one store it injected **zero**. So `graph.enabled: true`
+and `false` produce the same injected set, and the knob reads as live while
+being observably inert.
+
+It becomes live under either of two conditions, and it is worth knowing which
+one you are relying on:
+
+| condition | effect |
+|---|---|
+| `relevance.traversal` given a positive **weight** | reachability becomes evidence; measured 6 graph memories injected at `1.0`, 80 at `3.0` |
+| `smart_retrieval.enabled: true` | graph-reached candidates are **always asked**, whatever they scored, so the scorer can admit them on content the formula cannot judge |
+
+⚠ **`traversal` is a regression coefficient, not a hop count.** The feature it
+multiplies is binary — 1.0 for any chunk the graph reached, 0.0 for one the two
+ranked legs found — so the weight lives in log-odds beside `distance` and
+`keyword`, and is best read as a *discount on the bar* for graph-reached
+chunks. Against the default `threshold: 0.45`:
+
+| `traversal` | a graph-reached chunk clears the bar at a content-only score of |
+|---|---|
+| `0.0` | 0.450 — no discount; it competes like any other candidate |
+| `1.0` | 0.231 |
+| `3.0` | 0.039 — near enough everything the graph touches |
+
+**The walk is always exactly one hop, and that is not configurable.** It visits
+each seed section's immediate neighbours, in or out, and stops. `graph.seeds`
+chooses how many candidates to walk from and `graph.max_expand` caps what comes
+back, but neither is a depth.
+
+This is deliberately **not** a validation error. A config option that cannot
+produce a result under any setting of other knobs would not be an option at
+all — but `relevance.traversal` is such a knob, so `graph.enabled` is a real
+choice whose effect is conditional, which is a thing to document rather than
+to reject at load.
+
+**One list, not two.** What the graph reached arrives as an ordinary candidate
+with its text, competing for the same `top_n` slots. It previously had a
+section of its own containing node names and arrows and no text at all, which
+told the model those sections existed and nothing about what they said — so
+acting on one cost a `memory_search` turn, the thing the block exists to avoid.
+Because the block is rebuilt per turn it never hits the prefix cache, so those
+tokens were paid in prefill every time.
 
 Why a gate and not a distance floor: vector distance is only a weak relevance
 signal (a similar-but-off-topic memory sits as close as a relevant one), so any
@@ -154,15 +254,33 @@ together they separate relevant from irrelevant memories about as well as an
 LLM judge did, in milliseconds. The keyword index is built once per reindex
 and kept in memory.
 
-On the store the defaults were fitted to (437 memories, MiniLM embeddings, 50
-real messages graded for relevance): 4.0 memories per turn at 60% relevant,
-against an always-5 slice at ~47%, with the same share of relevant memories
-found.
+On the store the defaults were fitted to (443 chunks, MiniLM embeddings, 50
+real messages with 1,713 graded message-memory pairs — headings were in the
+keyword index at the time but not yet in every vector, so `distance` was fitted
+against a slightly weaker vector leg than it now scores; correcting that moved
+the median best distance by 0.008 and did not justify a re-fit): 3.8 memories
+per turn at 69% relevant, against an ungated always-5 slice at ~50%, with the same share of
+relevant memories found — and a turn with nothing relevant stays silent half the
+time rather than never.
+
+Those figures are not comparable to ones taken against an earlier, narrower
+label set; widening the graded pool changes the denominator. Compare arms within
+one set, never across two.
 
 **Reindex cadence.** Maintenance loop checks `sourcesHash` every 5 min
 and reindexes if changed. Source-file edits (e.g., a memory_flush
 appending to today's file, or the nightly curator rewriting a note) get
 picked up within 5 min.
+
+⚠ **A source hash cannot notice that the *code* reading it changed.** If you
+alter what gets indexed — the text handed to the embedder, how a note is split
+into chunks, what the keyword index sees — the sources are identical, no
+reindex fires, and the change ships and does nothing until something forces a
+rebuild by hand. Bump `INDEX_VERSION` in `memory.py` with any such change: it
+is recorded in `sync_state.json` and a mismatch forces a full rebuild, so the
+deploy reindexes itself. Note that a full rebuild and an incremental update are
+two code paths over the same store — keep them producing identical documents,
+or a chunk's vector will depend on which path last touched it.
 
 **Supersession.** A memory the curator has superseded carries a
 `supersededBy=<id>` marker; retrieval auto-follows the old→new chain and
@@ -173,21 +291,48 @@ visible timeline without outranking its replacement. See curation below.
 its memories are written and chunked, its vocabulary, its size — and they
 drift as the store changes. A WARNING like `memory retrieval drift: median
 best distance … calibrated at …` means the store has moved away from where
-they were fitted. To re-calibrate:
+they were fitted.
+
+Two things it is **not**. It is not a deploy-time check: it fires only after
+100 live retrievals, i.e. roughly 100 real turns, so after a change to the
+indexed representation compute the median best vector distance over a frozen
+query set directly instead of waiting for it. And it is not an instruction to
+re-fit — it is a prompt to re-measure. **A re-fit must beat the shipped weights
+at matched volume before it is taken.** One measured example: a re-fit prompted
+this way showed precision 0.59 → 0.69 and was rejected, because it bought that
+purely by injecting 2.04 memories a turn instead of 3.76, with recall falling
+0.57 → 0.47. At equal volume it was noise.
+
+To re-calibrate:
 
 1. Take ~50 real messages from transcripts. For each, collect the ungated top
    `candidates` (e.g. `_candidates()` with `threshold: 0`).
 2. Grade each message–memory pair 0/1/2 for relevance (by hand, or with a
    strong model as referee — spot-check it).
 3. Fit a logistic regression of *relevant (grade ≥ 1)* on
-   `[d, log(1+kw), kw/kw_best]`, cross-validated by message so it cannot
+   `[d, log(1+kw), kw/kw_best, g]`, cross-validated by message so it cannot
    memorise; set `relevance.*` to the fitted weights and choose `threshold`
    from the precision/recall trade-off you want.
 4. Set `calibration.best_distance` to the median best vector distance per
    message on that sample.
 
-Steps 1 and 2 are `python -m claw.evaluate collect` and `grade`; `score` then
-reports what the current code retrieves against those labels.
+All four are `python -m claw.evaluate collect`, `grade`, `fit` and `score`.
+`fit` groups its folds by message — a random split puts candidates from one
+message on both sides, and since they share `kw_best` and much of their
+subject matter, that leaks. It ridge-penalises, because `traversal` is zero
+for most rows and non-zero for a clustered minority, which is the setup where
+an unpenalised coefficient runs off to infinity and reports a model that looks
+superb and predicts nothing.
+
+**Re-pick `threshold` after any re-fit.** New coefficients mean a new
+probability scale, so carrying the old number across silently changes
+behaviour on the *existing* population, not just the new one.
+
+**Widen, do not redraw.** `collect --extend` keeps the existing messages and
+only lengthens their candidate lists, so earlier grades still describe the same
+pairs and `grade` fills the gaps. Collect wider than production injects: the
+referee costs one call per message whatever the list length, so a pool that
+already covers the next experiment is far cheaper than a second run.
 
 **Keep what step 2 produces.** The grades are the expensive part and the
 reusable part: a label says whether this memory helps answer this message,
@@ -197,6 +342,22 @@ scored against them with **no model calls at all**, which is the difference
 between validating a change and asserting it. Regrading is not a cheap redo
 either: a referee is not deterministic, so fresh labels are a different
 baseline and earlier measurements stop being comparable.
+
+**But a label set decays, so check it rather than trusting it.** A chunk id is
+positional (`{source}:{index}`), so editing or re-sectioning a note re-points
+an id at content nobody graded and the label silently describes text that is
+no longer there. On one store 31 labels across 8 ids went stale in a single
+day, because an agent kept writing to that day's note. `collect --extend`
+compares the frozen text of every labelled chunk against the live corpus and
+refuses rather than building on it; `--drop-drifted` discards just those pairs
+so the next `grade` re-labels them, which costs no extra calls when those
+messages are being visited anyway.
+
+`score` reports the share of injected memories carrying **no** label. Every
+rate treats an unlabelled memory as irrelevant, so a non-zero share makes
+precision a floor rather than a measurement — and that is exactly what a change
+widening the candidate pool produces, which is when the number is most likely
+to be misread as a regression.
 
 Tests will not catch this class of change. `relevance` is a fitted model whose
 inputs include keyword scores, so altering which words are searched moves the
@@ -209,6 +370,102 @@ out of version control, and far from any public mirror.
 Quick adjustments without re-fitting: raise `threshold` for fewer, cleaner
 memories; lower it (or `0`) for more. The explicit `memory_search` tool is
 never gated.
+
+### Smart retrieval
+
+`memory_retrieval.smart_retrieval.enabled: true` adds a second opinion on the
+candidates near the threshold. It **requires a `systemone` block** — enabling
+it without one is a load-time error, not a silent no-op.
+
+The relevance formula is calibrated and free, but it is four coefficients, and
+near its own threshold it is guessing. Smart retrieval sends just that band to
+the scorer, one question per candidate, and acts on the answers:
+
+- a **rejected** candidate the scorer calls relevant is **promoted in**;
+- a **retrieved** candidate it calls irrelevant is **dropped**;
+- everything surviving is injected, with **no `top_n` slice** — a turn may
+  inject nothing, or everything that passed.
+
+**Only the borderline is asked about**, which is what makes it affordable, and
+each bound was measured rather than chosen:
+
+| band | behaviour | why |
+|---|---|---|
+| below `threshold - promote_margin` | dropped unasked | of 170 candidates that far below, the scorer promoted **zero** |
+| the band, either side | asked | where the formula is guessing |
+| above `threshold + review_margin` | kept unasked | the formula is confident there and the scorer is worse than it — it wanted to drop 17 such entries and 13 were useful |
+| graph-reached, any score | **always asked** | the fitted weights lean on a keyword score an expanded chunk has no reason to have, so the formula's opinion of one is not evidence |
+
+Both margins are **relative to `threshold`**, so tuning the threshold moves the
+band with it. Absolute values would drift off the boundary they exist to police.
+
+**Cost.** Roughly `fixed + questions x per-question`, the per-question part
+scaling with `note_chars` (measured 59 ms at 400 characters, 42 at 200, 35 at
+100). On one store the whole pass ran ~1.4 s a turn, median 1.3 s with a tail
+to ~3.9 s. A turn whose candidates all sit outside the band asks nothing and
+costs nothing.
+
+`smart_retrieval.timeout_s` (default 5.0) bounds that batched request, and is
+**retrieval's own deadline, not the gate's**. The two share one client but sit
+on different paths: the gate answers in front of the LLM and must fail open
+quickly, while this asks about every borderline candidate at once and its
+failure costs precision rather than memory. Setting it to the gate's 2 s
+truncates the tail — those turns fall back to ordinary retrieval — and cost
+~5 points on **every** metric below.
+
+Against that, more accurate retrieval can pay for itself in turns the agent no
+longer spends hunting for what it should already have been told — a memory that
+arrives unbidden is one the agent never has to suspect exists and go searching
+for. Treat the latency as a ceiling on the cost, not as the net.
+
+**Measured** on one store, 50 real messages graded by the consuming model with
+the same conversation context the scorer reads, through the shipped code path
+at the shipped deadline:
+
+| | ordinary | smart |
+|---|---|---|
+| memories per turn | 3.64 | **3.16** |
+| relevant (grade ≥ 1) | 0.50 | **0.64** |
+| clearly relevant (= 2) | 0.32 | **0.45** |
+| recall of clearly relevant | 0.62 | **0.73** |
+| stayed quiet when nothing was relevant | 0.10 | **0.70** |
+| got something when there was something | 0.93 | 0.82 |
+
+**It injects less while recalling more**, which is the point: shrinking the
+injected set raises precision on its own, so an arm that injects less normally
+has to be read against a random cut of the same size before it can claim
+anything — but a random cut lowers recall in proportion and cannot raise it.
+By grade, the exchange is **34 net junk chunks shed** and **12 net clearly
+relevant gained**, against 2 net marginals lost.
+
+The one metric that moves the wrong way is *got something when there was
+something*, 0.93 → 0.82. Read it with the grades attached: all four turns it
+counts as losses had only **marginally** relevant memories available, so no
+turn lost a clearly relevant memory to silence — which is why recall rises at
+the same time.
+
+> ⚠ **Measure this in the shape you deploy.** Two dimensions each move the
+> result by ~5 points and neither is visible in the output. A graded set
+> collected **without conversation context** has the scorer judging a bare
+> message, which is not what it sees at runtime (it reads
+> `smart_retrieval.context_turns`); collect with context and show the referee
+> the same thing. And a bench **deadline** more generous than the deployed one
+> flatters the result by letting the tail through. Both were walked into.
+> `evaluate smart --timeout` defaults to the shipped value for this reason.
+
+> ⚠ **`note_chars` and the two thresholds are one calibration.** Clipping moves
+> the scorer's whole score distribution, so the same thresholds cut somewhere
+> else: between 400 and 200 characters `retain_threshold` had to move
+> 0.149 → 0.107 to hold the same operating point. Changing `note_chars` alone
+> is a silent regression, not a tuning. 200 was measured to be
+> indistinguishable from 400 once the thresholds were re-fitted; 100 was not.
+
+**Failure is always open.** No scorer, a transport error, a timeout or a
+malformed answer all fall back to ordinary retrieval for that turn. An outage
+costs precision, never memory.
+
+Score it against a graded set with `python -m claw.evaluate smart`, which runs
+the shipped path with a real scorer and reports ordinary retrieval beside it.
 
 ## Curation (forgetory) in depth
 
@@ -400,7 +657,7 @@ eligible (one message, `matrix`/`voice`); and the `:gate:` line's reason. A
 steady `low-confidence, <handler> @ 0.7x` means the right pick under the bar —
 tune the description or that handler's `min_confidence` against a measured set
 of utterances and near-misses (`docs/decisions.md` *Tuning*). `scorer-error`
-means the decision service is down, slow (past `systemone.timeout_s`) or
+means the decision service is down, slow (past `gate.timeout_s`) or
 answering in the wrong format; the turn went to the LLM, as designed.
 
 ### Flush isn't firing

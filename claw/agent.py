@@ -62,7 +62,7 @@ from claw.memory_flush import run_memory_flush
 from claw.ollama import OllamaClient
 from claw.sink import ChannelSink, Sink
 from claw.tools.base import Tool
-from claw.gate import Decision, DecisionGate, build_tool_handlers
+from claw.gate import Decision, DecisionGate, build_state, build_tool_handlers
 from claw.systemone import SystemOneClient
 from claw.tools.bluetooth import build_bluetooth_tools
 from claw.tools.music import build_music_tools
@@ -1211,11 +1211,22 @@ class Agent:
                 return
 
         # Memory retrieval — query against the combined text.
+        #
+        # ``state`` is what smart retrieval judges against, and it is
+        # built the same way the decision gate builds its own: real user and
+        # assistant turns, envelopes stripped, synthetic rows dropped. The
+        # ranked search still matches on ``user_text`` alone; only the
+        # scorer sees the conversation, and only when configured to.
+        adm = self.cfg.memory_retrieval.smart_retrieval
+        state = None
+        if adm.enabled and adm.context_turns > 0 and not stateless:
+            state = build_state(self.transcripts.load(sid), body, adm.context_turns)
         try:
             retrieval_block = await self.memory.retrieve_markdown(
                 user_text,
                 top_n=self.cfg.memory_retrieval.top_n,
                 compact=self.cfg.memory_retrieval.compact,
+                state=state,
             )
         except Exception:
             log.exception("[%s] memory retrieve failed; continuing", self.id)

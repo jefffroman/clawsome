@@ -24,17 +24,33 @@ class SystemOneError(RuntimeError):
 
 
 class SystemOneClient:
-    def __init__(self, base_url: str, timeout_s: float) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout_s)
+    """One client, shared by every caller. It holds NO default deadline.
+
+    A deadline is a property of the question being asked, not of the
+    transport: the gate runs in front of the LLM and must fail open in about
+    two seconds, while a retrieval batch asks about many candidates at once
+    and is worth several. When this client carried a default, whichever
+    caller did not state one silently inherited the other's latency policy —
+    which is how smart retrieval ran at the gate's 2s bound and lost about
+    five points on every metric before anyone measured it. So ``ask`` requires
+    the deadline, and a client-level one is not offered: it could never be
+    reached anyway, since a per-request timeout overrides it entirely.
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self._client = httpx.AsyncClient(base_url=base_url)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     async def ask(
         self, state: Any, questions: dict[str, dict[str, Any]],
-        model: str = "local",
+        model: str = "local", *, timeout_s: float,
     ) -> dict[str, dict[str, Any]]:
         """POST one request; return its ``answers`` map (question id -> answer).
+
+        ``timeout_s`` is required, and bounds this request alone. See the
+        class docstring for why there is no default to fall back to.
 
         Raises ``httpx.HTTPError`` on transport failure or timeout, and
         ``SystemOneError`` on a non-2xx status or a response missing any
@@ -43,6 +59,7 @@ class SystemOneClient:
         resp = await self._client.post(
             "/v1/systemone",
             json={"state": state, "model": model, "questions": questions},
+            timeout=timeout_s,
         )
         if resp.status_code != 200:
             raise SystemOneError(f"HTTP {resp.status_code}: {resp.text[:300]}")

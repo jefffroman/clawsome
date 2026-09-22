@@ -40,22 +40,33 @@ class RelevanceConfig:
     """The per-turn relevance gate over retrieval candidates.
 
     Each candidate gets ``sigmoid(offset + distance*d + keyword*log(1+kw) +
-    keyword_share*kw/kw_best)``, where ``d`` is its squared-L2 vector distance
-    to the (full) message, ``kw`` its keyword (BM25) score with the store's
-    common words excluded, and ``kw_best`` the message's best keyword score
-    over the whole store. Candidates at or above ``threshold`` are injected, in
+    keyword_share*kw/kw_best + traversal*g)``, where ``d`` is its squared-L2
+    distance to the (full) message, ``kw`` its keyword (BM25) score with the
+    store's common words excluded, ``kw_best`` the message's best keyword score
+    over the whole store, and ``g`` 1.0 when the graph reached this candidate
+    by expansion rather than either leg ranking it. Candidates at or above ``threshold`` are injected, in
     search-rank order. ``threshold: 0`` disables the gate (a plain top_n slice).
 
-    The defaults were fitted on one real store (437 memories, MiniLM
-    embeddings) against graded relevance: they are a calibrated starting point,
-    not universal constants — see docs/operations.md, *Memory retrieval*, for
+    The defaults were fitted on one real store (443 chunks, MiniLM embeddings,
+    1,713 graded message-memory pairs). Headings were in the keyword index at
+    the time but not yet in every vector, so ``distance`` was fitted against a
+    slightly weaker vector leg than the one it now scores; re-measuring after
+    that was corrected moved the median best distance by 0.008 and did not
+    justify a re-fit. They are a calibrated starting point, not universal
+    constants — see docs/operations.md, *Memory retrieval*, for
     re-calibrating them on another store.
     """
-    threshold: float = 0.40
-    offset: float = 3.30
-    distance: float = -3.78
-    keyword: float = 0.49
-    keyword_share: float = 0.78
+    threshold: float = 0.45
+    offset: float = 2.40
+    distance: float = -2.99
+    keyword: float = 0.64
+    keyword_share: float = 0.24
+    # Weight on `traversal`: 1.0 for a candidate the graph reached from the
+    # fused pool, 0.0 for everything the two legs ranked directly. It defaults
+    # to 0.0 -- being reachable is not by itself evidence of relevance, so a
+    # graph-reached chunk must stand on its content like any other until a fit
+    # against graded data earns it a positive weight.
+    traversal: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -69,8 +80,143 @@ class RetrievalCalibrationConfig:
     unnoticed for months exactly this way: topical distances fell from ~1.42 to
     ~0.97 and every memory passed.)
     """
-    best_distance: float = 0.97
+    best_distance: float = 0.973
     tolerance: float = 0.25
+
+
+@dataclass(frozen=True)
+class GraphConfig:
+    """Graph expansion of the candidate pool.
+
+    The knowledge graph does NOT match the query. It expands outward from the
+    chunks the two ranked legs already found, one hop, and only through
+    section nodes -- a concept node is a bolded phrase with no chunk of its
+    own, and walking through concepts nominated a median 48 of 443 chunks per
+    message on one store. What comes back is judged by the ordinary relevance
+    gate on its content, so a bad expansion costs candidate slots rather than
+    prompt tokens.
+
+    ``enabled: false`` removes the step entirely.
+    """
+    enabled: bool = True
+    # How many of the fused candidates to expand from, best-ranked first.
+    seeds: int = 10
+    # Hard cap on chunks added per query, whatever the graph's shape.
+    max_expand: int = 20
+
+
+@dataclass(frozen=True)
+class SmartRetrievalConfig:
+    """Smart retrieval: a second opinion on the candidates near the line.
+
+    Ordinary retrieval scores every candidate with the fitted relevance
+    formula and keeps those over ``relevance.threshold``. That formula is
+    calibrated and cheap, but it is a bag of four numbers, and near its own
+    threshold it is guessing. Smart retrieval sends just those borderline
+    candidates to the System One scorer for a second opinion, and acts on it:
+
+    * a REJECTED candidate the scorer calls relevant is **promoted** in;
+    * a RETRIEVED candidate the scorer calls irrelevant is **dropped**.
+
+    Everything surviving is injected. There is no ``top_n`` slice on this
+    path -- a turn may inject nothing, or everything that passed.
+
+    **Only the borderline is asked about**, which is what keeps this
+    affordable. Measured on one store: of 170 rejected candidates scoring
+    more than ``promote_margin`` below the threshold, the scorer promoted
+    exactly **zero**, so asking about them buys nothing. And candidates more
+    than ``review_margin`` above it are kept unasked, because there the
+    fitted score is confident and the scorer is measurably worse than it --
+    it wanted to drop 17 such entries and 13 of them were useful.
+
+    Graph-reached candidates are asked about **whatever their fitted score**.
+    The fitted weights lean on a keyword score a graph-expanded chunk has no
+    reason to have, so the formula's opinion of one is not evidence. Those
+    candidates are the reason this feature can reach anything the ordinary
+    path structurally cannot.
+
+    Absent scorer, a scorer error, or a timeout ⇒ the whole block is skipped
+    and retrieval behaves exactly as it does without it. Nothing here may
+    become required.
+    """
+    enabled: bool = False
+
+    # --- which candidates are worth asking about ---------------------------
+    #
+    # Both are margins AROUND `relevance.threshold`, never absolute scores.
+    # The band exists to police that boundary, so if the threshold is tuned
+    # the band has to follow it; absolute values would silently drift off the
+    # line they were chosen for.
+    #
+    # How far BELOW the threshold to look for candidates to promote.
+    promote_margin: float = 0.10
+    # How far ABOVE the threshold to keep reviewing candidates for dropping.
+    # Beyond this, entries are kept without asking. Raising it means a
+    # tighter, smaller set; lowering it means more material at a slightly
+    # lower hit rate. Measured on one store, 0.30 gave 2.54 memories a turn
+    # against 2.14 for no ceiling at all -- 17% more context for 1.4 points
+    # of precision.
+    review_margin: float = 0.30
+
+    # --- what the scorer's answer has to be --------------------------------
+    #
+    # P(yes) from the scorer. These sit far lower than a "0 to 1" reading
+    # suggests: on this scorer a note squarely on topic measures ~0.8, an
+    # irrelevant one ~0.06, and the useful separation is near the bottom of
+    # the range. They are also tied to `note_chars` -- see below.
+    promote_threshold: float = 0.905
+    retain_threshold: float = 0.107
+    # Graph-reached candidates are judged on a much lower bar, because they
+    # score low across the board: their relevance is usually indirect (the
+    # note that matched REFERS to this one), which is not visible in the text
+    # the scorer reads.
+    graph_promote_threshold: float = 0.10
+
+    # --- cost --------------------------------------------------------------
+    #
+    # How much of a note the scorer reads. Cost is roughly
+    # `fixed + questions x per-question`, and the per-question part scales
+    # with this: measured 59 ms at 400 characters, 42 ms at 200, 35 ms at 100.
+    #
+    # ⚠ `note_chars` and the two thresholds above are ONE calibration. Clipping
+    # moves the whole score distribution, so the same thresholds cut at a
+    # different place: between 400 and 200 characters the retain threshold had
+    # to move 0.149 -> 0.107 to hold the same operating point. Changing this
+    # number alone is a silent regression, not a tuning. 200 was measured to
+    # be indistinguishable from 400 once the thresholds were re-fitted, and
+    # 100 was not -- it returned measurably worse material.
+    note_chars: int = 200
+    # Retrieval's own scorer deadline, independent of ``systemone.timeout_s``.
+    # The two callers of one shared client want different bounds: the gate
+    # sits in front of the LLM and must fail open fast, while this asks about
+    # every borderline candidate in ONE batched request whose answer decides
+    # what the turn is told. Measured over 50 real turns, that request runs a
+    # median 1.4s and at most ~4.4s, so a 2s bound truncated the tail and cost
+    # ~5 points on every retrieval metric — the turns it cut fell back to
+    # ordinary retrieval. A failure here is never lost memory, only lost
+    # precision, which is why it can afford to wait.
+    timeout_s: float = 5.0
+
+    # Prior user/assistant messages the scorer reads as conversation state,
+    # in addition to the current one.
+    #
+    # Worth having: many turns ("looks good", "try it again") carry their
+    # subject in the conversation and not in the text being matched, and no
+    # amount of tuning on a bare message reaches those. Measured on a graded
+    # set collected WITH the same context in front of the referee -- grading
+    # against the bare message while the scorer reads the thread asks a
+    # different question and marks down exactly the turns context rescues --
+    # it made the filter sharper rather than merely stricter: relevance
+    # 54.4% -> 59.9% with recall of clearly-relevant material UNCHANGED at
+    # 73.4%. What it drops is "somewhat relevant" padding.
+    #
+    # Cost is flat per turn, not per candidate: the state is prefilled once
+    # and shared by every question, so 6 turns adds ~190 ms whether 4
+    # candidates are asked about or 22.
+    #
+    # Default matches `gate.context_turns`, which is the same question asked
+    # of the same conversation.
+    context_turns: int = 6
 
 
 @dataclass(frozen=True)
@@ -86,6 +232,8 @@ class MemoryRetrievalConfig:
     common_word_max_share: float = 0.10
     relevance: RelevanceConfig = RelevanceConfig()
     calibration: RetrievalCalibrationConfig = RetrievalCalibrationConfig()
+    graph: GraphConfig = GraphConfig()
+    smart_retrieval: SmartRetrievalConfig = SmartRetrievalConfig()
 
 
 @dataclass(frozen=True)
@@ -161,10 +309,12 @@ class SystemOneConfig:
     from this block and shared by every user.
     """
     base_url: str = "http://127.0.0.1:11502"
-    # Whole-request ceiling. Scorer calls sit on hot paths (the gate runs
-    # before every eligible turn), and callers treat a timeout as "no answer",
-    # so this bounds what a scorer outage can add.
-    timeout_s: float = 2.0
+    # No timeout here, deliberately. Each caller states its own deadline at
+    # the call site (gate.timeout_s, memory_retrieval.smart_retrieval
+    # .timeout_s), because they sit on different paths and want different
+    # bounds. A client-level default could not be reached in any case — a
+    # per-request timeout overrides it — so it would only serve to let the
+    # next caller inherit someone else's policy by accident.
 
 
 @dataclass(frozen=True)
@@ -239,6 +389,11 @@ class GateConfig:
     # notes excluded) the scorer sees with the new message, so a short
     # follow-up ("skip this one") can be read in context.
     context_turns: int = 6
+    # The gate's own fail-open bound. It runs before every eligible turn and
+    # a timeout means "let the LLM answer", so it is a latency guarantee to
+    # the user, not a transport setting — which is why it lives here beside
+    # the gate's other policy rather than under `systemone`.
+    timeout_s: float = 2.0
     handlers: tuple[GateHandlerConfig, ...] = ()
 
 
@@ -799,7 +954,7 @@ def load(path: Path | str) -> Config:
     _validate_can_spawn(cfg)
     _validate_voice(cfg)
     _validate_music(cfg)
-    _validate_systemone(cfg)
+    _validate_smart_retrieval(cfg)
     _validate_gate(cfg)
     return cfg
 
@@ -952,7 +1107,8 @@ def _parse_memory_retrieval(d: dict[str, Any] | None) -> MemoryRetrievalConfig:
     key raises rather than silently keeping a default."""
     if not d:
         return MemoryRetrievalConfig()
-    scalars = {k: v for k, v in d.items() if k not in ("relevance", "calibration")}
+    scalars = {k: v for k, v in d.items()
+               if k not in ("relevance", "calibration", "graph", "smart_retrieval")}
     for k in ("candidates", "top_n"):
         if k in scalars:
             scalars[k] = int(scalars[k])
@@ -960,14 +1116,57 @@ def _parse_memory_retrieval(d: dict[str, Any] | None) -> MemoryRetrievalConfig:
         scalars["common_word_max_share"] = float(scalars["common_word_max_share"])
     rel = {k: float(v) for k, v in (d.get("relevance") or {}).items()}
     cal = {k: float(v) for k, v in (d.get("calibration") or {}).items()}
+    # Not blanket-floated like the other two: `enabled` is a bool and the rest
+    # are counts.
+    graph = dict(d.get("graph") or {})
+    if "enabled" in graph:
+        graph["enabled"] = bool(graph["enabled"])
+    for k in ("seeds", "max_expand"):
+        if k in graph:
+            graph[k] = int(graph[k])
+    sr = dict(d.get("smart_retrieval") or {})
+    if "enabled" in sr:
+        sr["enabled"] = bool(sr["enabled"])
+    for k in ("note_chars", "context_turns"):
+        if k in sr:
+            sr[k] = int(sr[k])
+    for k in ("promote_margin", "review_margin", "promote_threshold",
+              "retain_threshold", "graph_promote_threshold", "timeout_s"):
+        if k in sr:
+            sr[k] = float(sr[k])
     cfg = MemoryRetrievalConfig(
         relevance=RelevanceConfig(**rel), calibration=RetrievalCalibrationConfig(**cal),
+        graph=GraphConfig(**graph), smart_retrieval=SmartRetrievalConfig(**sr),
         **scalars,
     )
     if not 0.0 <= cfg.relevance.threshold <= 1.0:
         raise ValueError(f"memory_retrieval.relevance.threshold must be within [0, 1], got {cfg.relevance.threshold}")
     if not 0.0 < cfg.common_word_max_share <= 1.0:
         raise ValueError(f"memory_retrieval.common_word_max_share must be within (0, 1], got {cfg.common_word_max_share}")
+    if cfg.graph.seeds < 1 or cfg.graph.max_expand < 0:
+        raise ValueError("memory_retrieval.graph.seeds must be >= 1 and max_expand >= 0")
+    sc = cfg.smart_retrieval
+    for name in ("promote_margin", "review_margin", "promote_threshold",
+                 "retain_threshold", "graph_promote_threshold"):
+        v = getattr(sc, name)
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"memory_retrieval.smart_retrieval.{name} must be within [0, 1], got {v}")
+    if sc.retain_threshold > sc.promote_threshold:
+        # Not a range check but a coherence one: a retrieved candidate would
+        # need a HIGHER score to stay than a rejected one needs to get in,
+        # which is not a policy anyone means to write.
+        raise ValueError(
+            "memory_retrieval.smart_retrieval.retain_threshold must not exceed "
+            f"promote_threshold ({sc.retain_threshold} > {sc.promote_threshold})")
+    if sc.context_turns < 0:
+        raise ValueError("memory_retrieval.smart_retrieval.context_turns must be >= 0")
+    if sc.note_chars < 1:
+        raise ValueError("memory_retrieval.smart_retrieval.note_chars must be >= 1")
+    if sc.timeout_s <= 0:
+        raise ValueError(
+            "memory_retrieval.smart_retrieval.timeout_s must be > 0, got "
+            f"{sc.timeout_s}")
     if cfg.candidates < cfg.top_n:
         raise ValueError(f"memory_retrieval.candidates ({cfg.candidates}) must be >= top_n ({cfg.top_n})")
     return cfg
@@ -977,10 +1176,7 @@ def _parse_systemone(d: dict[str, Any] | None) -> SystemOneConfig | None:
     """Parse the optional ``systemone:`` block. Strict; absent = no scorer."""
     if d is None:
         return None
-    scalars = dict(d)
-    if "timeout_s" in scalars:
-        scalars["timeout_s"] = float(scalars["timeout_s"])
-    return SystemOneConfig(**scalars)
+    return SystemOneConfig(**dict(d))
 
 
 def _parse_gate(d: dict[str, Any] | None) -> GateConfig:
@@ -998,6 +1194,8 @@ def _parse_gate(d: dict[str, Any] | None) -> GateConfig:
         scalars["min_confidence"] = float(scalars["min_confidence"])
     if "context_turns" in scalars:
         scalars["context_turns"] = int(scalars["context_turns"])
+    if "timeout_s" in scalars:
+        scalars["timeout_s"] = float(scalars["timeout_s"])
     handlers = tuple(_parse_gate_handler(h) for h in d.get("handlers") or ())
     return GateConfig(handlers=handlers, **scalars)
 
@@ -1198,6 +1396,8 @@ def _validate_gate(cfg: "Config") -> None:
         raise ValueError(f"gate.min_confidence must be within [0, 1], got {cfg.gate.min_confidence}")
     if cfg.gate.context_turns < 0:
         raise ValueError(f"gate.context_turns must be >= 0, got {cfg.gate.context_turns}")
+    if cfg.gate.timeout_s <= 0:
+        raise ValueError(f"gate.timeout_s must be > 0, got {cfg.gate.timeout_s}")
     ids = [h.id for h in cfg.gate.handlers]
     if "none" in ids:
         raise ValueError("gate.handlers: id 'none' is reserved (it is the LLM's option)")
@@ -1210,9 +1410,22 @@ def _validate_gate(cfg: "Config") -> None:
         )
 
 
-def _validate_systemone(cfg: "Config") -> None:
-    if cfg.systemone is not None and cfg.systemone.timeout_s <= 0:
-        raise ValueError(f"systemone.timeout_s must be positive, got {cfg.systemone.timeout_s}")
+def _validate_smart_retrieval(cfg: "Config") -> None:
+    """Smart retrieval needs a scorer, and says so at load rather than at turn 1.
+
+    The runtime is deliberately forgiving -- a scorer that errors or times out
+    mid-turn drops back to ordinary retrieval, because an outage must cost
+    precision and never retrieval. But a config that asks for the feature with
+    no scorer configured is not an outage, it is a mistake, and it would
+    otherwise present as the feature silently never running. Same reasoning as
+    gate.handlers, which refuses for the same reason.
+    """
+    if cfg.memory_retrieval.smart_retrieval.enabled and cfg.systemone is None:
+        raise ValueError(
+            "memory_retrieval.smart_retrieval.enabled is true but no scorer is "
+            "configured: add a systemone block, or set it to false (ordinary "
+            "retrieval is the supported default and needs no scorer)"
+        )
 
 
 def _validate_music(cfg: "Config") -> None:

@@ -37,11 +37,11 @@ def build_memory_search_tool(memory: MemoryIndex) -> Tool:
     return Tool(
         name="memory_search",
         description=(
-            "Search your own memory index (ChromaDB + BM25 + graph) for relevant "
-            "chunks. Returns formatted markdown with the top matches and any "
-            "linked graph neighbors. Auto-retrieval already runs every turn, so "
-            "use this only for follow-up queries the auto-block didn't cover, "
-            "or when you want a higher top_n."
+            "Search your own memory index (vector + keyword) for relevant "
+            "chunks. Returns formatted markdown with the top matches and their "
+            "text. Auto-retrieval already runs every turn, so use this only "
+            "for follow-up queries the auto-block didn't cover, or when you "
+            "want a higher top_n."
         ),
         input_schema={
             "type": "object",

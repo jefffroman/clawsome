@@ -92,7 +92,9 @@ curl -s http://127.0.0.1:11502/v1/systemone -H 'Content-Type: application/json' 
 Latency matters more than throughput here: the gate asks one question per
 eligible turn, on the reply path. A service sharing a GPU with the LLM will
 answer more slowly while the LLM is generating; that only matters if it
-approaches `systemone.timeout_s`.
+approaches `gate.timeout_s`. Note that each caller sets its own deadline —
+retrieval's batched call deliberately waits longer than the gate's, so "slow"
+means different things to them.
 
 ## The contract for code that uses the client
 
@@ -164,11 +166,11 @@ request that needs something *taken from the message* — "play some reggae",
 ```yaml
 systemone:
   base_url: http://127.0.0.1:11502
-  timeout_s: 2.0
 
 gate:
   enabled: true
   exposed_to: [agent-1]
+  timeout_s: 2.0
   min_confidence: 0.8
   context_turns: 6
   handlers:
@@ -200,9 +202,17 @@ gate:
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `base_url` | str | `http://127.0.0.1:11502` | Where the service listens. |
-| `timeout_s` | float | `2.0` | Whole-request ceiling. A timeout counts as "no answer". Must be positive. |
 
 Omit the block entirely to run without a decision service.
+
+**No timeout lives here.** A deadline is a property of the question being
+asked, not of the transport: the gate must fail open fast in front of the LLM,
+while a retrieval batch asks about many candidates at once and is worth
+waiting longer for. One client is shared, so a default here became whichever
+caller's policy got there first — and the caller that had not stated one
+silently inherited it. `ask()` therefore requires the deadline, and since every
+caller passes one, a client-level default would be unreachable regardless: a
+per-request timeout overrides it for connect, read, write and pool alike.
 
 ### `gate:`
 

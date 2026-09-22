@@ -118,15 +118,21 @@ class FakeMemory:
     def __init__(self, markdown: str = "") -> None:
         self._markdown = markdown
         self.queries: list[str] = []
+        # The conversation state each call was given, so a test can assert
+        # what smart retrieval would have judged against.
+        self.states: list[list[dict[str, str]] | None] = []
         self.warmed = False
+        self.scorer: Any | None = None
 
     async def warmup_async(self) -> None:
         self.warmed = True
 
     async def retrieve_markdown(
-        self, query: str, *, top_n: int = 5, compact: bool = True
+        self, query: str, *, top_n: int = 5, compact: bool = True,
+        state: list[dict[str, str]] | None = None,
     ) -> str:
         self.queries.append(query)
+        self.states.append(state)
         return self._markdown
 
     async def reindex_if_stale(self) -> dict[str, Any]:

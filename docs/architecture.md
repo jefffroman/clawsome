@@ -220,7 +220,7 @@ a zombie can't resurrect a stopped conversation.
 | `transcripts/<sid>.jsonl` | OpenAI-flat message log per session. | Per turn (load) |
 | `.memory/chroma_db/` | ChromaDB persistence (vector + metadata). | On reindex / retrieve |
 | `.memory/bm25_corpus.json` | Lexical index. | On reindex / retrieve |
-| `.memory/memory_graph.json` | NetworkX co-occurrence graph for RRF fusion. | On reindex / retrieve |
+| `.memory/memory_graph.json` | NetworkX section/concept graph; retrieval expands the candidate pool one hop along it. | On reindex / retrieve |
 | `.memory/sync_state.json` | Source files hash + last reindex marker. | On boot / reindex |
 | `.memory/curation_state.json` | Curator watermark: section hashes at the last curation pass. Written only by the curator. | On curation |
 | `.matrix-store/` | matrix-nio crypto store (Olm sessions, group sessions). | Continuously |
