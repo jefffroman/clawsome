@@ -178,3 +178,10 @@ def test_candidates_reaches_music_candidates(verb):
 def test_history_reaches_music_history(verb):
     name, got = verb(["history", "burning", "spear", "--limit", "5"])
     assert name == "music_history" and got == {"query": "burning spear", "limit": 5}
+
+
+@pytest.mark.parametrize("level", ["-10", "+10", "60"])
+def test_volume_takes_a_signed_level_as_a_positional(level):
+    # argparse would read "-10" as an option if any option looked numeric.
+    args = music_cli._parser().parse_args(["--config", "/nowhere.yaml", "volume", level, "-o", "room"])
+    assert (args.verb, args.level, args.output) == ("volume", level, "room")

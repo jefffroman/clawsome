@@ -235,3 +235,37 @@ def make_cfg(make_agent_cfg):
         return Config(**d)
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def device_volumes(monkeypatch):
+    """Every output device's volume, faked for the whole suite.
+
+    Autouse on purpose: claw.coreaudio talks to the real audio hardware, so a
+    test that reached it on a machine with speakers would turn them up or down.
+    Maps an mpv device string to its volume; a device absent from the map is
+    not present. ``sets`` records every write in order.
+    """
+    from claw import coreaudio
+
+    class Volumes(dict):
+        sets: list[tuple[str, int]]
+        fail: bool = False
+
+    vols = Volumes()
+    vols.sets = []
+
+    def get_volume(dev):
+        if dev not in vols:
+            raise coreaudio.CoreAudioError(f"no audio device {dev!r} is present")
+        return vols[dev]
+
+    def set_volume(dev, pct):
+        if vols.fail or dev not in vols:
+            raise coreaudio.CoreAudioError(f"{dev!r} refused a volume change")
+        vols[dev] = pct
+        vols.sets.append((dev, pct))
+
+    monkeypatch.setattr(coreaudio, "get_volume", get_volume)
+    monkeypatch.setattr(coreaudio, "set_volume", set_volume)
+    return vols

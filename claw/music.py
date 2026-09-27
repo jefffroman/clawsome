@@ -52,7 +52,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.parse import unquote
 
+from claw import coreaudio
 from claw.config import LoudnessConfig, MusicConfig, MusicOutput
+from claw.coreaudio import CoreAudioError
 
 log = logging.getLogger(__name__)
 
@@ -892,8 +894,15 @@ class Player:
             connected = (rc == 0 and out.strip() == "1")
         return OutputState(output=output, connected=connected, present=present)
 
-    async def ensure_output(self, output: MusicOutput) -> str | None:
+    async def ensure_output(self, output: MusicOutput, volume: int | None = None) -> str | None:
         """Make *output* the one mpv plays through. Returns a reason on refusal.
+
+        Then sets the device's volume: *volume* if the play asked for one, else
+        the output's configured ``device_volume``, else leaves it alone. An
+        asked-for volume that cannot be set refuses the play — "quietly, please"
+        must not come out at full level. A configured one that cannot be set is
+        logged and the play goes ahead: it is repair, and the device is no worse
+        than it was.
 
         The restore-the-default step is not defensive tidiness. macOS promotes a
         Bluetooth audio device to system default the instant it connects, so
@@ -931,7 +940,35 @@ class Player:
         )
         if reply.get("error") != "success":
             return f"mpv refused to route to {output.name}: {reply.get('error')}"
+        target = volume if volume is not None else output.device_volume
+        if target is not None:
+            try:
+                await self.set_volume(output, target)
+            except CoreAudioError as exc:
+                if volume is not None:
+                    return f"could not set {output.name} to volume {volume}: {exc}"
+                log.warning("music: could not restore %s to volume %d: %s",
+                            output.name, target, exc)
         return None
+
+    async def current_output(self) -> MusicOutput | None:
+        """The configured output mpv is routed to now, if it is one of ours."""
+        (reply,) = await ipc(self.cfg.mpv_socket, [["get_property", "audio-device"]])
+        dev = _data(reply)
+        return next((o for o in self.cfg.outputs if o.mpv_device == dev), None)
+
+    async def volume_of(self, output: MusicOutput) -> int | None:
+        """The output device's own volume, 0–100, or None if it cannot be read
+        (a Bluetooth sink that is not connected has no device to ask)."""
+        try:
+            return await asyncio.to_thread(coreaudio.get_volume, output.mpv_device)
+        except CoreAudioError:
+            return None
+
+    async def set_volume(self, output: MusicOutput, percent: int) -> None:
+        """Set the output device's own volume — by its UID, never through the
+        machine-wide default. Raises CoreAudioError."""
+        await asyncio.to_thread(coreaudio.set_volume, output.mpv_device, percent)
 
     async def _await_device(self, mpv_device: str) -> bool:
         deadline = asyncio.get_running_loop().time() + self.cfg.connect_timeout_s

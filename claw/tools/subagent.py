@@ -355,6 +355,98 @@ class SubagentSpawner:
             # on ct; subagent_status will still report.
             pass
 
+    def _gc_registry(self) -> None:
+        """Evict oldest completed/failed entries when the registry grows
+        past the soft cap. Running entries are never evicted.
+        """
+        if len(self.tasks) <= _MAX_REGISTRY_SIZE:
+            return
+        completed = [
+            ct for ct in self.tasks.values()
+            if ct.status != "running" and ct.completed_at is not None
+        ]
+        completed.sort(key=lambda c: c.completed_at)  # type: ignore[arg-type,return-value]
+        excess = len(self.tasks) - _MAX_REGISTRY_SIZE
+        for ct in completed[:excess]:
+            self.tasks.pop(ct.id, None)
+
+    # --- operator %stop support -----------------------------------------
+
+    def running_for_session(self, sid: str) -> list["ChildTask"]:
+        """Running subagents whose origin session is ``sid``, newest first.
+        Session-scoped (every turn's children) — for %subagents discovery.
+        """
+        out = [
+            ct for ct in self.tasks.values()
+            if ct.status == "running"
+            and ct.origin_session_key == sid
+        ]
+        out.sort(key=lambda c: c.started_at, reverse=True)
+        return out
+
+    def cancel_turn(self, turn_id: str, *, suppress: bool) -> list[str]:
+        """Cancel every running subagent whose ``spawn_turn_id == turn_id``
+        — i.e. the entire cascade rooted at one turn, at any depth (the
+        turn id is inherited transitively). ``suppress`` sets
+        ``suppress_delivery`` first so a stopped session is not resurrected
+        by these children's completions. Returns the cancelled task ids.
+        """
+        if not turn_id:
+            return []
+        hit: list[str] = []
+        for ct in list(self.tasks.values()):
+            if ct.status != "running" or ct.spawn_turn_id != turn_id:
+                continue
+            ct.suppress_delivery = suppress
+            if ct.aio_task is not None and not ct.aio_task.done():
+                ct.aio_task.cancel()
+            hit.append(ct.id)
+        return hit
+
+    def cancel_subtree(self, task_id: str) -> list[str]:
+        """Cancel ``task_id`` and its transitive descendants (children via
+        ``parent_task_id``). The target keeps normal completion delivery
+        (the session is alive and should learn it was killed, same as the
+        model-facing subagent_stop); collateral descendants are suppressed
+        so they don't spam the session. Returns the cancelled task ids.
+        """
+        target = self.tasks.get(task_id)
+        if target is None:
+            return []
+        # BFS the parent_task_id forest from the target.
+        subtree = {task_id}
+        frontier = [task_id]
+        while frontier:
+            parent = frontier.pop()
+            for ct in self.tasks.values():
+                if ct.parent_task_id == parent and ct.id not in subtree:
+                    subtree.add(ct.id)
+                    frontier.append(ct.id)
+        hit: list[str] = []
+        for tid in subtree:
+            ct = self.tasks.get(tid)
+            if ct is None or ct.status != "running":
+                continue
+            ct.suppress_delivery = tid != task_id  # deliver only the target
+            if ct.aio_task is not None and not ct.aio_task.done():
+                ct.aio_task.cancel()
+            hit.append(tid)
+        return hit
+
+    def format_running(self, cts: list["ChildTask"]) -> str:
+        if not cts:
+            return "No subagents running for this session."
+        lines = [f"{len(cts)} subagent(s) running:"]
+        for ct in cts:
+            elapsed = _format_elapsed((_now() - ct.started_at).total_seconds())
+            lines.append(
+                f"  {ct.id}  task_name={ct.task_name!r}  "
+                f"persona={ct.persona}  elapsed={elapsed}"
+            )
+        return "\n".join(lines)
+
+    # --- status (read-only) ---------------------------------------------
+
     def format_status(self, ct: ChildTask) -> str:
         if ct.status == "running":
             elapsed_s = (_now() - ct.started_at).total_seconds()

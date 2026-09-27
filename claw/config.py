@@ -419,6 +419,14 @@ class MusicOutput:
     coreaudio_name: str = ""
     bluetooth_address: str | None = None
     default: bool = False
+    # The device's own volume (0-100, the menu-bar slider's value), set every
+    # time playback is routed here unless the play names another. None leaves
+    # the device alone. Worth setting because macOS does not keep it: a reboot
+    # (and possibly a reconnect) puts a Bluetooth sink back at 50, which is
+    # ~-18 dB of software attenuation applied before the codec, for the amp to
+    # make up along with the codec noise. 100 is unity — the level every other
+    # digital stage already sits at.
+    device_volume: int | None = None
 
 
 @dataclass(frozen=True)
@@ -584,12 +592,18 @@ class MusicConfig:
     thing that happens in a room someone is sitting in, so who may do it is
     per-deployment policy rather than a property of the code.
 
-    There is deliberately **no per-output volume**. Loudness is set once,
-    downstream, on the amplifier: a standing attenuation in software happens
-    *before* a lossy encoder, so the amp then raises music and codec noise
-    together. Per-track normalisation (see :class:`LoudnessConfig`) is not
-    that — it brings a loud record down to where the typical one already
-    enters the encoder, and never boosts anything past its own true peak.
+    Room loudness is set downstream, on the amplifier. Each output's
+    ``device_volume`` is a **setpoint that restores** its device, re-applied on
+    every new queue play (one that routes, i.e. not an append), not a standing
+    attenuation: at 100 the device is at unity, like every other digital stage.
+    A play may ask for less (``music_play``'s ``volume``, or music_control's
+    volume action), and that lasts until the next new queue play that does not. Below 100 on
+    a Bluetooth sink is attenuation *before* a lossy encoder — fine for "turn
+    it down tonight", wrong as a default, because the amp then raises music and
+    codec noise together. Per-track normalisation (see :class:`LoudnessConfig`)
+    is a different thing — it brings a loud record down to where the typical
+    one already enters the encoder, and never boosts anything past its own
+    true peak.
     """
     enabled: bool = False
     exposed_to: tuple[str, ...] = ()
@@ -1453,6 +1467,13 @@ def _validate_music(cfg: "Config") -> None:
         raise ValueError(
             f"music.outputs: more than one output marked default: {sorted(defaults)}"
         )
+    for o in cfg.music.outputs:
+        v = o.device_volume
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 100):
+            raise ValueError(
+                f"music.outputs[{o.id}].device_volume must be a whole number 0-100 "
+                f"or absent (got {v!r})"
+            )
     _validate_loudness(cfg.music.loudness)
     _validate_candidates(cfg.music.candidates)
     _validate_dj(cfg.music.dj)

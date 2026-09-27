@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     order.add_argument("--shuffle", dest="shuffle", action="store_true", default=None)
     order.add_argument("--in-order", dest="shuffle", action="store_false", default=None)
     play.add_argument("--append", action="store_true", help="add to the queue instead of replacing it")
+    play.add_argument("--volume", type=int, help="the speaker's own volume for this playback, 0-100")
 
     cur = sub.add_parser("curate", help="annotate a track or album")
     cur.add_argument("query", nargs="+")
@@ -80,6 +81,10 @@ def _parser() -> argparse.ArgumentParser:
                      help="DISCARD curation for these tracks and reread the files")
     ing.add_argument("--workers", type=int, default=8)
 
+    vol = sub.add_parser("volume", help="set a speaker's volume, leaving playback alone")
+    vol.add_argument("level", help="0-100, or +N / -N to change it from where it is")
+    vol.add_argument("-o", "--output", help="which speaker (default: the one music is on)")
+
     for verb, helptext in (
         ("stats", "what the catalogue holds"),
         ("pause", "pause playback"),
@@ -111,6 +116,7 @@ async def _run(args: argparse.Namespace) -> str:
             "album": args.album,
             "shuffle": args.shuffle,
             "append": args.append,
+            "volume": args.volume,
         })
     if args.verb == "history":
         return await tools["music_history"].run(
@@ -162,6 +168,9 @@ async def _run(args: argparse.Namespace) -> str:
         return await tools["music_status"].run({})
     if args.verb == "outputs":
         return await tools["music_outputs"].run({})
+    if args.verb == "volume":
+        return await tools["music_control"].run(
+            {"action": "volume", "volume": args.level, "output": args.output})
     action = "stop" if args.verb == "quiet" else args.verb
     assert action in ACTIONS
     return await tools["music_control"].run({"action": action})

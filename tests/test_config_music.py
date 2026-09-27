@@ -223,3 +223,16 @@ def test_candidates_values_that_cannot_work_are_refused(make_cfg, tmp_path, cand
     music = _parse_music({"enabled": True, "outputs": [_out()], "candidates": candidates})
     with pytest.raises(ValueError, match=message):
         _validate_music(_cfg_with(make_cfg, tmp_path, music))
+
+
+def test_device_volume_is_absent_unless_configured():
+    cfg = _parse_music({"enabled": True, "outputs": [_out(), _out(id="room-b", device_volume=100)]})
+    assert cfg.outputs[0].device_volume is None
+    assert cfg.outputs[1].device_volume == 100
+
+
+@pytest.mark.parametrize("bad", [101, -1, 50.5, True, "100"])
+def test_a_device_volume_outside_0_to_100_fails_the_load(make_cfg, tmp_path, bad):
+    music = _parse_music({"enabled": True, "outputs": [_out(device_volume=bad)]})
+    with pytest.raises(ValueError, match="device_volume"):
+        _validate_music(_cfg_with(make_cfg, tmp_path, music))

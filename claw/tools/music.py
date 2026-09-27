@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from claw.config import MusicConfig, MusicOutput
+from claw.coreaudio import CoreAudioError
 from claw import music_db
 import json
 import random
+import re
 from datetime import datetime, timedelta, timezone
 
 from claw.music import (
@@ -35,7 +37,7 @@ from claw.tools.base import Tool
 
 log = logging.getLogger(__name__)
 
-ACTIONS: tuple[str, ...] = ("pause", "resume", "next", "stop")
+ACTIONS: tuple[str, ...] = ("pause", "resume", "next", "stop", "volume")
 
 # What the model is told it may set, per level. Reads from the schema so the
 # message cannot drift from what curate() will actually accept.
@@ -189,6 +191,75 @@ def build_music_tools(
             "energy": (int(lo or 1), int(hi or 5)) if (lo or hi) else None,
         }
 
+    def _level_arg(v: Any) -> tuple[bool, int] | None:
+        """Parse a volume value: (relative, n), or None if it is not one.
+
+        An integer (or a whole float) is absolute. A string is ``"N"`` —
+        absolute — or ``"+N"`` / ``"-N"``, a change from the current level. A
+        bare negative integer is NOT read as a change: the sign has to be
+        written, so -10 cannot be a typo for 10 that turns the room down."""
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        if isinstance(v, int):
+            return (False, v)
+        if isinstance(v, str) and (m := re.fullmatch(r"\s*([+-]?)(\d+)\s*", v)):
+            n = int(m.group(2))
+            return (True, -n if m.group(1) == "-" else n) if m.group(1) else (False, n)
+        return None
+
+    def _volume(args: dict[str, Any], nothing: str = "Nothing was queued.") -> int | None | str:
+        """A play's volume: absolute 0-100, None when not given, or an error
+        string ending in *nothing* — what the refusal left undone."""
+        v = args.get("volume")
+        if v is None:
+            return None
+        got = _level_arg(v)
+        if got is not None and got[0]:
+            return (f"error: a play takes an absolute volume, 0-100 (got {v!r}). To "
+                    "change the level of what is on by an amount, use music_control's "
+                    f"volume action. {nothing}")
+        if got is None or not 0 <= got[1] <= 100:
+            return f"error: volume is a whole number 0-100 (got {v!r}). {nothing}"
+        return got[1]
+
+    async def _route(chosen: MusicOutput, append: bool, volume: int | None) -> str | None:
+        """Route to *chosen* and set its volume — or, when appending, leave the
+        routing alone and apply an asked-for volume to wherever music already is.
+        Returns a refusal string, or None."""
+        if not append:
+            if (refusal := await player.ensure_output(chosen, volume)) is not None:
+                return f"refused: {refusal}"
+            return None
+        if volume is None:
+            return None
+        here = await player.current_output()
+        if here is None:
+            return ("refused: nothing is routed to a configured speaker, so there is "
+                    "no volume to set — play without append. Nothing was queued.")
+        try:
+            await player.set_volume(here, volume)
+        except CoreAudioError as exc:
+            return f"refused: could not set {here.name} to volume {volume}: {exc}. Nothing was queued."
+        return None
+
+    async def _level(chosen: MusicOutput, append: bool, volume: int | None) -> str:
+        """The reply's volume clause: what the device is at now — and, when no
+        volume was asked for and it is not at its configured one, why not."""
+        where = (await player.current_output() if append else chosen) or chosen
+        got = await player.volume_of(where)
+        if got is None:
+            return ", volume unknown"
+        want = where.device_volume
+        if volume is not None or want is None or got == want:
+            return f", at volume {got}"
+        if append:
+            # Append does not route, so nothing tried to restore it — most
+            # likely someone set this level on purpose. Neutral, not a fault.
+            return f", at volume {got} (a new queue play without a volume restores {want})"
+        return f", at volume {got} — not its configured {want}: setting it failed (see the log)"
+
     async def _play(args: dict[str, Any]) -> str:
         if args.get("handles"):
             return await _play_handles(args)
@@ -202,6 +273,8 @@ def build_music_tools(
         want_album = bool(args.get("album"))
         append = bool(args.get("append"))
         root = cfg.library_root
+        if isinstance(volume := _volume(args), str):
+            return volume
 
         chosen = await _resolve_output(args.get("output"))
         if isinstance(chosen, str):
@@ -252,9 +325,10 @@ def build_music_tools(
         queue = (shuffled(tracks) if shuffle else list(tracks))[:MAX_QUEUE]
 
         try:
-            if not append and (refusal := await player.ensure_output(chosen)) is not None:
-                return f"refused: {refusal}"
+            if (refusal := await _route(chosen, append, volume)) is not None:
+                return refusal
             await player.play(queue, append=append, album_gain=(kind == "album" and not shuffle))
+            level = await _level(chosen, append, volume)
         except MpvUnavailable:
             return _DOWN
         _remember(queue, chosen)
@@ -268,7 +342,7 @@ def build_music_tools(
         return (
             f"{verb} {what} on {chosen.name} — {len(queue)} track"
             f"{'s' if len(queue) != 1 else ''} {how}{note}"
-            + ("" if append else f", starting with {head}")
+            + ("" if append else f", starting with {head}") + level
         )
 
     async def _play_handles(args: dict[str, Any]) -> str:
@@ -302,13 +376,16 @@ def build_music_tools(
             queue = shuffled(queue)
         queue = queue[:MAX_QUEUE]
         append = bool(args.get("append"))
+        if isinstance(volume := _volume(args), str):
+            return volume
         chosen = await _resolve_output(args.get("output"))
         if isinstance(chosen, str):
             return chosen
         try:
-            if not append and (refusal := await player.ensure_output(chosen)) is not None:
-                return f"refused: {refusal}"
+            if (refusal := await _route(chosen, append, volume)) is not None:
+                return refusal
             await player.play(queue, append=append)
+            level = await _level(chosen, append, volume)
         except MpvUnavailable:
             return _DOWN
         _remember(queue, chosen)
@@ -316,7 +393,8 @@ def build_music_tools(
         verb = "queued" if append else "playing"
         how = "shuffled" if args.get("shuffle") else "in your order"
         return (f"{verb} {len(queue)} track{'s' if len(queue) != 1 else ''} on {chosen.name}, "
-                f"{how}, {_hms(secs)}" + ("" if append else f", starting with {queue[0].full_label()}"))
+                f"{how}, {_hms(secs)}" + ("" if append else f", starting with {queue[0].full_label()}")
+                + level)
 
     async def _candidates(args: dict[str, Any]) -> str:
         c = cfg.candidates
@@ -486,6 +564,8 @@ def build_music_tools(
                         f"about {abs(music_s - want) / 60:.0f} min and send it again. "
                         "Nothing was rendered or queued.")
 
+        if isinstance(volume := _volume(args), str):
+            return volume
         chosen = await _resolve_output(args.get("output"))
         if isinstance(chosen, str):
             return chosen
@@ -510,9 +590,10 @@ def build_music_tools(
             queue.extend(got)
             gains.extend([one] * len(got))
         try:
-            if not append and (refusal := await player.ensure_output(chosen)) is not None:
-                return f"refused: {refusal}"
+            if (refusal := await _route(chosen, append, volume)) is not None:
+                return refusal
             await player.play(queue[:MAX_QUEUE], append=append, gains=gains[:MAX_QUEUE])
+            level = await _level(chosen, append, volume)
         except MpvUnavailable:
             return _DOWN
         if tracks:
@@ -526,7 +607,7 @@ def build_music_tools(
                 f"({_hms(music_s)} of music, {speech:.0f} s of talk)"
                 + (f", with {', '.join(records)} whole and in order" if records else "")
                 + (f", starting with {queue[0].full_label() if isinstance(queue[0], Track) else 'your opening'}"
-                   if not append else ""))
+                   if not append else "") + level)
 
     def _remember(queue: Sequence[Track], output: MusicOutput) -> None:
         """Record the queue. Best-effort — losing history must not fail a play."""
@@ -979,6 +1060,8 @@ def build_music_tools(
         if action not in ACTIONS:
             return (f"error: action must be one of: {', '.join(ACTIONS)}",
                     {"result": "error"})
+        if action == "volume":
+            return await _set_level(args)
         try:
             if action == "next":
                 res = await player.skip()
@@ -989,12 +1072,62 @@ def build_music_tools(
         except MpvUnavailable:
             return _DOWN, {"result": "down"}
 
+    async def _set_level(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Set a speaker's volume and nothing else — what is playing carries on.
+
+        The speaker is the named one, else wherever music is routed, else the
+        default: the same choice music_play makes, so "turn it down" reaches
+        the room that is actually playing.
+
+        ``"+N"`` / ``"-N"`` is a change from the current level and saturates at
+        0 and 100 — "louder" at 95 means 100, and says so. An absolute value
+        outside 0-100 is refused instead: asking for 133 is a misunderstanding,
+        not an intent with a ceiling."""
+        unchanged = "Nothing was changed."
+        err: dict[str, Any] = {"result": "error"}
+        v = args.get("volume")
+        if v is None:
+            return f"error: the volume action needs volume: 0-100, or \"+N\" / \"-N\". {unchanged}", err
+        if (parsed := _level_arg(v)) is None:
+            return (f"error: volume is a whole number 0-100, or \"+N\" / \"-N\" for a change "
+                    f"(got {v!r}). {unchanged}"), err
+        relative, n = parsed
+        if not relative and not 0 <= n <= 100:
+            # One reply for every out-of-range absolute — -10 and 133 alike.
+            return (f"error: volume is a whole number 0-100 (got {v!r}). For a change "
+                    f"from the current level, write a signed string: \"+N\" or \"-N\". "
+                    f"{unchanged}"), err
+        chosen = await _resolve_output(args.get("output"))
+        if isinstance(chosen, str):
+            return chosen, err
+        was = await player.volume_of(chosen)
+        if relative and was is None:
+            return (f"error: {chosen.name}'s current volume cannot be read, so there is "
+                    f"nothing to change by {n:+d}. Give an absolute level. {unchanged}"), err
+        volume = min(100, max(0, was + n)) if relative else n
+        try:
+            await player.set_volume(chosen, volume)
+        except CoreAudioError as exc:
+            return f"error: could not set {chosen.name} to volume {volume}: {exc}. {unchanged}", err
+        how = ""
+        if relative:
+            capped = volume != was + n
+            how = f" ({n:+d}{f', capped at {volume}' if capped else ''})"
+        moved = f"{was} → {volume}" if was is not None else f"set to {volume}"
+        back = (f" The next new queue play without a volume restores {chosen.device_volume}."
+                if chosen.device_volume is not None and chosen.device_volume != volume else "")
+        return (f"{chosen.name} volume {moved}{how}; playback untouched.{back}",
+                {"result": "volume", "output": chosen.id, "volume": volume, "was": was,
+                 "change": n if relative else None})
+
     async def _control(args: dict[str, Any]) -> str:
         return (await _do_control(args))[0]
 
     async def _control_data(args: dict[str, Any]) -> dict[str, Any]:
         """``result``: paused | resumed | stopped | skipped | end_of_queue |
-        idle | down | error; after a skip, ``next`` is the entry now starting
+        idle | down | volume | error; after volume, ``output``, ``volume``,
+        ``was`` (None if it could not be read) and ``change`` (the signed
+        amount, or None for an absolute level); after a skip, ``next`` is the entry now starting
         ({title, artist, album}, {link: True}, or None if uncatalogued)."""
         return (await _do_control(args))[1]
 
@@ -1024,25 +1157,43 @@ def build_music_tools(
     async def _status_data(_args: dict[str, Any]) -> dict[str, Any]:
         """What is on now, as fields: ``state`` is playing | paused | idle |
         loading | link (a spoken DJ link between songs) | down; ``title``/``artist``/
-        ``album`` are set only for a catalogued track."""
+        ``album`` are set only for a catalogued track; ``volume`` is the routed
+        device's own volume (0-100), None when it cannot be read."""
         try:
             st = await player.status()
         except MpvUnavailable:
             return {"state": "down"}
+        output: MusicOutput | None = st.get("output")
+        volume = await player.volume_of(output) if output else None
         if not st.get("path"):
             # idle-active explicitly False with no path: an entry is current
             # but its file is still opening — the few milliseconds after a
             # skip. Not "nothing is playing". Anything else is idle.
-            return {"state": "loading" if st.get("idle-active") is False else "idle"}
+            return {"state": "loading" if st.get("idle-active") is False else "idle",
+                    "volume": volume}
         if st.get("clip"):
-            return {"state": "link"}
+            return {"state": "link", "volume": volume}
         track: Track | None = st.get("track")
         return {
+            "volume": volume,
             "state": "paused" if st.get("pause") else "playing",
             "title": track.title if track else (st.get("media-title") or None),
             "artist": track.artist if track else None,
             "album": track.album if track else None,
         }
+
+    async def _volume_line(output: MusicOutput | None) -> str:
+        """Where playback is routed and that device's volume — in every state,
+        idle included, so a device left low is visible before anything plays."""
+        if output is None:
+            return "routed to a device that is not a configured output"
+        got = await player.volume_of(output)
+        if got is None:
+            return f"{output.name} volume unknown (the device is not present)"
+        configured = output.device_volume
+        note = (f" (a new queue play without a volume restores {configured})"
+                if configured is not None and got != configured else "")
+        return f"{output.name} at volume {got}{note}"
 
     async def _status(_args: dict[str, Any]) -> str:
         try:
@@ -1050,17 +1201,18 @@ def build_music_tools(
         except MpvUnavailable:
             return _DOWN
         recent = _recently()
+        output: MusicOutput | None = st.get("output")
+        level = await _volume_line(output)
         if not st.get("path"):
             if st.get("idle-active") is False:
-                return "the next entry is loading — ask again in a moment"
-            return "nothing is playing" + (f". {recent}" if recent else "")
+                return f"the next entry is loading — ask again in a moment. {level}"
+            return f"nothing is playing. {level}" + (f". {recent}" if recent else "")
         track: Track | None = st.get("track")
         if st.get("clip"):
             title = "a DJ link (the agent talking between songs)"
         else:
             title = track.full_label() if track else (st.get("media-title") or st["path"])
-        output: MusicOutput | None = st.get("output")
-        where = output.name if output else (st.get("audio-device") or "an unconfigured device")
+        where = level if output else (st.get("audio-device") or "an unconfigured device")
         pos, count = st.get("playlist-pos-1"), st.get("playlist-count")
         bits = [
             f"{'paused at' if st.get('pause') else 'playing'} {title}",
@@ -1172,6 +1324,17 @@ def build_music_tools(
                     },
                     "energy_min": {"type": "integer", "description": "1 (still) to 5 (relentless)."},
                     "energy_max": {"type": "integer", "description": "1 (still) to 5 (relentless)."},
+                    "volume": {
+                        "type": "integer", "minimum": 0, "maximum": 100,
+                        "description": (
+                            "The speaker's own volume for this playback, 0-100. Omit "
+                            "it and the speaker's configured level is used — pass it "
+                            "only when asked for a level. It lasts until the next "
+                            "new queue play (music_play or music_dj without append) "
+                            "that has no volume. With append it changes what is "
+                            "playing now, and an append never restores the level."
+                        ),
+                    },
                 },
             },
             run=_play,
@@ -1321,14 +1484,33 @@ def build_music_tools(
         "music_control": Tool(
             name="music_control",
             description=(
-                "Transport control for what is already playing: pause, resume, "
-                "skip to the next track, or stop and clear the queue. Stop is "
-                "not a pause — the queue is gone afterwards."
+                "Control what is already playing: pause, resume, skip to the "
+                "next track, stop and clear the queue, or set the volume. Stop "
+                "is not a pause — the queue is gone afterwards. volume changes "
+                "a speaker's level and nothing else; it lasts until the next "
+                "new queue play (music_play or music_dj without append) that "
+                "has no volume, which restores the configured level. Appending "
+                "keeps it."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": list(ACTIONS)},
+                    "volume": {
+                        "type": ["integer", "string"],
+                        "description": (
+                            "For the volume action: the speaker's own volume — 0-100, "
+                            "or a change from where it is now as a signed string, "
+                            "\"+10\" or \"-10\" (stops at 0 and 100)."
+                        ),
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": (
+                            "For the volume action: which speaker. Omit for the one "
+                            f"music is on. One of: {', '.join(o.id for o in cfg.outputs)}."
+                        ),
+                    },
                 },
                 "required": ["action"],
             },
@@ -1338,8 +1520,9 @@ def build_music_tools(
         "music_status": Tool(
             name="music_status",
             description=(
-                "What is playing right now, where, how far in, how much of the "
-                "queue is left, and which records were queued recently. Worth "
+                "What is playing right now, where and at what volume, how far "
+                "in, how much of the queue is left, and which records were "
+                "queued recently. Worth "
                 "checking before acting on a vague request — so a session "
                 "already under way is not restarted, and so a set does not "
                 "repeat what was just on."
@@ -1403,6 +1586,17 @@ def build_music_tools(
                         ),
                     },
                     "minutes": {"type": "number", "description": "The length you intend; checked before rendering."},
+                    "volume": {
+                        "type": "integer", "minimum": 0, "maximum": 100,
+                        "description": (
+                            "The speaker's own volume for this playback, 0-100. Omit "
+                            "it and the speaker's configured level is used — pass it "
+                            "only when asked for a level. It lasts until the next "
+                            "new queue play (music_play or music_dj without append) "
+                            "that has no volume. With append it changes what is "
+                            "playing now, and an append never restores the level."
+                        ),
+                    },
                 },
                 "required": ["set"],
             },

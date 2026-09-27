@@ -5,6 +5,7 @@ deployment agent name.
 """
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -1434,5 +1435,272 @@ async def test_status_between_a_skip_and_the_file_opening_is_loading(playing, mo
                 for c in commands]
 
     monkeypatch.setattr(music_mod, "ipc", loading)
-    assert (await built["music_status"].data({})) == {"state": "loading"}
+    assert (await built["music_status"].data({})) == {"state": "loading", "volume": None}
     assert "loading" in await built["music_status"].run({})
+
+
+# --- device volume -------------------------------------------------------
+
+def _with_volumes(cfg, **by_id):
+    """cfg with device_volume set on the named outputs."""
+    outs = tuple(dataclasses.replace(o, device_volume=by_id[o.id]) if o.id in by_id else o
+                 for o in cfg.outputs)
+    return MusicConfig(**{**cfg.__dict__, "outputs": outs})
+
+
+def test_the_uid_is_the_mpv_device_without_its_prefix():
+    from claw.coreaudio import CoreAudioError, uid_of
+    assert uid_of("coreaudio/AA-BB:output") == "AA-BB:output"
+    with pytest.raises(CoreAudioError):
+        uid_of("pulse/whatever")
+
+
+async def test_routing_restores_the_configured_device_volume(cfg, ipc_calls, device_volumes):
+    # macOS resets a Bluetooth sink to 50 on a reboot; every play puts it back.
+    cfg = _with_volumes(cfg, **{"room-a": 100})
+    device_volumes[BT.mpv_device] = 50
+    p = FakePlayer(cfg, devices={BT.mpv_device}, bt_table={"--is-connected": (0, "1", "")})
+    assert await p.ensure_output(cfg.outputs[0]) is None
+    assert device_volumes.sets == [(BT.mpv_device, 100)]
+
+
+async def test_an_asked_for_volume_overrides_the_configured_one(cfg, ipc_calls, device_volumes):
+    cfg = _with_volumes(cfg, **{"room-a": 100})
+    device_volumes[BT.mpv_device] = 100
+    p = FakePlayer(cfg, devices={BT.mpv_device}, bt_table={"--is-connected": (0, "1", "")})
+    assert await p.ensure_output(cfg.outputs[0], volume=40) is None
+    assert device_volumes.sets == [(BT.mpv_device, 40)]
+
+
+async def test_no_configured_volume_leaves_the_device_alone(cfg, ipc_calls, device_volumes):
+    device_volumes[WIRED.mpv_device] = 71
+    p = FakePlayer(cfg, devices={WIRED.mpv_device}, bt_table={})
+    assert await p.ensure_output(WIRED) is None
+    assert device_volumes.sets == [] and device_volumes[WIRED.mpv_device] == 71
+
+
+async def test_an_asked_for_volume_that_cannot_be_set_refuses(cfg, ipc_calls, device_volumes):
+    # "Quietly, please" must not come out at full level.
+    device_volumes[WIRED.mpv_device] = 100
+    device_volumes.fail = True
+    p = FakePlayer(cfg, devices={WIRED.mpv_device}, bt_table={})
+    refusal = await p.ensure_output(WIRED, volume=30)
+    assert refusal is not None and "volume 30" in refusal
+
+
+async def test_a_configured_volume_that_cannot_be_set_does_not_block_play(cfg, ipc_calls, device_volumes):
+    cfg = _with_volumes(cfg, **{"room-b": 100})
+    device_volumes[WIRED.mpv_device] = 50
+    device_volumes.fail = True
+    p = FakePlayer(cfg, devices={WIRED.mpv_device}, bt_table={})
+    assert await p.ensure_output(cfg.outputs[1]) is None
+
+
+async def test_play_passes_its_volume_to_the_speaker_and_says_so(playing, device_volumes):
+    built, _, _ = playing
+    device_volumes[BT.mpv_device] = 100
+    out = await built["music_play"].run({"query": "ace of spades", "output": "room-a", "volume": 35})
+    assert device_volumes.sets == [(BT.mpv_device, 35)]
+    assert out.endswith("at volume 35")
+
+
+async def test_a_bad_volume_queues_nothing(playing, device_volumes):
+    built, _, calls = playing
+    for bad in (101, -1, "loud", True, 50.5):
+        out = await built["music_play"].run({"query": "ace of spades", "output": "room-a", "volume": bad})
+        assert out.startswith("error:") and "0-100" in out
+    assert not [c for c in calls if c[0] == "loadfile"] and device_volumes.sets == []
+
+
+async def test_append_with_a_volume_sets_where_music_already_is(playing, mpv_state, device_volumes):
+    # Append never re-routes, so the level applies to the speaker in use —
+    # not to whatever output the call happened to name.
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = WIRED.mpv_device
+    device_volumes[WIRED.mpv_device] = 100
+    device_volumes[BT.mpv_device] = 100
+    out = await built["music_play"].run(
+        {"query": "overkill", "output": "room-a", "append": True, "volume": 60})
+    assert device_volumes.sets == [(WIRED.mpv_device, 60)]
+    assert "at volume 60" in out
+
+
+async def test_status_reports_the_volume_even_when_idle(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state.update({"idle-active": True, "audio-device": BT.mpv_device})
+    device_volumes[BT.mpv_device] = 50
+    out = await built["music_status"].run({})
+    assert out.startswith("nothing is playing") and "Room A at volume 50" in out
+
+
+async def test_status_says_when_the_device_is_off_its_configured_level(
+        cfg, library_root, monkeypatch, mpv_state, device_volumes):
+    cfg = _with_volumes(MusicConfig(**{**cfg.__dict__, "library_root": library_root}),
+                        **{"room-a": 100})
+    monkeypatch.setattr("claw.tools.music.Player",
+                        lambda c, b: FakePlayer(c, devices={BT.mpv_device}, bt_table={}))
+    built = build_music_tools(cfg, Path("/nonexistent/blueutil"), "example")
+    state, _ = mpv_state
+    state.update({"idle-active": True, "audio-device": BT.mpv_device})
+    device_volumes[BT.mpv_device] = 50
+    out = await built["music_status"].run({})
+    assert "Room A at volume 50 (a new queue play without a volume restores 100)" in out
+    assert (await built["music_status"].data({}))["volume"] == 50
+
+
+async def test_the_volume_action_changes_the_level_and_nothing_else(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, calls = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = 100
+    out = await built["music_control"].run({"action": "volume", "volume": 40})
+    assert device_volumes.sets == [(BT.mpv_device, 40)]
+    assert out.startswith("Room A volume 100 → 40; playback untouched")
+    # No transport command: what was playing carries on.
+    assert not [c for c in calls if c[0] in ("loadfile", "set_property", "stop", "playlist-next")]
+
+
+async def test_the_volume_action_can_name_a_speaker(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes.update({BT.mpv_device: 100, WIRED.mpv_device: 100})
+    data = await built["music_control"].data({"action": "volume", "volume": 20, "output": "room-b"})
+    assert device_volumes.sets == [(WIRED.mpv_device, 20)]
+    assert data == {"result": "volume", "output": "room-b", "volume": 20, "was": 100, "change": None}
+
+
+async def test_the_volume_action_says_the_next_play_restores_the_setpoint(
+        cfg, library_root, monkeypatch, mpv_state, device_volumes):
+    cfg = _with_volumes(MusicConfig(**{**cfg.__dict__, "library_root": library_root}),
+                        **{"room-a": 100})
+    monkeypatch.setattr("claw.tools.music.Player",
+                        lambda c, b: FakePlayer(c, devices={BT.mpv_device}, bt_table={}))
+    built = build_music_tools(cfg, Path("/nonexistent/blueutil"), "example")
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = 100
+    out = await built["music_control"].run({"action": "volume", "volume": 30})
+    assert "next new queue play without a volume restores 100" in out
+
+
+@pytest.mark.parametrize("args", [{}, {"volume": 133}, {"volume": "loud"}])
+async def test_a_volume_action_without_a_good_level_changes_nothing(playing, device_volumes, args):
+    built, _, _ = playing
+    out = await built["music_control"].run({"action": "volume", **args})
+    assert out.startswith("error:") and out.endswith("Nothing was changed.")
+    assert device_volumes.sets == []
+
+
+async def test_a_volume_action_on_an_absent_speaker_is_an_error(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device        # but not in device_volumes: not present
+    out = await built["music_control"].run({"action": "volume", "volume": 40})
+    assert out.startswith("error: could not set Room A to volume 40")
+
+
+async def test_a_play_whose_configured_volume_failed_says_so(
+        cfg, library_root, monkeypatch, ipc_calls, device_volumes):
+    cfg = _with_volumes(MusicConfig(**{**cfg.__dict__, "library_root": library_root}),
+                        **{"room-b": 100})
+    monkeypatch.setattr("claw.tools.music.Player",
+                        lambda c, b: FakePlayer(c, devices={WIRED.mpv_device}, bt_table={}))
+    built = build_music_tools(cfg, Path("/nonexistent/blueutil"), "example")
+    device_volumes[WIRED.mpv_device] = 50
+    device_volumes.fail = True
+    out = await built["music_play"].run({"query": "ace of spades", "output": "room-b"})
+    # It plays — the restore is repair, not a requirement — but not silently.
+    assert [c for c in ipc_calls if c[0] == "loadfile"]
+    assert out.endswith("at volume 50 — not its configured 100: setting it failed (see the log)")
+
+
+async def test_an_append_keeps_a_level_set_on_purpose_and_says_so_neutrally(
+        cfg, library_root, monkeypatch, mpv_state, device_volumes):
+    # "Turn it down to 40", then "add some Motörhead": still 40. Only a new
+    # queue play restores the configured level, and the note must not read as
+    # a fault the agent should go and fix.
+    cfg = _with_volumes(MusicConfig(**{**cfg.__dict__, "library_root": library_root}),
+                        **{"room-a": 100})
+    monkeypatch.setattr("claw.tools.music.Player",
+                        lambda c, b: FakePlayer(c, devices={BT.mpv_device},
+                                                bt_table={"--is-connected": (0, "1", "")}))
+    built = build_music_tools(cfg, Path("/nonexistent/blueutil"), "example")
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = 100
+    await built["music_control"].run({"action": "volume", "volume": 40})
+    out = await built["music_play"].run({"query": "overkill", "append": True})
+    assert device_volumes[BT.mpv_device] == 40
+    assert out.endswith("at volume 40 (a new queue play without a volume restores 100)")
+    assert "failed" not in out
+    await built["music_play"].run({"query": "ace of spades", "output": "room-a"})
+    assert device_volumes[BT.mpv_device] == 100
+
+
+@pytest.mark.parametrize("given, was, now, says", [
+    ("-10", 80, 70, "Room A volume 80 → 70 (-10); playback untouched."),
+    ("+10", 80, 90, "Room A volume 80 → 90 (+10); playback untouched."),
+    ("+20", 90, 100, "Room A volume 90 → 100 (+20, capped at 100); playback untouched."),
+    ("-30", 20, 0, "Room A volume 20 → 0 (-30, capped at 0); playback untouched."),
+    ("60", 80, 60, "Room A volume 80 → 60; playback untouched."),
+])
+async def test_a_signed_volume_is_a_change_from_where_it_is(
+        playing, mpv_state, device_volumes, given, was, now, says):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = was
+    out = await built["music_control"].run({"action": "volume", "volume": given})
+    assert device_volumes[BT.mpv_device] == now
+    assert out.startswith(says)
+
+
+async def test_out_of_range_absolutes_get_one_reply_whichever_side(playing, mpv_state, device_volumes):
+    # -10 must not be read as "turn it down": the sign has to be written. It is
+    # just an out-of-range absolute, answered exactly as 133 is.
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = 80
+    low = await built["music_control"].run({"action": "volume", "volume": -10})
+    high = await built["music_control"].run({"action": "volume", "volume": 133})
+    assert low.replace("(got -10)", "(got X)") == high.replace("(got 133)", "(got X)")
+    assert low.startswith("error:") and '"+N" or "-N"' in low
+    assert device_volumes.sets == []
+
+
+async def test_a_change_needs_a_level_to_change_from(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device          # not present: unreadable
+    out = await built["music_control"].run({"action": "volume", "volume": "-10"})
+    assert out.startswith("error:") and "cannot be read" in out
+
+
+async def test_the_change_is_in_the_data_twin(playing, mpv_state, device_volumes):
+    built, _, _ = playing
+    state, _ = mpv_state
+    state["audio-device"] = BT.mpv_device
+    device_volumes[BT.mpv_device] = 50
+    data = await built["music_control"].data({"action": "volume", "volume": "+5"})
+    assert data == {"result": "volume", "output": "room-a", "volume": 55, "was": 50, "change": 5}
+
+
+@pytest.mark.parametrize("given", ["+10", "-10"])
+async def test_a_play_refuses_a_relative_volume(playing, device_volumes, given):
+    # Relative to what — the level now, or the one a new queue play restores?
+    built, _, calls = playing
+    device_volumes[BT.mpv_device] = 100
+    out = await built["music_play"].run({"query": "ace of spades", "output": "room-a", "volume": given})
+    assert out.startswith("error:") and "music_control" in out
+    assert not [c for c in calls if c[0] == "loadfile"] and device_volumes.sets == []
+
+
+async def test_a_play_takes_a_level_written_as_a_string(playing, device_volumes):
+    built, _, _ = playing
+    device_volumes[BT.mpv_device] = 100
+    await built["music_play"].run({"query": "ace of spades", "output": "room-a", "volume": "60"})
+    assert device_volumes.sets == [(BT.mpv_device, 60)]
